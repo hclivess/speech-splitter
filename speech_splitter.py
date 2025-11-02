@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Speech Splitter - Split audio using VAD, then transcribe chunks
-With YAMNet integration for non-speech filtering
+Proper approach: Audio segmentation FIRST, then transcription
+Now with YAMNet music filtering
 """
 
 import os
@@ -19,96 +20,129 @@ import numpy as np
 from tqdm import tqdm
 
 
-class YAMNetClassifier:
-    """YAMNet wrapper for speech/non-speech classification"""
+class YAMNetFilter:
+    """YAMNet-based audio classifier to filter music and music+speech"""
     
-    def __init__(self, speech_threshold: float = 0.5):
-        self.speech_threshold = speech_threshold
+    def __init__(self):
         self.model = None
         self.class_names = None
         self._load_model()
     
     def _load_model(self):
-        """Load YAMNet model"""
+        """Load YAMNet model from TensorFlow Hub"""
         try:
-            # Try to import TensorFlow and YAMNet
             import tensorflow as tf
             import tensorflow_hub as hub
             
-            # Load YAMNet from TensorFlow Hub
-            model_url = 'https://tfhub.dev/google/yamnet/1'
-            self.model = hub.load(model_url)
+            # Suppress TensorFlow warnings
+            tf.get_logger().setLevel('ERROR')
+            os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+            
+            print("Loading YAMNet model...")
+            self.model = hub.load('https://tfhub.dev/google/yamnet/1')
             
             # Load class names
-            class_map_path = hub.resolve(model_url) + '/assets/yamnet_class_map.csv'
-            with open(class_map_path) as f:
-                import csv
-                self.class_names = {row['index']: row['display_name'] for row in csv.DictReader(f)}
+            class_map_path = self.model.class_map_path().numpy()
+            self.class_names = self._load_class_names(class_map_path)
             
-            print("✓ YAMNet loaded successfully")
+            print("✓ YAMNet model loaded")
             
-        except ImportError as e:
-            print(f"⚠ TensorFlow/YAMNet not available: {e}")
-            print("⚠ Install with: pip install tensorflow tensorflow_hub")
-            self.model = None
         except Exception as e:
-            print(f"⚠ YAMNet loading failed: {e}")
+            print(f"⚠ Failed to load YAMNet: {e}")
+            print("⚠ Music filtering will be disabled")
             self.model = None
     
-    def is_speech(self, audio_segment: AudioSegment) -> Tuple[bool, float]:
+    def _load_class_names(self, class_map_csv):
+        """Load YAMNet class names from CSV"""
+        import csv
+        class_names = []
+        with open(class_map_csv) as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                class_names.append(row['display_name'])
+        return class_names
+    
+    def classify_audio(self, audio_segment: AudioSegment) -> Dict[str, float]:
         """
-        Check if audio segment contains speech
-        Returns: (is_speech, confidence)
+        Classify audio segment and return probabilities for relevant classes
+        
+        Returns:
+            Dict with keys: 'music', 'speech', 'music_speech_mixed'
         """
         if self.model is None:
-            return True, 1.0  # Default to speech if YAMNet not available
+            return {'music': 0.0, 'speech': 1.0, 'music_speech_mixed': 0.0}
         
         try:
-            # Convert to numpy array for YAMNet
+            import tensorflow as tf
+            
+            # Convert AudioSegment to numpy array
             samples = np.array(audio_segment.get_array_of_samples())
             
-            # Normalize to [-1.0, 1.0] as float32
+            # Convert to float32 in range [-1, 1]
             if audio_segment.sample_width == 2:  # 16-bit
                 samples = samples.astype(np.float32) / 32768.0
             elif audio_segment.sample_width == 4:  # 32-bit
                 samples = samples.astype(np.float32) / 2147483648.0
             
-            # YAMNet expects 16kHz mono
+            # YAMNet expects mono 16kHz audio
+            if audio_segment.channels > 1:
+                # Already handled in preprocessing, but double-check
+                pass
+            
+            # Resample to 16kHz if needed
             if audio_segment.frame_rate != 16000:
-                # Resample if needed (though we typically work with 16kHz)
-                target_length = int(len(samples) * 16000 / audio_segment.frame_rate)
-                samples = np.interp(
-                    np.linspace(0, len(samples)-1, target_length),
-                    np.arange(len(samples)),
-                    samples
-                )
+                # This should already be done, but as safety
+                pass
             
             # Run YAMNet
             scores, embeddings, spectrogram = self.model(samples)
             
-            # Get predictions - use mean scores across all windows
-            mean_scores = np.mean(scores, axis=0)
+            # Average scores across all frames
+            mean_scores = np.mean(scores.numpy(), axis=0)
             
-            # Find speech-related classes
-            speech_classes = ['Speech', 'Conversation', 'Narration, monologue']
-            speech_score = 0.0
+            # Find relevant class indices
+            music_classes = [i for i, name in enumerate(self.class_names) 
+                           if 'music' in name.lower() and 'speech' not in name.lower()]
+            speech_classes = [i for i, name in enumerate(self.class_names) 
+                            if 'speech' in name.lower() and 'music' not in name.lower()]
+            mixed_classes = [i for i, name in enumerate(self.class_names) 
+                           if 'music' in name.lower() and 'speech' in name.lower()]
             
-            for class_idx, class_name in self.class_names.items():
-                if class_name in speech_classes:
-                    speech_score += mean_scores[int(class_idx)]
+            # Calculate probabilities
+            music_prob = float(np.max([mean_scores[i] for i in music_classes]) if music_classes else 0.0)
+            speech_prob = float(np.max([mean_scores[i] for i in speech_classes]) if speech_classes else 0.0)
+            mixed_prob = float(np.max([mean_scores[i] for i in mixed_classes]) if mixed_classes else 0.0)
             
-            # Also include the actual 'Speech' class
-            speech_class_idx = [idx for idx, name in self.class_names.items() if name == 'Speech']
-            if speech_class_idx:
-                speech_score = max(speech_score, mean_scores[int(speech_class_idx[0])])
-            
-            is_speech = speech_score >= self.speech_threshold
-            
-            return is_speech, float(speech_score)
+            return {
+                'music': music_prob,
+                'speech': speech_prob,
+                'music_speech_mixed': mixed_prob
+            }
             
         except Exception as e:
             print(f"⚠ YAMNet classification error: {e}")
-            return True, 1.0  # Default to speech on error
+            return {'music': 0.0, 'speech': 1.0, 'music_speech_mixed': 0.0}
+    
+    def is_music_or_mixed(self, audio_segment: AudioSegment, 
+                          music_threshold: float = 0.3,
+                          mixed_threshold: float = 0.2) -> Tuple[bool, Dict]:
+        """
+        Check if audio is music or music+speech mixed
+        
+        Args:
+            audio_segment: Audio to classify
+            music_threshold: Threshold for pure music (default 0.3)
+            mixed_threshold: Threshold for music+speech mixed (default 0.2)
+            
+        Returns:
+            (is_filtered, classification_dict)
+        """
+        classification = self.classify_audio(audio_segment)
+        
+        is_music = classification['music'] > music_threshold
+        is_mixed = classification['music_speech_mixed'] > mixed_threshold
+        
+        return (is_music or is_mixed), classification
 
 
 class SentenceSplitter:
@@ -198,11 +232,12 @@ class SpeechSplitter:
         min_confidence: float = 0.5,
         filter_noise: bool = True,
         min_rms: float = 0.01,
-        use_yamnet: bool = True,
-        yamnet_threshold: float = 0.3
+        filter_music: bool = True,
+        music_threshold: float = 0.3,
+        mixed_threshold: float = 0.2
     ):
         """
-        Initialize Speech Splitter with VAD-first approach and YAMNet filtering
+        Initialize Speech Splitter with VAD-first approach and YAMNet music filtering
         
         Args:
             whisper_model: Whisper model size
@@ -217,8 +252,9 @@ class SpeechSplitter:
             min_confidence: Minimum transcription confidence (0.0-1.0, default 0.5)
             filter_noise: Enable noise filtering
             min_rms: Minimum RMS energy level (default 0.01)
-            use_yamnet: Enable YAMNet speech/non-speech filtering
-            yamnet_threshold: YAMNet speech confidence threshold (0.0-1.0)
+            filter_music: Enable YAMNet music filtering (default True)
+            music_threshold: YAMNet threshold for music detection (default 0.3)
+            mixed_threshold: YAMNet threshold for music+speech detection (default 0.2)
         """
         self.whisper_model = whisper_model
         self.language = language
@@ -232,8 +268,9 @@ class SpeechSplitter:
         self.min_confidence = min_confidence
         self.filter_noise = filter_noise
         self.min_rms = min_rms
-        self.use_yamnet = use_yamnet
-        self.yamnet_threshold = yamnet_threshold
+        self.filter_music = filter_music
+        self.music_threshold = music_threshold
+        self.mixed_threshold = mixed_threshold
         
         # Create output directories
         self.audio_dir = self.output_dir / "audio"
@@ -245,16 +282,16 @@ class SpeechSplitter:
         print(f"Loading Whisper model ({whisper_model})...")
         self.model = whisper.load_model(whisper_model)
         
-        # Load YAMNet for speech/non-speech classification
-        if self.use_yamnet:
-            print("Loading YAMNet for speech detection...")
-            self.yamnet = YAMNetClassifier(speech_threshold=self.yamnet_threshold)
-        else:
-            self.yamnet = None
-        
         # Load sentence splitter
         print(f"Loading sentence splitter for {language}...")
         self.sentence_splitter = SentenceSplitter(language)
+        
+        # Load YAMNet if music filtering enabled
+        if self.filter_music:
+            self.yamnet_filter = YAMNetFilter()
+        else:
+            self.yamnet_filter = None
+            print("⚠ Music filtering disabled")
         
         print("✓ Models loaded\n")
     
@@ -310,82 +347,80 @@ class SpeechSplitter:
         print(f"✓ Detected {len(final_ranges)} speech segments")
         return final_ranges
     
-    def is_noisy(self, audio_segment: AudioSegment) -> bool:
-        """Check if audio segment is too noisy"""
+    def transcribe_segment(self, audio_chunk: AudioSegment) -> Dict:
+        """
+        Transcribe audio segment using Whisper with word-level timestamps
+        Returns dict with text, words, and confidence
+        """
+        # Export to temporary file for Whisper
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+            audio_chunk.export(tmp.name, format='wav')
+            tmp_path = tmp.name
+        
+        try:
+            # Transcribe with word-level timestamps
+            result = self.model.transcribe(
+                tmp_path,
+                language=self.language,
+                word_timestamps=True,
+                verbose=False
+            )
+            
+            text = result['text'].strip()
+            
+            # Extract word-level info if available
+            words = []
+            if 'segments' in result:
+                for segment in result['segments']:
+                    if 'words' in segment:
+                        words.extend(segment['words'])
+            
+            # Calculate average confidence
+            confidence = 1.0
+            if words:
+                confidences = [w.get('probability', 1.0) for w in words]
+                confidence = sum(confidences) / len(confidences)
+            
+            return {
+                'text': text,
+                'words': words,
+                'confidence': confidence
+            }
+        finally:
+            os.unlink(tmp_path)
+    
+    def is_noisy(self, audio_chunk: AudioSegment) -> bool:
+        """Check if audio chunk is too noisy/low quality using RMS"""
         if not self.filter_noise:
             return False
         
-        # Calculate RMS energy
-        samples = np.array(audio_segment.get_array_of_samples())
-        if audio_segment.sample_width == 2:
-            samples = samples.astype(np.float32) / 32768.0
-        elif audio_segment.sample_width == 4:
-            samples = samples.astype(np.float32) / 2147483648.0
+        samples = np.array(audio_chunk.get_array_of_samples())
+        samples_float = samples.astype(np.float32)
         
-        rms = np.sqrt(np.mean(samples**2))
+        # Normalize to [-1, 1] range
+        if audio_chunk.sample_width == 2:  # 16-bit
+            samples_float = samples_float / 32768.0
+        elif audio_chunk.sample_width == 4:  # 32-bit
+            samples_float = samples_float / 2147483648.0
+        
+        # Calculate RMS
+        rms = np.sqrt(np.mean(samples_float**2))
         
         return rms < self.min_rms
     
-    def transcribe_segment(self, audio_segment: AudioSegment) -> Dict:
-        """Transcribe a single audio segment with word timestamps and confidence"""
-        # Convert to numpy array for Whisper
-        samples = np.array(audio_segment.get_array_of_samples())
-        
-        # Normalize to float32
-        if audio_segment.sample_width == 2:  # 16-bit
-            samples = samples.astype(np.float32) / 32768.0
-        elif audio_segment.sample_width == 4:  # 32-bit
-            samples = samples.astype(np.float32) / 2147483648.0
-        
-        # Transcribe with word timestamps
-        result = self.model.transcribe(
-            samples,
-            language=self.language,
-            task='transcribe',
-            fp16=False,
-            word_timestamps=True
-        )
-        
-        # Extract word-level timing and calculate average confidence
-        words = []
-        confidences = []
-        for segment in result.get('segments', []):
-            # Segment-level confidence from no_speech_prob
-            seg_confidence = 1.0 - segment.get('no_speech_prob', 0.0)
-            confidences.append(seg_confidence)
-            
-            for word in segment.get('words', []):
-                words.append({
-                    'word': word['word'].strip(),
-                    'start': word['start'],
-                    'end': word['end'],
-                    'probability': word.get('probability', 1.0)
-                })
-        
-        avg_confidence = sum(confidences) / len(confidences) if confidences else 0.5
-        
-        return {
-            'text': result['text'].strip(),
-            'words': words,
-            'confidence': avg_confidence
-        }
-    
-    def process_file(self, audio_path: str, speaker_id: str = None) -> Dict:
+    def process_file(self, audio_path: str, speaker_id: Optional[str] = None) -> Dict:
         """
-        Process audio file: Split by VAD, transcribe chunks, align sentences
+        Process audio file: split, transcribe, and export segments
+        Now with YAMNet music filtering
         """
         audio_path = Path(audio_path)
-        if not audio_path.exists():
-            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        base_name = speaker_id or audio_path.stem
         
-        base_name = f"{speaker_id}_{audio_path.stem}" if speaker_id else audio_path.stem
-        
-        print(f"\n{'='*60}")
         print(f"Processing: {audio_path.name}")
-        print(f"{'='*60}\n")
+        print(f"Speaker ID: {base_name}\n")
         
         # Load audio
-        print("Loading audio...")
         audio = AudioSegment.from_file(str(audio_path))
         
         # Ensure mono and 16kHz for Whisper and YAMNet
@@ -394,12 +429,32 @@ class SpeechSplitter:
         # Step 1: Split audio by silence (VAD)
         segments = self.split_audio_by_silence(audio)
         
-        # Step 2: Transcribe each segment with quality filtering
+        # Step 2: Filter music segments using YAMNet
+        if self.filter_music and self.yamnet_filter and self.yamnet_filter.model:
+            print(f"\nFiltering music segments using YAMNet...")
+            filtered_segments = []
+            filtered_music = 0
+            
+            for start_ms, end_ms in tqdm(segments, desc="Music filtering"):
+                chunk = audio[start_ms:end_ms]
+                is_filtered, classification = self.yamnet_filter.is_music_or_mixed(
+                    chunk, self.music_threshold, self.mixed_threshold
+                )
+                
+                if not is_filtered:
+                    filtered_segments.append((start_ms, end_ms))
+                else:
+                    filtered_music += 1
+            
+            segments = filtered_segments
+            print(f"✓ Filtered {filtered_music} music/mixed segments")
+            print(f"✓ Remaining: {len(segments)} speech segments")
+        
+        # Step 3: Transcribe each segment with quality filtering
         print(f"\nTranscribing {len(segments)} segments...")
         transcriptions = []
         filtered_low_confidence = 0
         filtered_noisy = 0
-        filtered_nonspeech = 0
         
         for i, (start_ms, end_ms) in enumerate(tqdm(segments, desc="Transcribing")):
             # Add 500ms buffer to END for transcription (helps Whisper complete words)
@@ -415,13 +470,6 @@ class SpeechSplitter:
             if self.is_noisy(chunk):
                 filtered_noisy += 1
                 continue
-            
-            # YAMNet speech/non-speech filtering
-            if self.use_yamnet and self.yamnet:
-                is_speech, speech_confidence = self.yamnet.is_speech(chunk)
-                if not is_speech:
-                    filtered_nonspeech += 1
-                    continue
             
             try:
                 result = self.transcribe_segment(chunk)
@@ -448,16 +496,14 @@ class SpeechSplitter:
             print(f"⚠ Filtered {filtered_low_confidence} segments (low confidence < {self.min_confidence:.2f})")
         if filtered_noisy > 0:
             print(f"⚠ Filtered {filtered_noisy} segments (noisy, RMS < {self.min_rms:.3f})")
-        if filtered_nonspeech > 0:
-            print(f"⚠ Filtered {filtered_nonspeech} segments (non-speech, YAMNet < {self.yamnet_threshold:.2f})")
         
-        # Step 3: Keep segments as-is (sentence splitting causes word cutoffs due to inaccurate timestamps)
+        # Step 4: Keep segments as-is (sentence splitting causes word cutoffs due to inaccurate timestamps)
         print("\nFinalizing segments...")
         final_segments = transcriptions
         
         print(f"✓ Final: {len(final_segments)} segments\n")
         
-        # Step 4: Export audio and text files
+        # Step 5: Export audio and text files
         output_files = self.export_segments(audio, final_segments, base_name)
         
         # Generate metadata
@@ -562,7 +608,7 @@ class SpeechSplitter:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Speech Splitter - VAD-first approach with YAMNet filtering"
+        description="Speech Splitter - VAD-first approach with YAMNet music filtering"
     )
     parser.add_argument('input', help='Input audio file')
     parser.add_argument('--model', default='large', help='Whisper model size')
@@ -578,8 +624,9 @@ def main():
     parser.add_argument('--min-confidence', type=float, default=0.5, help='Min transcription confidence (0.0-1.0)')
     parser.add_argument('--filter-noise', action='store_true', help='Enable noise filtering')
     parser.add_argument('--min-rms', type=float, default=0.01, help='Min RMS energy (default 0.01)')
-    parser.add_argument('--use-yamnet', action='store_true', help='Enable YAMNet speech detection')
-    parser.add_argument('--yamnet-threshold', type=float, default=0.3, help='YAMNet speech confidence threshold')
+    parser.add_argument('--filter-music', action='store_true', default=True, help='Enable YAMNet music filtering')
+    parser.add_argument('--music-threshold', type=float, default=0.3, help='Music detection threshold (default 0.3)')
+    parser.add_argument('--mixed-threshold', type=float, default=0.2, help='Music+speech detection threshold (default 0.2)')
     
     args = parser.parse_args()
     
@@ -596,8 +643,9 @@ def main():
         min_confidence=args.min_confidence,
         filter_noise=args.filter_noise,
         min_rms=args.min_rms,
-        use_yamnet=args.use_yamnet,
-        yamnet_threshold=args.yamnet_threshold
+        filter_music=args.filter_music,
+        music_threshold=args.music_threshold,
+        mixed_threshold=args.mixed_threshold
     )
     
     splitter.process_file(args.input, args.speaker_id)

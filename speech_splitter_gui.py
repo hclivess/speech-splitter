@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Speech Splitter GUI - PySide6 Application with YAMNet integration
+Speech Splitter GUI - PySide6 Application
+Now with YAMNet music filtering
 """
 
 import sys
@@ -41,10 +42,8 @@ class ProcessingThread(QThread):
             
             self.status.emit("Initializing models...")
             self.log.emit(f"Loading Whisper model: {self.settings['model']}")
-            
-            # Check if YAMNet is enabled but TensorFlow might not be available
-            if self.settings.get('use_yamnet', False):
-                self.log.emit("Loading YAMNet for speech detection...")
+            if self.settings.get('filter_music', True):
+                self.log.emit("Loading YAMNet for music filtering...")
             
             splitter = SpeechSplitter(
                 whisper_model=self.settings['model'],
@@ -59,8 +58,9 @@ class ProcessingThread(QThread):
                 min_confidence=self.settings.get('min_confidence', 0.5),
                 filter_noise=self.settings.get('filter_noise', True),
                 min_rms=self.settings.get('min_rms', 0.01),
-                use_yamnet=self.settings.get('use_yamnet', False),
-                yamnet_threshold=self.settings.get('yamnet_threshold', 0.3)
+                filter_music=self.settings.get('filter_music', True),
+                music_threshold=self.settings.get('music_threshold', 0.3),
+                mixed_threshold=self.settings.get('mixed_threshold', 0.2)
             )
             
             self.log.emit("✓ Models loaded\n")
@@ -124,7 +124,7 @@ class SpeechSplitterGUI(QMainWindow):
         self.load_settings()
     
     def init_ui(self):
-        self.setWindowTitle("Speech Splitter - TTS Data Generator with YAMNet")
+        self.setWindowTitle("Speech Splitter - TTS Data Generator")
         self.setMinimumSize(1000, 700)
         
         main_widget = QWidget()
@@ -137,7 +137,7 @@ class SpeechSplitterGUI(QMainWindow):
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
         
-        subtitle = QLabel("Audio Segmentation for TTS Training with YAMNet Filtering")
+        subtitle = QLabel("Audio Segmentation for TTS Training with YAMNet Music Filtering")
         subtitle.setAlignment(Qt.AlignCenter)
         layout.addWidget(subtitle)
         
@@ -149,7 +149,6 @@ class SpeechSplitterGUI(QMainWindow):
         settings_main_layout = QVBoxLayout()
         
         # Create tab widget
-        from PySide6.QtWidgets import QTabWidget
         tabs = QTabWidget()
         
         # Tab 1: Basic Settings
@@ -209,7 +208,7 @@ class SpeechSplitterGUI(QMainWindow):
         
         segment_layout.addWidget(QLabel("Silence Padding (ms):"))
         self.padding_spin = QSpinBox()
-        self.padding_spin.setRange(0, 500)
+        self.padding_spin.setRange(0, 1000)
         self.padding_spin.setValue(150)
         segment_layout.addWidget(self.padding_spin)
         
@@ -225,12 +224,11 @@ class SpeechSplitterGUI(QMainWindow):
         self.min_silence_spin = QSpinBox()
         self.min_silence_spin.setRange(100, 2000)
         self.min_silence_spin.setValue(700)
-        self.min_silence_spin.setSingleStep(50)
         vad_layout.addWidget(self.min_silence_spin)
         
         vad_layout.addWidget(QLabel("Silence Threshold (dBFS):"))
         self.silence_thresh_spin = QSpinBox()
-        self.silence_thresh_spin.setRange(-60, -20)
+        self.silence_thresh_spin.setRange(-60, -10)
         self.silence_thresh_spin.setValue(-40)
         vad_layout.addWidget(self.silence_thresh_spin)
         
@@ -242,27 +240,11 @@ class SpeechSplitterGUI(QMainWindow):
         quality_tab = QWidget()
         quality_layout = QVBoxLayout()
         
-        # YAMNet settings
-        self.use_yamnet_check = QCheckBox("Enable YAMNet Speech Detection")
-        self.use_yamnet_check.setChecked(True)
-        self.use_yamnet_check.setToolTip("Filter out non-speech segments using YAMNet model")
-        quality_layout.addWidget(self.use_yamnet_check)
-        
-        quality_layout.addWidget(QLabel("YAMNet Speech Threshold (0.0-1.0):"))
-        self.yamnet_threshold_spin = QDoubleSpinBox()
-        self.yamnet_threshold_spin.setRange(0.0, 1.0)
-        self.yamnet_threshold_spin.setValue(0.3)
-        self.yamnet_threshold_spin.setSingleStep(0.05)
-        self.yamnet_threshold_spin.setDecimals(2)
-        self.yamnet_threshold_spin.setToolTip("Higher values = more strict speech detection")
-        quality_layout.addWidget(self.yamnet_threshold_spin)
-        
-        quality_layout.addWidget(QLabel("Min Confidence (0.0-1.0):"))
+        quality_layout.addWidget(QLabel("Min Transcription Confidence:"))
         self.min_confidence_spin = QDoubleSpinBox()
         self.min_confidence_spin.setRange(0.0, 1.0)
         self.min_confidence_spin.setValue(0.5)
-        self.min_confidence_spin.setSingleStep(0.1)
-        self.min_confidence_spin.setDecimals(2)
+        self.min_confidence_spin.setSingleStep(0.05)
         quality_layout.addWidget(self.min_confidence_spin)
         
         self.filter_noise_check = QCheckBox("Enable Noise Filtering")
@@ -271,7 +253,7 @@ class SpeechSplitterGUI(QMainWindow):
         
         quality_layout.addWidget(QLabel("Min RMS Energy:"))
         self.min_rms_spin = QDoubleSpinBox()
-        self.min_rms_spin.setRange(0.001, 1.0)
+        self.min_rms_spin.setRange(0.001, 0.1)
         self.min_rms_spin.setValue(0.01)
         self.min_rms_spin.setSingleStep(0.005)
         self.min_rms_spin.setDecimals(3)
@@ -281,15 +263,66 @@ class SpeechSplitterGUI(QMainWindow):
         quality_tab.setLayout(quality_layout)
         tabs.addTab(quality_tab, "Quality")
         
+        # Tab 5: Music Filtering (NEW!)
+        music_tab = QWidget()
+        music_layout = QVBoxLayout()
+        
+        self.filter_music_check = QCheckBox("Enable YAMNet Music Filtering")
+        self.filter_music_check.setChecked(True)
+        self.filter_music_check.setToolTip("Use YAMNet to detect and filter out music and mixed music+speech segments")
+        music_layout.addWidget(self.filter_music_check)
+        
+        music_layout.addWidget(QLabel(""))  # Spacer
+        
+        music_layout.addWidget(QLabel("Music Detection Threshold:"))
+        music_threshold_label = QLabel("Higher = stricter filtering (default: 0.3)")
+        music_threshold_label.setStyleSheet("color: gray; font-size: 9pt;")
+        music_layout.addWidget(music_threshold_label)
+        self.music_threshold_spin = QDoubleSpinBox()
+        self.music_threshold_spin.setRange(0.1, 0.9)
+        self.music_threshold_spin.setValue(0.3)
+        self.music_threshold_spin.setSingleStep(0.05)
+        self.music_threshold_spin.setDecimals(2)
+        music_layout.addWidget(self.music_threshold_spin)
+        
+        music_layout.addWidget(QLabel(""))  # Spacer
+        
+        music_layout.addWidget(QLabel("Music+Speech Mix Threshold:"))
+        mixed_threshold_label = QLabel("Filters segments with music background (default: 0.2)")
+        mixed_threshold_label.setStyleSheet("color: gray; font-size: 9pt;")
+        music_layout.addWidget(mixed_threshold_label)
+        self.mixed_threshold_spin = QDoubleSpinBox()
+        self.mixed_threshold_spin.setRange(0.1, 0.9)
+        self.mixed_threshold_spin.setValue(0.2)
+        self.mixed_threshold_spin.setSingleStep(0.05)
+        self.mixed_threshold_spin.setDecimals(2)
+        music_layout.addWidget(self.mixed_threshold_spin)
+        
+        music_layout.addWidget(QLabel(""))  # Spacer
+        
+        info_label = QLabel("ℹ YAMNet uses a pre-trained neural network to classify audio.\n"
+                          "It will filter out:\n"
+                          "• Pure music segments\n"
+                          "• Speech with music background\n"
+                          "• Mixed music and speech content")
+        info_label.setStyleSheet("color: #555; font-size: 9pt; padding: 10px; background: #f0f0f0; border-radius: 5px;")
+        info_label.setWordWrap(True)
+        music_layout.addWidget(info_label)
+        
+        music_layout.addStretch()
+        music_tab.setLayout(music_layout)
+        tabs.addTab(music_tab, "Music Filter")
+        
         settings_main_layout.addWidget(tabs)
         settings_group.setLayout(settings_main_layout)
+        
         content_layout.addWidget(settings_group, 1)
         
-        # Right panel - Files and log
+        # Right panel - Files and Log
         right_panel = QVBoxLayout()
         
-        # File list
-        files_group = QGroupBox("Input Files")
+        # File selection
+        files_group = QGroupBox("Audio Files")
         files_layout = QVBoxLayout()
         
         self.file_list = QListWidget()
@@ -313,7 +346,7 @@ class SpeechSplitterGUI(QMainWindow):
         right_panel.addWidget(files_group, 1)
         
         # Log
-        log_group = QGroupBox("Processing Log")
+        log_group = QGroupBox("Log")
         log_layout = QVBoxLayout()
         
         self.log_text = QTextEdit()
@@ -409,8 +442,9 @@ class SpeechSplitterGUI(QMainWindow):
             'min_confidence': self.min_confidence_spin.value(),
             'filter_noise': self.filter_noise_check.isChecked(),
             'min_rms': self.min_rms_spin.value(),
-            'use_yamnet': self.use_yamnet_check.isChecked(),
-            'yamnet_threshold': self.yamnet_threshold_spin.value()
+            'filter_music': self.filter_music_check.isChecked(),
+            'music_threshold': self.music_threshold_spin.value(),
+            'mixed_threshold': self.mixed_threshold_spin.value()
         }
         
         self.log_text.clear()
@@ -482,8 +516,9 @@ class SpeechSplitterGUI(QMainWindow):
                 self.min_confidence_spin.setValue(settings.get('min_confidence', 0.5))
                 self.filter_noise_check.setChecked(settings.get('filter_noise', True))
                 self.min_rms_spin.setValue(settings.get('min_rms', 0.01))
-                self.use_yamnet_check.setChecked(settings.get('use_yamnet', True))
-                self.yamnet_threshold_spin.setValue(settings.get('yamnet_threshold', 0.3))
+                self.filter_music_check.setChecked(settings.get('filter_music', True))
+                self.music_threshold_spin.setValue(settings.get('music_threshold', 0.3))
+                self.mixed_threshold_spin.setValue(settings.get('mixed_threshold', 0.2))
             except Exception as e:
                 print(f"Error loading settings: {e}")
     
@@ -501,8 +536,9 @@ class SpeechSplitterGUI(QMainWindow):
             'min_confidence': self.min_confidence_spin.value(),
             'filter_noise': self.filter_noise_check.isChecked(),
             'min_rms': self.min_rms_spin.value(),
-            'use_yamnet': self.use_yamnet_check.isChecked(),
-            'yamnet_threshold': self.yamnet_threshold_spin.value()
+            'filter_music': self.filter_music_check.isChecked(),
+            'music_threshold': self.music_threshold_spin.value(),
+            'mixed_threshold': self.mixed_threshold_spin.value()
         }
         
         settings_file = Path.home() / '.speech_splitter_settings.json'
