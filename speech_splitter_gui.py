@@ -53,14 +53,14 @@ class ProcessingThread(QThread):
                 min_segment_length=self.settings['min_length'],
                 max_segment_length=self.settings['max_length'],
                 export_format=self.settings['format'],
-                min_silence_len=self.settings.get('min_silence_len', 700),
-                silence_thresh=self.settings.get('silence_thresh', -40),
+                pause_threshold=self.settings.get('pause_threshold', 0.5),
                 min_confidence=self.settings.get('min_confidence', 0.5),
                 filter_noise=self.settings.get('filter_noise', True),
                 min_rms=self.settings.get('min_rms', 0.01),
                 filter_music=self.settings.get('filter_music', True),
                 music_threshold=self.settings.get('music_threshold', 0.3),
-                mixed_threshold=self.settings.get('mixed_threshold', 0.2)
+                mixed_threshold=self.settings.get('mixed_threshold', 0.2),
+                word_boundary_buffer_ms=self.settings.get('word_buffer', 350)
             )
             
             self.log.emit("✓ Models loaded\n")
@@ -137,7 +137,7 @@ class SpeechSplitterGUI(QMainWindow):
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
         
-        subtitle = QLabel("Audio Segmentation for TTS Training with YAMNet Music Filtering")
+        subtitle = QLabel("Whisper-Only Segmentation with Perfect Audio/Text Alignment")
         subtitle.setAlignment(Qt.AlignCenter)
         layout.addWidget(subtitle)
         
@@ -212,29 +212,39 @@ class SpeechSplitterGUI(QMainWindow):
         self.padding_spin.setValue(150)
         segment_layout.addWidget(self.padding_spin)
         
+        segment_layout.addWidget(QLabel("Pause Threshold (s):"))
+        self.pause_threshold_spin = QDoubleSpinBox()
+        self.pause_threshold_spin.setRange(0.1, 2.0)
+        self.pause_threshold_spin.setValue(0.5)
+        self.pause_threshold_spin.setSingleStep(0.1)
+        self.pause_threshold_spin.setToolTip("Duration of pause to split segments (Whisper-based)")
+        segment_layout.addWidget(self.pause_threshold_spin)
+        
+        segment_layout.addWidget(QLabel("Word Boundary Buffer (ms):"))
+        self.word_buffer_spin = QSpinBox()
+        self.word_buffer_spin.setRange(0, 1000)
+        self.word_buffer_spin.setValue(350)
+        self.word_buffer_spin.setToolTip("Buffer to ensure complete word capture at segment ends")
+        segment_layout.addWidget(self.word_buffer_spin)
+        
         segment_layout.addStretch()
         segment_tab.setLayout(segment_layout)
         tabs.addTab(segment_tab, "Segments")
         
-        # Tab 3: VAD Settings
-        vad_tab = QWidget()
-        vad_layout = QVBoxLayout()
+        # Tab 3: Whisper Settings
+        whisper_tab = QWidget()
+        whisper_layout = QVBoxLayout()
         
-        vad_layout.addWidget(QLabel("Min Silence Length (ms):"))
-        self.min_silence_spin = QSpinBox()
-        self.min_silence_spin.setRange(100, 2000)
-        self.min_silence_spin.setValue(700)
-        vad_layout.addWidget(self.min_silence_spin)
+        whisper_layout.addWidget(QLabel("<b>Segmentation Method: Whisper Word Timestamps</b>"))
+        whisper_layout.addWidget(QLabel("Segmentation relies entirely on Whisper's word-level timestamps"))
+        whisper_layout.addWidget(QLabel("for perfect audio/text alignment."))
+        whisper_layout.addWidget(QLabel(""))
+        whisper_layout.addWidget(QLabel("Adjust 'Pause Threshold' in Segments tab"))
+        whisper_layout.addWidget(QLabel("to control segment splitting."))
         
-        vad_layout.addWidget(QLabel("Silence Threshold (dBFS):"))
-        self.silence_thresh_spin = QSpinBox()
-        self.silence_thresh_spin.setRange(-60, -10)
-        self.silence_thresh_spin.setValue(-40)
-        vad_layout.addWidget(self.silence_thresh_spin)
-        
-        vad_layout.addStretch()
-        vad_tab.setLayout(vad_layout)
-        tabs.addTab(vad_tab, "VAD")
+        whisper_layout.addStretch()
+        whisper_tab.setLayout(whisper_layout)
+        tabs.addTab(whisper_tab, "Whisper")
         
         # Tab 4: Quality Filters
         quality_tab = QWidget()
@@ -436,15 +446,15 @@ class SpeechSplitterGUI(QMainWindow):
             'min_length': self.min_length_spin.value(),
             'max_length': self.max_length_spin.value(),
             'silence_padding': self.padding_spin.value(),
+            'pause_threshold': self.pause_threshold_spin.value(),
             'format': self.format_combo.currentText(),
-            'min_silence_len': self.min_silence_spin.value(),
-            'silence_thresh': self.silence_thresh_spin.value(),
             'min_confidence': self.min_confidence_spin.value(),
             'filter_noise': self.filter_noise_check.isChecked(),
             'min_rms': self.min_rms_spin.value(),
             'filter_music': self.filter_music_check.isChecked(),
             'music_threshold': self.music_threshold_spin.value(),
-            'mixed_threshold': self.mixed_threshold_spin.value()
+            'mixed_threshold': self.mixed_threshold_spin.value(),
+            'word_buffer': self.word_buffer_spin.value()
         }
         
         self.log_text.clear()
@@ -510,15 +520,15 @@ class SpeechSplitterGUI(QMainWindow):
                 self.min_length_spin.setValue(settings.get('min_length', 1.0))
                 self.max_length_spin.setValue(settings.get('max_length', 15.0))
                 self.padding_spin.setValue(settings.get('silence_padding', 150))
+                self.pause_threshold_spin.setValue(settings.get('pause_threshold', 0.5))
                 self.format_combo.setCurrentText(settings.get('format', 'wav'))
-                self.min_silence_spin.setValue(settings.get('min_silence_len', 700))
-                self.silence_thresh_spin.setValue(settings.get('silence_thresh', -40))
                 self.min_confidence_spin.setValue(settings.get('min_confidence', 0.5))
                 self.filter_noise_check.setChecked(settings.get('filter_noise', True))
                 self.min_rms_spin.setValue(settings.get('min_rms', 0.01))
                 self.filter_music_check.setChecked(settings.get('filter_music', True))
                 self.music_threshold_spin.setValue(settings.get('music_threshold', 0.3))
                 self.mixed_threshold_spin.setValue(settings.get('mixed_threshold', 0.2))
+                self.word_buffer_spin.setValue(settings.get('word_buffer', 50))
             except Exception as e:
                 print(f"Error loading settings: {e}")
     
@@ -530,15 +540,15 @@ class SpeechSplitterGUI(QMainWindow):
             'min_length': self.min_length_spin.value(),
             'max_length': self.max_length_spin.value(),
             'silence_padding': self.padding_spin.value(),
+            'pause_threshold': self.pause_threshold_spin.value(),
             'format': self.format_combo.currentText(),
-            'min_silence_len': self.min_silence_spin.value(),
-            'silence_thresh': self.silence_thresh_spin.value(),
             'min_confidence': self.min_confidence_spin.value(),
             'filter_noise': self.filter_noise_check.isChecked(),
             'min_rms': self.min_rms_spin.value(),
             'filter_music': self.filter_music_check.isChecked(),
             'music_threshold': self.music_threshold_spin.value(),
-            'mixed_threshold': self.mixed_threshold_spin.value()
+            'mixed_threshold': self.mixed_threshold_spin.value(),
+            'word_buffer': self.word_buffer_spin.value()
         }
         
         settings_file = Path.home() / '.speech_splitter_settings.json'
