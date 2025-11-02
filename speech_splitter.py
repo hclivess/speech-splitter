@@ -555,40 +555,73 @@ class SpeechSplitter:
             'metadata_file': str(metadata_path),
             'manifest_file': str(manifest_path)
         }
-    
+
     def export_segments(
-        self,
-        audio: AudioSegment,
-        segments: List[Dict],
-        base_name: str,
-        audio_dir: Path,
-        text_dir: Path
+            self,
+            audio: AudioSegment,
+            segments: List[Dict],
+            base_name: str,
+            audio_dir: Path,
+            text_dir: Path
     ) -> List[Tuple[str, str, Dict]]:
         """Export audio chunks and transcripts to per-file directories"""
         print(f"Exporting {len(segments)} segments...")
-        
+
         silence = AudioSegment.silent(duration=self.silence_padding_ms)
         output_files = []
-        
+
         for idx, seg in enumerate(tqdm(segments, desc="Exporting"), 1):
             # Final text validation
             if not self.validate_segment_text(seg['text']):
                 print(f"⚠ Skipping segment {idx} due to invalid text")
                 continue
-            
+
             chunk_name = f"{base_name}_{idx:04d}"
-            
+
             # Extract audio using Whisper word timestamps with buffer for complete word capture
             start_ms = int(seg['start_ms'])
             end_ms = int(seg['end_ms'])
-            
+
             # Add buffer to ensure complete word capture at the end
             buffered_end_ms = min(end_ms + self.word_boundary_buffer_ms, len(audio))
             audio_chunk = audio[start_ms:buffered_end_ms]
-            
+
             # Add configured silence padding at the end
             audio_chunk = audio_chunk + silence
-            
+
+            # NEW: Re-transcribe the filtered audio segment to get accurate text
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+                # Export chunk to temp file
+                temp_chunk_path = tmp.name
+                # Convert to mono 16kHz for Whisper re-transcription
+                chunk_for_whisper = audio_chunk.set_channels(1).set_frame_rate(16000)
+                chunk_for_whisper.export(temp_chunk_path, format='wav')
+
+            try:
+                # Re-transcribe this specific segment
+                retranscription = self.model.transcribe(
+                    temp_chunk_path,
+                    language=self.language,
+                    word_timestamps=False,  # We don't need word timestamps for re-transcription
+                    verbose=False
+                )
+                retranscribed_text = retranscription['text'].strip()
+
+                # Only use re-transcribed text if it's valid and different
+                if self.validate_segment_text(retranscribed_text):
+                    final_text = retranscribed_text
+                    print(f"  ℹ Re-transcribed segment {idx}: '{seg['text'][:30]}...' → '{final_text[:30]}...'")
+                else:
+                    final_text = seg['text'].strip()
+                    print(f"  ℹ Using original transcription for segment {idx}")
+            except Exception as e:
+                print(f"  ⚠ Re-transcription failed for segment {idx}: {e}")
+                final_text = seg['text'].strip()
+            finally:
+                # Clean up temp file
+                os.unlink(temp_chunk_path)
+
             # Export audio
             audio_file = audio_dir / f"{chunk_name}.{self.export_format}"
             audio_chunk.export(
@@ -596,20 +629,20 @@ class SpeechSplitter:
                 format=self.export_format,
                 parameters=["-ar", "22050"]
             )
-            
-            # Export transcript
+
+            # Export transcript with re-transcribed text
             transcript_file = text_dir / f"{chunk_name}.txt"
             with open(transcript_file, 'w', encoding='utf-8') as f:
-                f.write(seg['text'].strip())
-            
+                f.write(final_text)
+
             metadata = {
                 'duration': seg['duration'],
-                'text_length': len(seg['text'])
+                'text_length': len(final_text)
             }
-            
+
             output_files.append((str(audio_file), str(transcript_file), metadata))
             print(f"  ✓ Exported: {chunk_name} ({seg['duration']:.2f}s)")
-        
+
         print(f"✓ Exported {len(output_files)} segments")
         return output_files
 
