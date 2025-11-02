@@ -412,7 +412,17 @@ class SpeechSplitter:
     def process_file(self, audio_path: str, speaker_id: Optional[str] = None) -> Dict:
         """
         Process audio file: split, transcribe, and export segments
-        Now with YAMNet music filtering
+        
+        Optimized filtering order to maximize efficiency:
+        1. VAD segmentation (splits audio by silence)
+        2. Length pre-filter (instant, filters too-short segments)
+        3. YAMNet music filter (medium cost, saves transcription work)
+        4. Noise + Transcription + Confidence filters (expensive, done last)
+        5. Export with buffers to prevent cutoff
+        
+        Buffer strategy:
+        - Transcription: 500ms buffer (helps Whisper see full word endings)
+        - Export: 300ms buffer (prevents cutoff while keeping segments tight)
         """
         audio_path = Path(audio_path)
         base_name = speaker_id or audio_path.stem
@@ -429,13 +439,33 @@ class SpeechSplitter:
         # Step 1: Split audio by silence (VAD)
         segments = self.split_audio_by_silence(audio)
         
-        # Step 2: Filter music segments using YAMNet
+        # Step 2: PRE-FILTERING (cheap checks before extraction/transcription)
+        print(f"\nApplying pre-filters...")
+        filtered_length = 0
+        prefiltered_segments = []
+        
+        for start_ms, end_ms in segments:
+            # Length check on base segment (instant, no extraction needed)
+            base_duration_s = (end_ms - start_ms) / 1000.0
+            if base_duration_s < self.min_segment_length:
+                filtered_length += 1
+                continue
+            
+            prefiltered_segments.append((start_ms, end_ms))
+        
+        if filtered_length > 0:
+            print(f"✓ Filtered {filtered_length} segments (too short < {self.min_segment_length}s)")
+        segments = prefiltered_segments
+        print(f"✓ Remaining after length filter: {len(segments)} segments")
+        
+        # Step 3: MUSIC FILTERING using YAMNet (medium cost, saves transcription)
         if self.filter_music and self.yamnet_filter and self.yamnet_filter.model:
             print(f"\nFiltering music segments using YAMNet...")
             filtered_segments = []
             filtered_music = 0
             
             for start_ms, end_ms in tqdm(segments, desc="Music filtering"):
+                # Extract base segment for classification
                 chunk = audio[start_ms:end_ms]
                 is_filtered, classification = self.yamnet_filter.is_music_or_mixed(
                     chunk, self.music_threshold, self.mixed_threshold
@@ -450,23 +480,21 @@ class SpeechSplitter:
             print(f"✓ Filtered {filtered_music} music/mixed segments")
             print(f"✓ Remaining: {len(segments)} speech segments")
         
-        # Step 3: Transcribe each segment with quality filtering
+        # Step 4: TRANSCRIPTION with quality filtering (expensive, done last)
         print(f"\nTranscribing {len(segments)} segments...")
         transcriptions = []
         filtered_low_confidence = 0
         filtered_noisy = 0
         
         for i, (start_ms, end_ms) in enumerate(tqdm(segments, desc="Transcribing")):
-            # Add 500ms buffer to END for transcription (helps Whisper complete words)
+            # TRANSCRIPTION BUFFER: Add 500ms to end so Whisper sees complete word endings
+            # This buffer is larger than export buffer (300ms) to give Whisper full context
+            # The extra 200ms is "look-ahead" for Whisper but won't be in final audio
             transcribe_end_ms = min(end_ms + 500, len(audio))
             chunk = audio[start_ms:transcribe_end_ms]
             duration_s = len(chunk) / 1000.0
             
-            # Skip very short segments
-            if duration_s < self.min_segment_length:
-                continue
-            
-            # Check for noise
+            # Noise check (requires extraction, so done here)
             if self.is_noisy(chunk):
                 filtered_noisy += 1
                 continue
@@ -497,13 +525,13 @@ class SpeechSplitter:
         if filtered_noisy > 0:
             print(f"⚠ Filtered {filtered_noisy} segments (noisy, RMS < {self.min_rms:.3f})")
         
-        # Step 4: Keep segments as-is (sentence splitting causes word cutoffs due to inaccurate timestamps)
+        # Step 5: Keep segments as-is (sentence splitting causes word cutoffs due to inaccurate timestamps)
         print("\nFinalizing segments...")
         final_segments = transcriptions
         
         print(f"✓ Final: {len(final_segments)} segments\n")
         
-        # Step 5: Export audio and text files
+        # Step 6: Export audio and text files
         output_files = self.export_segments(audio, final_segments, base_name)
         
         # Generate metadata
@@ -576,8 +604,11 @@ class SpeechSplitter:
             start_ms = int(seg['start_ms'])
             end_ms = int(seg['end_ms'])
             
-            # Add 300ms buffer to end for audio extraction only
-            # (prevents words being cut short due to timing inaccuracies)
+            # BUFFER STRATEGY: 
+            # - Transcription uses 500ms buffer (helps Whisper complete words)
+            # - Export uses 300ms buffer (prevents word cutoff while keeping segments tight)
+            # - This asymmetry is intentional: we transcribe more than we export
+            #   to ensure Whisper sees full context, but export a tighter segment
             audio_end_ms = min(end_ms + 300, len(audio))
             
             audio_chunk = audio[start_ms:audio_end_ms] + silence
