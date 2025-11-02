@@ -1,5 +1,7 @@
 # Speech Splitter with YAMNet Music Filtering
 
+![image](aavsnx.jpg)
+
 Advanced audio segmentation tool for TTS training data preparation with intelligent music detection and filtering.
 
 ## Features
