@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Speech Splitter GUI - PySide6 Application
+Speech Splitter GUI - PySide6 Application with YAMNet integration
 """
 
 import sys
@@ -42,6 +42,10 @@ class ProcessingThread(QThread):
             self.status.emit("Initializing models...")
             self.log.emit(f"Loading Whisper model: {self.settings['model']}")
             
+            # Check if YAMNet is enabled but TensorFlow might not be available
+            if self.settings.get('use_yamnet', False):
+                self.log.emit("Loading YAMNet for speech detection...")
+            
             splitter = SpeechSplitter(
                 whisper_model=self.settings['model'],
                 language=self.settings['language'],
@@ -54,7 +58,9 @@ class ProcessingThread(QThread):
                 silence_thresh=self.settings.get('silence_thresh', -40),
                 min_confidence=self.settings.get('min_confidence', 0.5),
                 filter_noise=self.settings.get('filter_noise', True),
-                min_rms=self.settings.get('min_rms', 0.01)
+                min_rms=self.settings.get('min_rms', 0.01),
+                use_yamnet=self.settings.get('use_yamnet', False),
+                yamnet_threshold=self.settings.get('yamnet_threshold', 0.3)
             )
             
             self.log.emit("✓ Models loaded\n")
@@ -118,7 +124,7 @@ class SpeechSplitterGUI(QMainWindow):
         self.load_settings()
     
     def init_ui(self):
-        self.setWindowTitle("Speech Splitter - TTS Data Generator")
+        self.setWindowTitle("Speech Splitter - TTS Data Generator with YAMNet")
         self.setMinimumSize(1000, 700)
         
         main_widget = QWidget()
@@ -131,7 +137,7 @@ class SpeechSplitterGUI(QMainWindow):
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
         
-        subtitle = QLabel("Audio Segmentation for TTS Training")
+        subtitle = QLabel("Audio Segmentation for TTS Training with YAMNet Filtering")
         subtitle.setAlignment(Qt.AlignCenter)
         layout.addWidget(subtitle)
         
@@ -235,6 +241,21 @@ class SpeechSplitterGUI(QMainWindow):
         # Tab 4: Quality Filters
         quality_tab = QWidget()
         quality_layout = QVBoxLayout()
+        
+        # YAMNet settings
+        self.use_yamnet_check = QCheckBox("Enable YAMNet Speech Detection")
+        self.use_yamnet_check.setChecked(True)
+        self.use_yamnet_check.setToolTip("Filter out non-speech segments using YAMNet model")
+        quality_layout.addWidget(self.use_yamnet_check)
+        
+        quality_layout.addWidget(QLabel("YAMNet Speech Threshold (0.0-1.0):"))
+        self.yamnet_threshold_spin = QDoubleSpinBox()
+        self.yamnet_threshold_spin.setRange(0.0, 1.0)
+        self.yamnet_threshold_spin.setValue(0.3)
+        self.yamnet_threshold_spin.setSingleStep(0.05)
+        self.yamnet_threshold_spin.setDecimals(2)
+        self.yamnet_threshold_spin.setToolTip("Higher values = more strict speech detection")
+        quality_layout.addWidget(self.yamnet_threshold_spin)
         
         quality_layout.addWidget(QLabel("Min Confidence (0.0-1.0):"))
         self.min_confidence_spin = QDoubleSpinBox()
@@ -387,7 +408,9 @@ class SpeechSplitterGUI(QMainWindow):
             'silence_thresh': self.silence_thresh_spin.value(),
             'min_confidence': self.min_confidence_spin.value(),
             'filter_noise': self.filter_noise_check.isChecked(),
-            'min_rms': self.min_rms_spin.value()
+            'min_rms': self.min_rms_spin.value(),
+            'use_yamnet': self.use_yamnet_check.isChecked(),
+            'yamnet_threshold': self.yamnet_threshold_spin.value()
         }
         
         self.log_text.clear()
@@ -459,6 +482,8 @@ class SpeechSplitterGUI(QMainWindow):
                 self.min_confidence_spin.setValue(settings.get('min_confidence', 0.5))
                 self.filter_noise_check.setChecked(settings.get('filter_noise', True))
                 self.min_rms_spin.setValue(settings.get('min_rms', 0.01))
+                self.use_yamnet_check.setChecked(settings.get('use_yamnet', True))
+                self.yamnet_threshold_spin.setValue(settings.get('yamnet_threshold', 0.3))
             except Exception as e:
                 print(f"Error loading settings: {e}")
     
@@ -475,7 +500,9 @@ class SpeechSplitterGUI(QMainWindow):
             'silence_thresh': self.silence_thresh_spin.value(),
             'min_confidence': self.min_confidence_spin.value(),
             'filter_noise': self.filter_noise_check.isChecked(),
-            'min_rms': self.min_rms_spin.value()
+            'min_rms': self.min_rms_spin.value(),
+            'use_yamnet': self.use_yamnet_check.isChecked(),
+            'yamnet_threshold': self.yamnet_threshold_spin.value()
         }
         
         settings_file = Path.home() / '.speech_splitter_settings.json'

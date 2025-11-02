@@ -1,0 +1,10 @@
+openai-whisper
+pydub
+spacy
+spacy-udpipe
+tqdm
+torch
+numpy
+PySide6
+tensorflow
+tensorflow_hub
