@@ -179,15 +179,17 @@ The tool uses an optimized filtering order for maximum efficiency:
 ```
 1. Load Audio
    ↓
-2. VAD Segmentation (split by silence)
+2. Whisper Transcription (full audio with word timestamps)
    ↓
-3. Length Pre-Filter (instant, removes too-short segments)
+3. Pause-based Segmentation (split by natural pauses using word timestamps)
    ↓
-4. YAMNet Music Filter (medium cost, saves transcription work)
+4. Length Pre-Filter (instant, removes too-short segments)
    ↓
-5. Transcription + Noise Check + Confidence Filter (expensive, done last)
+5. YAMNet Music Filter (medium cost, saves transcription work)
    ↓
-6. Export (exact same audio that was transcribed)
+6. Transcription + Noise Check + Confidence Filter (expensive, done last)
+   ↓
+7. Export (exact same audio that was transcribed, with re-transcription for accuracy)
 ```
 
 **Why this order?**
@@ -239,186 +241,5 @@ for file in audio/*.mp3; do
   python speech_splitter.py "$file" --speaker-id "$(basename "$file" .mp3)"
 done
 ```
-
-## Threshold Tuning Guide
-
-### Music Detection Threshold
-
-**Lower (0.1-0.2)**: Aggressive
-- Catches subtle music
-- May filter some speech with music-like prosody
-- Use for: Audiobooks, podcasts with music beds
-
-**Medium (0.3)**: Balanced ✓ RECOMMENDED
-- Good general-purpose setting
-- Filters obvious music
-- Keeps most clean speech
-
-**Higher (0.4-0.9)**: Conservative
-- Only filters clear music
-- May let some mixed content through
-- Use for: Clean recordings, interviews
-
-### Mixed Content Threshold
-
-**Lower (0.1-0.15)**: Aggressive
-- Filters speech with even quiet background music
-- Strictest quality control
-- Use for: High-quality TTS training
-
-**Medium (0.2)**: Balanced ✓ RECOMMENDED
-- Filters noticeable background music
-- Good for most use cases
-
-**Higher (0.3-0.5)**: Conservative
-- Only filters obvious music backgrounds
-- More permissive
-
-### Confidence Threshold
-
-- **0.3-0.4**: Permissive (keeps most segments)
-- **0.5**: Balanced ✓ RECOMMENDED
-- **0.6-0.8**: Strict (only high-quality transcriptions)
-
-## Troubleshooting
-
-### YAMNet fails to load
-```
-ERROR: Could not load YAMNet
-```
-**Solution:**
-- Install TensorFlow: `pip install tensorflow tensorflow-hub`
-- First run downloads model (~27MB), needs internet
-- Check: `python -c "import tensorflow; print(tensorflow.__version__)"`
-
-### Too much filtered (false positives)
-**Symptoms:** Good speech segments removed
-
-**Solution:**
-- Increase music threshold: `--music-threshold 0.4`
-- Increase mixed threshold: `--mixed-threshold 0.3`
-- Lower confidence threshold: `--min-confidence 0.4`
-
-### Music not filtered (false negatives)
-**Symptoms:** Music segments in output
-
-**Solution:**
-- Decrease thresholds: `--music-threshold 0.2 --mixed-threshold 0.15`
-- Check YAMNet is enabled: `--filter-music`
-- Test segment: `python test_yamnet.py segment.mp3`
-
-### Slow processing
-**Solutions:**
-- Use smaller Whisper model: `--model base` or `--model small`
-- Disable music filtering: `--no-filter-music`
-- Install TensorFlow with GPU support
-- Process files in parallel (separate terminal windows)
-
-### Audio/text mismatch
-**Should not happen** - fixed in current version
-- Same 300ms buffer used for transcription and export
-- Exact audio chunk transcribed = exact audio chunk exported
-- If you see this, report as a bug
-
-### Words cut off at end
-**Solution:**
-- Already using 300ms buffer
-- Check `--silence-padding` (default 150ms)
-- May need to increase: `--silence-padding 300`
-
-## Performance Tips
-
-1. **GPU Acceleration**: Install TensorFlow with CUDA support for 5-10x speedup
-2. **Model Size**: Use `base` or `small` for 3-5x faster processing with slight accuracy trade-off
-3. **Batch Processing**: Process multiple files sequentially (GUI) or parallel (CLI)
-4. **Pre-filtering**: Music filtering before transcription saves 30-50% time on music-heavy audio
-5. **Disk Speed**: Use SSD for output directory
-
-## Output Files
-
-Each processed file generates:
-
-**audio/** - Individual audio segments
-- Format: WAV (22.05kHz) or MP3
-- Naming: `{speaker_id}_{0001}.wav`
-- Padding: Configured silence at end
-
-**transcripts/** - Text transcriptions
-- Format: UTF-8 plain text
-- Naming: `{speaker_id}_{0001}.txt`
-- Content: Transcribed speech only
-
-**{speaker_id}_metadata.json** - Detailed segment information
-```json
-{
-  "source_file": "podcast.mp3",
-  "speaker_id": "podcast",
-  "language": "en",
-  "total_segments": 42,
-  "segments": [
-    {
-      "audio": "podcast_0001.wav",
-      "transcript": "podcast_0001.txt",
-      "duration": 3.5,
-      "text_length": 85
-    }
-  ]
-}
-```
-
-**{speaker_id}_manifest.txt** - Audio-transcript pairs
-```
-podcast_0001.wav|podcast_0001.txt
-podcast_0002.wav|podcast_0002.txt
-```
-
-## Dependencies
-
-**Core:**
-- openai-whisper - Speech transcription
-- pydub - Audio manipulation
-- tensorflow - YAMNet neural network
-- tensorflow-hub - Pre-trained model loading
-- numpy - Numerical operations
-- tqdm - Progress bars
-
-**GUI (optional):**
-- PySide6 - Qt-based interface
-
-**Language Support (optional):**
-- spacy - Advanced sentence segmentation
-- spacy-udpipe - Czech language support
-
-## Known Limitations
-
-1. **First Run**: Downloads YAMNet model (~27MB), requires internet
-2. **GPU Memory**: TensorFlow uses more memory with GPU (but faster)
-3. **Short Segments**: Very short segments (<1s) may not classify accurately
-4. **Edge Cases**: Complex music/speech mixing may not filter perfectly
-
-## Testing
-
-Test YAMNet classification on any file:
-```bash
-python test_yamnet.py sample.mp3
-```
-
-Shows:
-- Music probability
-- Speech probability
-- Mixed content probability
-- Filtering decisions at different thresholds
-
-## Credits
-
-- **YAMNet**: Google Research (Apache 2.0 License)
-- **Whisper**: OpenAI (MIT License)
-- **TensorFlow**: Google Brain
-
-## License
-
-See individual component licenses above.
-
----
 
 For issues or questions, check the troubleshooting section above or report issues on the repository.
