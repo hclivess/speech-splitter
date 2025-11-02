@@ -218,6 +218,28 @@ class SentenceSplitter:
 
 
 class SpeechSplitter:
+    """
+    Speech Splitter with VAD, YAMNet music filtering, and quality filtering
+    
+    Output Structure:
+        output_dir/
+            speaker1/
+                audio/
+                    speaker1_0001.wav
+                    speaker1_0002.wav
+                transcripts/
+                    speaker1_0001.txt
+                    speaker1_0002.txt
+                speaker1_metadata.json
+                speaker1_manifest.txt
+            speaker2/
+                audio/
+                    speaker2_0001.wav
+                transcripts/
+                    speaker2_0001.txt
+                speaker2_metadata.json
+                speaker2_manifest.txt
+    """
     def __init__(
         self,
         whisper_model: str = "large",
@@ -272,11 +294,8 @@ class SpeechSplitter:
         self.music_threshold = music_threshold
         self.mixed_threshold = mixed_threshold
         
-        # Create output directories
-        self.audio_dir = self.output_dir / "audio"
-        self.text_dir = self.output_dir / "transcripts"
-        self.audio_dir.mkdir(parents=True, exist_ok=True)
-        self.text_dir.mkdir(parents=True, exist_ok=True)
+        # Create main output directory
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         
         # Load Whisper
         print(f"Loading Whisper model ({whisper_model})...")
@@ -418,17 +437,27 @@ class SpeechSplitter:
         2. Length pre-filter (instant, filters too-short segments)
         3. YAMNet music filter (medium cost, saves transcription work)
         4. Noise + Transcription + Confidence filters (expensive, done last)
-        5. Export with buffers to prevent cutoff
+        5. Export exact same audio that was transcribed
         
-        Buffer strategy:
-        - Transcription: 500ms buffer (helps Whisper see full word endings)
-        - Export: 300ms buffer (prevents cutoff while keeping segments tight)
+        Audio/Text alignment:
+        - Uses 300ms buffer for both transcription AND export
+        - Guarantees perfect synchronization (no audio/text mismatch)
+        - Same audio chunk transcribed = same audio chunk exported
         """
         audio_path = Path(audio_path)
         base_name = speaker_id or audio_path.stem
         
         print(f"Processing: {audio_path.name}")
         print(f"Speaker ID: {base_name}\n")
+        
+        # Create per-file output directories
+        file_output_dir = self.output_dir / base_name
+        audio_dir = file_output_dir / "audio"
+        text_dir = file_output_dir / "transcripts"
+        audio_dir.mkdir(parents=True, exist_ok=True)
+        text_dir.mkdir(parents=True, exist_ok=True)
+        
+        print(f"Output directory: {file_output_dir}\n")
         
         # Load audio
         audio = AudioSegment.from_file(str(audio_path))
@@ -487,11 +516,10 @@ class SpeechSplitter:
         filtered_noisy = 0
         
         for i, (start_ms, end_ms) in enumerate(tqdm(segments, desc="Transcribing")):
-            # TRANSCRIPTION BUFFER: Add 500ms to end so Whisper sees complete word endings
-            # This buffer is larger than export buffer (300ms) to give Whisper full context
-            # The extra 200ms is "look-ahead" for Whisper but won't be in final audio
-            transcribe_end_ms = min(end_ms + 500, len(audio))
-            chunk = audio[start_ms:transcribe_end_ms]
+            # Extract chunk with 300ms buffer - use SAME buffer for transcription and export
+            # This ensures audio and text are perfectly aligned
+            audio_end_ms = min(end_ms + 300, len(audio))
+            chunk = audio[start_ms:audio_end_ms]
             duration_s = len(chunk) / 1000.0
             
             # Noise check (requires extraction, so done here)
@@ -511,6 +539,7 @@ class SpeechSplitter:
                     transcriptions.append({
                         'start_ms': start_ms,
                         'end_ms': end_ms,
+                        'audio_end_ms': audio_end_ms,  # Store exact extraction point
                         'duration': duration_s,
                         'text': result['text'],
                         'words': result['words'],
@@ -532,7 +561,7 @@ class SpeechSplitter:
         print(f"✓ Final: {len(final_segments)} segments\n")
         
         # Step 6: Export audio and text files
-        output_files = self.export_segments(audio, final_segments, base_name)
+        output_files = self.export_segments(audio, final_segments, base_name, audio_dir, text_dir)
         
         # Generate metadata
         metadata = {
@@ -550,12 +579,12 @@ class SpeechSplitter:
             ]
         }
         
-        metadata_path = self.output_dir / f"{base_name}_metadata.json"
+        metadata_path = file_output_dir / f"{base_name}_metadata.json"
         with open(metadata_path, 'w', encoding='utf-8') as f:
             json.dump(metadata, f, ensure_ascii=False, indent=2)
         
         # Generate manifest
-        manifest_path = self.output_dir / f"{base_name}_manifest.txt"
+        manifest_path = file_output_dir / f"{base_name}_manifest.txt"
         with open(manifest_path, 'w', encoding='utf-8') as f:
             for audio_file, transcript_file, _ in output_files:
                 f.write(f"{Path(audio_file).name}|{Path(transcript_file).name}\n")
@@ -570,7 +599,7 @@ class SpeechSplitter:
         print(f"Segments: {len(output_files)}")
         print(f"Duration: {total_duration:.2f}s")
         print(f"Average: {avg_duration:.2f}s per segment")
-        print(f"Output: {self.output_dir}")
+        print(f"Output: {file_output_dir}")
         print(f"{'='*60}\n")
         
         return {
@@ -585,9 +614,11 @@ class SpeechSplitter:
         self,
         audio: AudioSegment,
         segments: List[Dict],
-        base_name: str
+        base_name: str,
+        audio_dir: Path,
+        text_dir: Path
     ) -> List[Tuple[str, str, Dict]]:
-        """Export audio chunks and transcripts"""
+        """Export audio chunks and transcripts to per-file directories"""
         print(f"Exporting {len(segments)} segments...")
         
         silence = AudioSegment.silent(duration=self.silence_padding_ms)
@@ -600,21 +631,15 @@ class SpeechSplitter:
             
             chunk_name = f"{base_name}_{idx:04d}"
             
-            # Extract audio with extra buffer at end to prevent cutoffs
+            # Use the EXACT same audio boundaries that were transcribed
+            # This guarantees perfect audio/text alignment
             start_ms = int(seg['start_ms'])
-            end_ms = int(seg['end_ms'])
-            
-            # BUFFER STRATEGY: 
-            # - Transcription uses 500ms buffer (helps Whisper complete words)
-            # - Export uses 300ms buffer (prevents word cutoff while keeping segments tight)
-            # - This asymmetry is intentional: we transcribe more than we export
-            #   to ensure Whisper sees full context, but export a tighter segment
-            audio_end_ms = min(end_ms + 300, len(audio))
+            audio_end_ms = int(seg['audio_end_ms'])  # Use stored extraction point
             
             audio_chunk = audio[start_ms:audio_end_ms] + silence
             
             # Export audio
-            audio_file = self.audio_dir / f"{chunk_name}.{self.export_format}"
+            audio_file = audio_dir / f"{chunk_name}.{self.export_format}"
             audio_chunk.export(
                 audio_file,
                 format=self.export_format,
@@ -622,7 +647,7 @@ class SpeechSplitter:
             )
             
             # Export transcript
-            transcript_file = self.text_dir / f"{chunk_name}.txt"
+            transcript_file = text_dir / f"{chunk_name}.txt"
             with open(transcript_file, 'w', encoding='utf-8') as f:
                 f.write(seg['text'].strip())
             
