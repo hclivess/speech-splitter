@@ -590,39 +590,37 @@ class SpeechSplitter:
             audio_chunk = audio_chunk + silence
 
             # NEW: Re-transcribe the filtered audio segment to get accurate text
+            final_text = seg['text'].strip()  # Default to original text
+
             import tempfile
             with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
-                # Export chunk to temp file
                 temp_chunk_path = tmp.name
-                # Convert to mono 16kHz for Whisper re-transcription
-                chunk_for_whisper = audio_chunk.set_channels(1).set_frame_rate(16000)
-                chunk_for_whisper.export(temp_chunk_path, format='wav')
+                # Export the exact same audio chunk that will be saved - no conversion needed
+                audio_chunk.export(temp_chunk_path, format='wav')
 
             try:
-                # Re-transcribe this specific segment
+                # Re-transcribe this specific segment to get text matching the actual audio
                 retranscription = self.model.transcribe(
                     temp_chunk_path,
                     language=self.language,
-                    word_timestamps=False,  # We don't need word timestamps for re-transcription
+                    word_timestamps=False,
                     verbose=False
                 )
                 retranscribed_text = retranscription['text'].strip()
 
-                # Only use re-transcribed text if it's valid and different
+                # Only use re-transcribed text if it's valid
                 if self.validate_segment_text(retranscribed_text):
                     final_text = retranscribed_text
                     print(f"  ℹ Re-transcribed segment {idx}: '{seg['text'][:30]}...' → '{final_text[:30]}...'")
                 else:
-                    final_text = seg['text'].strip()
-                    print(f"  ℹ Using original transcription for segment {idx}")
+                    print(f"  ℹ Using original transcription for segment {idx} (re-transcription invalid)")
             except Exception as e:
                 print(f"  ⚠ Re-transcription failed for segment {idx}: {e}")
-                final_text = seg['text'].strip()
             finally:
                 # Clean up temp file
                 os.unlink(temp_chunk_path)
 
-            # Export audio
+            # Export audio (this is the unchanged, original audio chunk)
             audio_file = audio_dir / f"{chunk_name}.{self.export_format}"
             audio_chunk.export(
                 audio_file,
@@ -630,7 +628,7 @@ class SpeechSplitter:
                 parameters=["-ar", "22050"]
             )
 
-            # Export transcript with re-transcribed text
+            # Export transcript with the final text (either re-transcribed or original)
             transcript_file = text_dir / f"{chunk_name}.txt"
             with open(transcript_file, 'w', encoding='utf-8') as f:
                 f.write(final_text)
