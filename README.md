@@ -7,12 +7,9 @@ Advanced audio segmentation tool for TTS training data preparation with intellig
 ## Features
 
 - **Whisper Transcription** - Accurate speech-to-text with word-level timestamps
-- **VAD (Voice Activity Detection)** - Intelligent silence-based segmentation
 - **YAMNet Music Filtering** - Neural network-based music detection and removal
 - **Quality Filtering** - Confidence scoring and noise threshold filtering
-- **Optimized Pipeline** - Efficient filter ordering (cheap filters first, expensive last)
 - **Perfect Audio/Text Sync** - Guaranteed alignment between audio segments and transcripts
-- **Organized Output** - Each input file gets its own subdirectory
 - **Batch Processing** - Process multiple files at once
 - **GUI & CLI** - Choose your preferred interface
 
