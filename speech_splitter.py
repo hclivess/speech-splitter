@@ -294,14 +294,6 @@ class SpeechSplitter:
                     if pause_duration >= self.pause_threshold:
                         should_split = True
             
-            # Check if segment is too long (even if no pause)
-            if current_segment_words:
-                first_word = current_segment_words[0]
-                if 'start' in first_word:
-                    segment_duration = word['end'] - first_word['start']
-                    if segment_duration >= self.max_segment_length:
-                        should_split = True
-            
             # Last word always ends segment
             if i == len(words) - 1:
                 should_split = True
