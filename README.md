@@ -1,5 +1,8 @@
 # Speech Splitter with YAMNet Music Filtering
 
+## Downsides: 
+- Whisper transcription does not always get proper names right
+
 ![image](aavsnx.jpg)
 
 Advanced audio segmentation tool for TTS training data preparation with intelligent music detection and filtering.
