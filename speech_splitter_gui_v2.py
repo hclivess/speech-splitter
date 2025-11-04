@@ -59,8 +59,8 @@ class ProcessingThread(QThread):
                 filter_music=self.settings.get('filter_music', True),
                 music_threshold=self.settings.get('music_threshold', 0.3),
                 mixed_threshold=self.settings.get('mixed_threshold', 0.2),
-                word_start_buffer_ms=self.settings.get('word_start_buffer', 100),
-                word_end_buffer_ms=self.settings.get('word_end_buffer', 500)
+                word_start_buffer_ms=self.settings.get('word_start_buffer', 250),
+                word_end_buffer_ms=self.settings.get('word_end_buffer', 750)
             )
             
             self.log.emit("✓ Models loaded\n")
@@ -217,14 +217,14 @@ class SpeechSplitterGUI(QMainWindow):
         segment_layout.addWidget(QLabel("Word Start Buffer (ms):"))
         self.word_start_buffer_spin = QSpinBox()
         self.word_start_buffer_spin.setRange(0, 1000)
-        self.word_start_buffer_spin.setValue(100)
+        self.word_start_buffer_spin.setValue(250)
         self.word_start_buffer_spin.setToolTip("Buffer added at START of segments to capture complete word beginnings")
         segment_layout.addWidget(self.word_start_buffer_spin)
         
         segment_layout.addWidget(QLabel("Word End Buffer (ms):"))
         self.word_end_buffer_spin = QSpinBox()
         self.word_end_buffer_spin.setRange(0, 1000)
-        self.word_end_buffer_spin.setValue(500)
+        self.word_end_buffer_spin.setValue(750)
         self.word_end_buffer_spin.setToolTip("Buffer added at END of segments to capture complete word endings")
         segment_layout.addWidget(self.word_end_buffer_spin)
         
