@@ -109,25 +109,17 @@ class YAMNetFilter:
     
     def is_silent(self, audio_segment: AudioSegment, 
                   silence_threshold: float = 0.3) -> bool:
-        """Detect if audio segment contains significant silence"""
         classification = self.classify_audio(audio_segment)
         return classification['silence'] > silence_threshold
     
     def is_true_pause(self, audio_segment: AudioSegment,
                      silence_threshold: float = 0.3,
                      speech_threshold: float = 0.2) -> bool:
-        """
-        Determine if an audio segment is a true pause/silence.
-        Returns True if it's mostly silence and not speech/music.
-        """
-        if len(audio_segment) < 50:  # Too short to analyze reliably
+        if len(audio_segment) < 50:
             return True
         
         classification = self.classify_audio(audio_segment)
         
-        # It's a true pause if:
-        # 1. High silence score, OR
-        # 2. Low speech AND low music scores
         is_silence = classification['silence'] > silence_threshold
         is_not_speech = classification['speech'] < speech_threshold and classification['music'] < speech_threshold
         
@@ -158,7 +150,8 @@ class SpeechSplitter:
         cutoff_silence_threshold: float = 0.3,
         cutoff_action: str = "rename",
         hybrid_pause_detection: bool = True,
-        pause_speech_threshold: float = 0.2
+        pause_speech_threshold: float = 0.2,
+        buffer_validation_threshold: float = 0.3
     ):
         self.whisper_model = whisper_model
         self.language = language
@@ -181,6 +174,7 @@ class SpeechSplitter:
         self.cutoff_action = cutoff_action
         self.hybrid_pause_detection = hybrid_pause_detection
         self.pause_speech_threshold = pause_speech_threshold
+        self.buffer_validation_threshold = buffer_validation_threshold
         
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.audio_dir = self.output_dir / "audio"
@@ -253,23 +247,15 @@ class SpeechSplitter:
     
     def is_pause_validated(self, audio: AudioSegment, word_end_ms: int, next_word_start_ms: int, 
                           pause_duration: float) -> bool:
-        """
-        Validate ALL pauses with YAMNet audio analysis.
-        First checks timestamp threshold, then validates with actual audio.
-        """
-        # First check: timestamp-based
         if pause_duration < self.pause_threshold:
             return False
         
-        # If hybrid detection is disabled or YAMNet not available, rely on timestamps only
         if not self.hybrid_pause_detection or not self.yamnet_filter or not self.yamnet_filter.model:
             return True
         
-        # Second check: validate with audio analysis
         try:
             gap_audio = audio[word_end_ms:next_word_start_ms]
             
-            # Use YAMNet to verify it's actually a pause
             is_pause = self.yamnet_filter.is_true_pause(
                 gap_audio, 
                 self.noise_silence_threshold,
@@ -280,7 +266,68 @@ class SpeechSplitter:
             
         except Exception as e:
             print(f"    ⚠ Error validating pause: {e}, falling back to timestamp")
-            return True  # Fall back to accepting the pause if analysis fails
+            return True
+    
+    def validate_buffer_zone(self, audio: AudioSegment, start_ms: int, end_ms: int) -> bool:
+        if not self.yamnet_filter or not self.yamnet_filter.model:
+            return True
+        
+        if end_ms <= start_ms or start_ms < 0 or end_ms > len(audio):
+            return False
+        
+        try:
+            buffer_audio = audio[start_ms:end_ms]
+            if len(buffer_audio) < 20:
+                return True
+            
+            is_safe = self.yamnet_filter.is_true_pause(
+                buffer_audio,
+                self.buffer_validation_threshold,
+                self.pause_speech_threshold
+            )
+            
+            return is_safe
+            
+        except Exception as e:
+            print(f"    ⚠ Error validating buffer: {e}, skipping buffer")
+            return False
+    
+    def get_validated_boundaries(self, audio: AudioSegment, start_ms: int, end_ms: int,
+                                prev_word_end_ms: Optional[int], next_word_start_ms: Optional[int]) -> Tuple[int, int]:
+        validated_start = start_ms
+        validated_end = end_ms
+        
+        if self.word_start_buffer_ms > 0 and prev_word_end_ms is not None:
+            requested_start = max(start_ms - self.word_start_buffer_ms, prev_word_end_ms)
+            
+            if requested_start < start_ms:
+                if self.validate_buffer_zone(audio, requested_start, start_ms):
+                    validated_start = requested_start
+                else:
+                    print(f"    ⚠ Start buffer rejected: contains speech/noise")
+        
+        if self.word_end_buffer_ms > 0 and next_word_start_ms is not None:
+            requested_end = min(end_ms + self.word_end_buffer_ms, next_word_start_ms)
+            
+            if requested_end > end_ms:
+                if self.validate_buffer_zone(audio, end_ms, requested_end):
+                    validated_end = requested_end
+                else:
+                    print(f"    ⚠ End buffer rejected: contains speech/noise")
+        
+        if prev_word_end_ms is None and self.word_start_buffer_ms > 0:
+            requested_start = max(0, start_ms - self.word_start_buffer_ms)
+            if requested_start < start_ms:
+                if self.validate_buffer_zone(audio, requested_start, start_ms):
+                    validated_start = requested_start
+        
+        if next_word_start_ms is None and self.word_end_buffer_ms > 0:
+            requested_end = min(len(audio), end_ms + self.word_end_buffer_ms)
+            if requested_end > end_ms:
+                if self.validate_buffer_zone(audio, end_ms, requested_end):
+                    validated_end = requested_end
+        
+        return validated_start, validated_end
     
     def segment_by_pauses(self, words: List[Dict], audio: AudioSegment) -> List[Dict]:
         if not words:
@@ -310,11 +357,9 @@ class SpeechSplitter:
                 if 'start' in next_word and 'end' in word:
                     pause_duration = next_word['start'] - word['end']
                     
-                    # Check if this might be a pause based on timestamp
                     if pause_duration >= self.pause_threshold:
                         total_potential_pauses += 1
                         
-                        # Validate with audio analysis
                         word_end_ms = int(word['end'] * 1000)
                         next_word_start_ms = int(next_word['start'] * 1000)
                         
@@ -325,7 +370,6 @@ class SpeechSplitter:
                             rejected_pauses += 1
                             print(f"  ✗ Rejected pause at {word['end']:.2f}s ({pause_duration:.3f}s) - contains speech/noise")
             
-            # Always split at the end
             if i == len(words) - 1:
                 should_split = True
             
@@ -349,13 +393,30 @@ class SpeechSplitter:
                 segment_duration_s = last_word['end'] - first_word['start']
                 
                 if self.validate_segment_text(segment_text) and segment_duration_s >= self.min_segment_length:
+                    first_word_idx = words.index(current_segment_words[0])
+                    last_word_idx = words.index(current_segment_words[-1])
+                    
+                    prev_word_end_ms = None
+                    if first_word_idx > 0:
+                        prev_word = words[first_word_idx - 1]
+                        if 'end' in prev_word:
+                            prev_word_end_ms = int(prev_word['end'] * 1000)
+                    
+                    next_word_start_ms = None
+                    if last_word_idx < len(words) - 1:
+                        next_word = words[last_word_idx + 1]
+                        if 'start' in next_word:
+                            next_word_start_ms = int(next_word['start'] * 1000)
+                    
                     segments.append({
                         'start_ms': int(first_word['start'] * 1000),
                         'end_ms': int(last_word['end'] * 1000),
                         'duration': segment_duration_s,
                         'words': current_segment_words.copy(),
                         'text': segment_text,
-                        'confidence': avg_confidence
+                        'confidence': avg_confidence,
+                        'prev_word_end_ms': prev_word_end_ms,
+                        'next_word_start_ms': next_word_start_ms
                     })
                     print(f"✓ Created segment: {segment_duration_s:.2f}s, '{segment_text[:50]}...'")
                 else:
@@ -373,7 +434,6 @@ class SpeechSplitter:
         return segments
     
     def is_noisy(self, audio_chunk: AudioSegment) -> bool:
-        """Detect if audio chunk is noisy/silent using YAMNet"""
         if not self.filter_noise or not self.yamnet_filter or not self.yamnet_filter.model:
             return False
         
@@ -404,15 +464,10 @@ class SpeechSplitter:
     
     def handle_cutoff_segment(self, audio_chunk: AudioSegment, text: str, cutoff_type: str, 
                             base_name: str, idx: int) -> Tuple[Optional[str], Optional[str], Optional[Dict]]:
-        """
-        Handle segments with cutoff words based on cutoff_action setting.
-        Returns (audio_file_path, transcript_file_path, metadata) or (None, None, None) if skipped
-        """
         if self.cutoff_action == "skip":
             print(f"  ⚠ Skipping segment {idx} due to cutoff words at {cutoff_type}")
             return None, None, None
         elif self.cutoff_action == "rename":
-            # Add cutoff indicator to filename
             cutoff_indicator = ""
             if cutoff_type == "start":
                 cutoff_indicator = "_CUTSTART"
@@ -422,21 +477,18 @@ class SpeechSplitter:
                 cutoff_indicator = "_CUTBOTH"
             
             chunk_name = f"{base_name}_{idx:04d}{cutoff_indicator}"
-        else:  # include - no special handling
+        else:
             chunk_name = f"{base_name}_{idx:04d}"
         
-        # Generate unique filename to avoid conflicts
         audio_file = self.get_unique_filename(self.audio_dir, chunk_name, f".{self.export_format}")
         transcript_file = self.get_unique_filename(self.text_dir, chunk_name, ".txt")
         
-        # Export audio
         audio_chunk.export(
             audio_file,
             format=self.export_format,
             parameters=["-ar", str(audio_chunk.frame_rate)]
         )
         
-        # Write transcript
         with open(transcript_file, 'w', encoding='utf-8') as f:
             f.write(text.strip())
         
@@ -451,7 +503,6 @@ class SpeechSplitter:
         return str(audio_file), str(transcript_file), metadata
     
     def get_unique_filename(self, base_path: Path, stem: str, suffix: str) -> Path:
-        """Generate a unique filename by adding a counter if file exists"""
         counter = 0
         path = base_path / f"{stem}{suffix}"
         while path.exists():
@@ -502,7 +553,6 @@ class SpeechSplitter:
         if transcription_result.get('words'):
             print(f"Sample words: {transcription_result.get('words', [])[:3]}")
         
-        # Pass audio to segment_by_pauses for hybrid detection
         segments = self.segment_by_pauses(transcription_result['words'], audio)
         
         if not segments:
@@ -587,8 +637,8 @@ class SpeechSplitter:
             'total_segments': len(output_files),
             'total_duration': total_duration,
             'avg_duration': avg_duration,
-            'metadata_file': None,  # Will be generated for entire folder
-            'manifest_file': None   # Will be generated for entire folder
+            'metadata_file': None,
+            'manifest_file': None
         }
 
     def export_segments(
@@ -609,14 +659,19 @@ class SpeechSplitter:
 
             chunk_name = f"{base_name}_{idx:04d}"
 
-            start_ms = int(seg['start_ms'])
-            end_ms = int(seg['end_ms'])
+            start_ms = seg['start_ms']
+            end_ms = seg['end_ms']
             
-            buffered_start_ms = max(start_ms - self.word_start_buffer_ms, 0)
-            buffered_end_ms = min(end_ms + self.word_end_buffer_ms, len(audio))
-            audio_chunk = audio[buffered_start_ms:buffered_end_ms]
+            validated_start, validated_end = self.get_validated_boundaries(
+                audio,
+                start_ms,
+                end_ms,
+                seg.get('prev_word_end_ms'),
+                seg.get('next_word_start_ms')
+            )
+            
+            audio_chunk = audio[validated_start:validated_end]
 
-            # Cutoff detection - final processing step after segment isolation
             has_cutoff, cutoff_type = self.detect_cutoff(audio_chunk, seg['text'])
             
             if has_cutoff:
@@ -625,11 +680,9 @@ class SpeechSplitter:
                     audio_chunk, seg['text'], cutoff_type, base_name, idx
                 )
                 
-                # If segment was skipped due to cutoff action, continue to next segment
                 if audio_file is None:
                     continue
             else:
-                # No cutoff detected, export normally
                 audio_file = self.get_unique_filename(self.audio_dir, chunk_name, f".{self.export_format}")
                 audio_chunk.export(
                     audio_file,
@@ -654,10 +707,8 @@ class SpeechSplitter:
         return output_files
     
     def regenerate_folder_metadata(self):
-        """Regenerate metadata for the entire folder content"""
         print(f"\nRegenerating metadata for entire folder: {self.output_dir}")
         
-        # Get all audio files in the audio directory
         audio_files = list(self.audio_dir.glob(f'*.{self.export_format}'))
         if not audio_files:
             print("⚠ No audio files found in output directory")
@@ -665,24 +716,20 @@ class SpeechSplitter:
         
         print(f"Found {len(audio_files)} audio files")
         
-        # Build segment list from existing files
         segments = []
         for audio_file in audio_files:
-            # Find corresponding transcript file
             transcript_file = self.text_dir / f"{audio_file.stem}.txt"
             if not transcript_file.exists():
                 print(f"⚠ Transcript not found for {audio_file.name}, skipping")
                 continue
             
-            # Load audio to get duration
             try:
                 audio = AudioSegment.from_file(audio_file)
-                duration = len(audio) / 1000.0  # Convert to seconds
+                duration = len(audio) / 1000.0
             except Exception as e:
                 print(f"⚠ Error loading {audio_file.name}: {e}, using 0 duration")
                 duration = 0.0
             
-            # Read transcript text
             try:
                 with open(transcript_file, 'r', encoding='utf-8') as f:
                     text = f.read().strip()
@@ -702,7 +749,6 @@ class SpeechSplitter:
             print("⚠ No valid segments found for metadata generation")
             return
         
-        # Generate metadata.json
         metadata = {
             'total_segments': len(segments),
             'language': self.language,
@@ -713,13 +759,11 @@ class SpeechSplitter:
         with open(metadata_path, 'w', encoding='utf-8') as f:
             json.dump(metadata, f, ensure_ascii=False, indent=2)
         
-        # Generate manifest.txt
         manifest_path = self.output_dir / "manifest.txt"
         with open(manifest_path, 'w', encoding='utf-8') as f:
             for segment in segments:
                 f.write(f"{segment['audio']}|{segment['transcript']}\n")
         
-        # Generate metadata.csv for HuggingFace
         hf_metadata_path = self.output_dir / "metadata.csv"
         with open(hf_metadata_path, 'w', encoding='utf-8') as f:
             f.write("file_name,text\n")
@@ -763,10 +807,9 @@ def main():
     parser.add_argument('--cutoff-boundary-ms', type=int, default=50)
     parser.add_argument('--cutoff-silence-threshold', type=float, default=0.3)
     parser.add_argument('--cutoff-action', default='rename', choices=['rename', 'skip', 'include'])
-    parser.add_argument('--hybrid-pause-detection', action='store_true', default=True,
-                       help='Enable hybrid pause detection (Whisper + YAMNet)')
-    parser.add_argument('--pause-speech-threshold', type=float, default=0.2,
-                       help='Speech probability threshold for pause validation (lower = stricter)')
+    parser.add_argument('--hybrid-pause-detection', action='store_true', default=True)
+    parser.add_argument('--pause-speech-threshold', type=float, default=0.2)
+    parser.add_argument('--buffer-validation-threshold', type=float, default=0.3)
     
     args = parser.parse_args()
     
@@ -791,10 +834,10 @@ def main():
         cutoff_silence_threshold=args.cutoff_silence_threshold,
         cutoff_action=args.cutoff_action,
         hybrid_pause_detection=args.hybrid_pause_detection,
-        pause_speech_threshold=args.pause_speech_threshold
+        pause_speech_threshold=args.pause_speech_threshold,
+        buffer_validation_threshold=args.buffer_validation_threshold
     )
     
-    # Handle both single file and directory input
     input_path = Path(args.input)
     if input_path.is_file():
         splitter.process_file(str(input_path), args.speaker_id)
@@ -807,7 +850,6 @@ def main():
         print(f"Error: {args.input} is not a valid file or directory")
         return
     
-    # Regenerate metadata for the entire folder content
     splitter.regenerate_folder_metadata()
 
 
