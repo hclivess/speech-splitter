@@ -62,7 +62,8 @@ class ProcessingThread(QThread):
                 cutoff_silence_threshold=self.settings.get('cutoff_silence_threshold', 0.3),
                 cutoff_action=self.settings.get('cutoff_action', 'rename'),
                 hybrid_pause_detection=self.settings.get('hybrid_pause_detection', True),
-                pause_speech_threshold=self.settings.get('pause_speech_threshold', 0.2)
+                pause_speech_threshold=self.settings.get('pause_speech_threshold', 0.2),
+                overlength_action=self.settings.get('overlength_action', 'rename')
             )
             
             self.log.emit("✓ Models loaded\n")
@@ -207,21 +208,18 @@ class SpeechSplitterGUI(QMainWindow):
         self.pause_threshold_spin.setRange(0.1, 2.0)
         self.pause_threshold_spin.setValue(0.5)
         self.pause_threshold_spin.setSingleStep(0.1)
-        self.pause_threshold_spin.setToolTip("Duration of pause to split segments (Whisper-based)")
         segment_layout.addWidget(self.pause_threshold_spin)
         
         segment_layout.addWidget(QLabel("Word Start Buffer (ms):"))
         self.word_start_buffer_spin = QSpinBox()
         self.word_start_buffer_spin.setRange(0, 1000)
         self.word_start_buffer_spin.setValue(250)
-        self.word_start_buffer_spin.setToolTip("Buffer added at START of segments to capture complete word beginnings")
         segment_layout.addWidget(self.word_start_buffer_spin)
         
         segment_layout.addWidget(QLabel("Word End Buffer (ms):"))
         self.word_end_buffer_spin = QSpinBox()
         self.word_end_buffer_spin.setRange(0, 1000)
         self.word_end_buffer_spin.setValue(750)
-        self.word_end_buffer_spin.setToolTip("Buffer added at END of segments to capture complete word endings")
         segment_layout.addWidget(self.word_end_buffer_spin)
         
         segment_layout.addStretch()
@@ -259,15 +257,9 @@ class SpeechSplitterGUI(QMainWindow):
         
         self.filter_music_check = QCheckBox("Enable YAMNet Music Filtering")
         self.filter_music_check.setChecked(True)
-        self.filter_music_check.setToolTip("Use YAMNet to detect and filter out music and mixed music+speech segments")
         music_layout.addWidget(self.filter_music_check)
         
-        music_layout.addWidget(QLabel(""))
-        
         music_layout.addWidget(QLabel("Music Detection Threshold:"))
-        music_threshold_label = QLabel("Higher = stricter filtering (default: 0.3)")
-        music_threshold_label.setStyleSheet("color: gray; font-size: 9pt;")
-        music_layout.addWidget(music_threshold_label)
         self.music_threshold_spin = QDoubleSpinBox()
         self.music_threshold_spin.setRange(0.1, 0.9)
         self.music_threshold_spin.setValue(0.3)
@@ -275,29 +267,13 @@ class SpeechSplitterGUI(QMainWindow):
         self.music_threshold_spin.setDecimals(2)
         music_layout.addWidget(self.music_threshold_spin)
         
-        music_layout.addWidget(QLabel(""))
-        
         music_layout.addWidget(QLabel("Music+Speech Mix Threshold:"))
-        mixed_threshold_label = QLabel("Filters segments with music background (default: 0.2)")
-        mixed_threshold_label.setStyleSheet("color: gray; font-size: 9pt;")
-        music_layout.addWidget(mixed_threshold_label)
         self.mixed_threshold_spin = QDoubleSpinBox()
         self.mixed_threshold_spin.setRange(0.1, 0.9)
         self.mixed_threshold_spin.setValue(0.2)
         self.mixed_threshold_spin.setSingleStep(0.05)
         self.mixed_threshold_spin.setDecimals(2)
         music_layout.addWidget(self.mixed_threshold_spin)
-        
-        music_layout.addWidget(QLabel(""))
-        
-        info_label = QLabel("ℹ YAMNet uses a pre-trained neural network to classify audio.\n"
-                          "It will filter out:\n"
-                          "• Pure music segments\n"
-                          "• Speech with music background\n"
-                          "• Mixed music and speech content")
-        info_label.setStyleSheet("color: #555; font-size: 9pt; padding: 10px; background: #f0f0f0; border-radius: 5px;")
-        info_label.setWordWrap(True)
-        music_layout.addWidget(info_label)
         
         music_layout.addStretch()
         music_tab.setLayout(music_layout)
@@ -306,34 +282,17 @@ class SpeechSplitterGUI(QMainWindow):
         pause_tab = QWidget()
         pause_layout = QVBoxLayout()
         
-        self.hybrid_pause_check = QCheckBox("Enable Hybrid Pause Detection (Whisper + YAMNet)")
+        self.hybrid_pause_check = QCheckBox("Enable Hybrid Pause Detection")
         self.hybrid_pause_check.setChecked(True)
-        self.hybrid_pause_check.setToolTip("Validates all timestamp-based pauses with YAMNet audio analysis")
         pause_layout.addWidget(self.hybrid_pause_check)
         
-        pause_layout.addWidget(QLabel(""))
-        
         pause_layout.addWidget(QLabel("Pause Speech Threshold:"))
-        pause_speech_label = QLabel("Speech probability threshold for pause validation (default: 0.2)")
-        pause_speech_label.setStyleSheet("color: gray; font-size: 9pt;")
-        pause_layout.addWidget(pause_speech_label)
         self.pause_speech_threshold_spin = QDoubleSpinBox()
         self.pause_speech_threshold_spin.setRange(0.0, 0.5)
         self.pause_speech_threshold_spin.setValue(0.2)
         self.pause_speech_threshold_spin.setSingleStep(0.05)
         self.pause_speech_threshold_spin.setDecimals(2)
         pause_layout.addWidget(self.pause_speech_threshold_spin)
-        
-        pause_layout.addWidget(QLabel(""))
-        
-        hybrid_info_label = QLabel("ℹ Hybrid pause detection improves segmentation accuracy by:\n"
-                                  "1. First identifying potential pauses using Whisper timestamps\n"
-                                  "2. Then validating each pause with YAMNet audio analysis\n"
-                                  "3. Rejecting 'pauses' that contain speech or significant audio\n\n"
-                                  "This prevents splitting in the middle of continuous speech.")
-        hybrid_info_label.setStyleSheet("color: #555; font-size: 9pt; padding: 10px; background: #f0f0f0; border-radius: 5px;")
-        hybrid_info_label.setWordWrap(True)
-        pause_layout.addWidget(hybrid_info_label)
         
         pause_layout.addStretch()
         pause_tab.setLayout(pause_layout)
@@ -344,28 +303,19 @@ class SpeechSplitterGUI(QMainWindow):
         
         self.check_cutoff_check = QCheckBox("Enable Cutoff Detection")
         self.check_cutoff_check.setChecked(True)
-        self.check_cutoff_check.setToolTip("Detect segments with cut-off words at boundaries")
         cutoff_layout.addWidget(self.check_cutoff_check)
-        
-        cutoff_layout.addWidget(QLabel(""))
         
         cutoff_layout.addWidget(QLabel("Cutoff Action:"))
         self.cutoff_action_combo = QComboBox()
         self.cutoff_action_combo.addItems(['rename', 'skip', 'include'])
         self.cutoff_action_combo.setCurrentText('rename')
-        self.cutoff_action_combo.setToolTip("rename: Add suffix to filename\nskip: Discard cutoff segments\ninclude: Keep without marking")
         cutoff_layout.addWidget(self.cutoff_action_combo)
-        
-        cutoff_layout.addWidget(QLabel(""))
         
         cutoff_layout.addWidget(QLabel("Cutoff Boundary Check (ms):"))
         self.cutoff_boundary_spin = QSpinBox()
         self.cutoff_boundary_spin.setRange(10, 200)
         self.cutoff_boundary_spin.setValue(50)
-        self.cutoff_boundary_spin.setToolTip("Duration at start/end to check for cutoff (default: 50ms)")
         cutoff_layout.addWidget(self.cutoff_boundary_spin)
-        
-        cutoff_layout.addWidget(QLabel(""))
         
         cutoff_layout.addWidget(QLabel("Cutoff Silence Threshold:"))
         self.cutoff_silence_threshold_spin = QDoubleSpinBox()
@@ -373,26 +323,24 @@ class SpeechSplitterGUI(QMainWindow):
         self.cutoff_silence_threshold_spin.setValue(0.3)
         self.cutoff_silence_threshold_spin.setSingleStep(0.05)
         self.cutoff_silence_threshold_spin.setDecimals(2)
-        self.cutoff_silence_threshold_spin.setToolTip("Silence probability threshold for detecting cutoff")
         cutoff_layout.addWidget(self.cutoff_silence_threshold_spin)
-        
-        cutoff_layout.addWidget(QLabel(""))
-        
-        cutoff_info_label = QLabel("ℹ Cutoff detection identifies segments where words are cut off:\n"
-                                  "• Checks the first and last 50ms of each segment\n"
-                                  "• Uses YAMNet to detect if audio starts/ends abruptly\n"
-                                  "• Helps identify incomplete utterances\n\n"
-                                  "Actions:\n"
-                                  "• rename: Adds _CUTSTART, _CUTEND, or _CUTBOTH suffix\n"
-                                  "• skip: Discards segments with cutoffs\n"
-                                  "• include: Keeps all segments without marking")
-        cutoff_info_label.setStyleSheet("color: #555; font-size: 9pt; padding: 10px; background: #f0f0f0; border-radius: 5px;")
-        cutoff_info_label.setWordWrap(True)
-        cutoff_layout.addWidget(cutoff_info_label)
         
         cutoff_layout.addStretch()
         cutoff_tab.setLayout(cutoff_layout)
         tabs.addTab(cutoff_tab, "Cutoff Detection")
+        
+        overlength_tab = QWidget()
+        overlength_layout = QVBoxLayout()
+        
+        overlength_layout.addWidget(QLabel("Overlength Action:"))
+        self.overlength_action_combo = QComboBox()
+        self.overlength_action_combo.addItems(['rename', 'skip', 'include'])
+        self.overlength_action_combo.setCurrentText('rename')
+        overlength_layout.addWidget(self.overlength_action_combo)
+        
+        overlength_layout.addStretch()
+        overlength_tab.setLayout(overlength_layout)
+        tabs.addTab(overlength_tab, "Overlength")
         
         settings_main_layout.addWidget(tabs)
         settings_group.setLayout(settings_main_layout)
@@ -524,7 +472,8 @@ class SpeechSplitterGUI(QMainWindow):
             'cutoff_silence_threshold': self.cutoff_silence_threshold_spin.value(),
             'cutoff_action': self.cutoff_action_combo.currentText(),
             'hybrid_pause_detection': self.hybrid_pause_check.isChecked(),
-            'pause_speech_threshold': self.pause_speech_threshold_spin.value()
+            'pause_speech_threshold': self.pause_speech_threshold_spin.value(),
+            'overlength_action': self.overlength_action_combo.currentText()
         }
         
         self.log_text.clear()
@@ -605,6 +554,7 @@ class SpeechSplitterGUI(QMainWindow):
                 self.cutoff_action_combo.setCurrentText(settings.get('cutoff_action', 'rename'))
                 self.hybrid_pause_check.setChecked(settings.get('hybrid_pause_detection', True))
                 self.pause_speech_threshold_spin.setValue(settings.get('pause_speech_threshold', 0.2))
+                self.overlength_action_combo.setCurrentText(settings.get('overlength_action', 'rename'))
             except Exception as e:
                 print(f"Error loading settings: {e}")
     
@@ -630,7 +580,8 @@ class SpeechSplitterGUI(QMainWindow):
             'cutoff_silence_threshold': self.cutoff_silence_threshold_spin.value(),
             'cutoff_action': self.cutoff_action_combo.currentText(),
             'hybrid_pause_detection': self.hybrid_pause_check.isChecked(),
-            'pause_speech_threshold': self.pause_speech_threshold_spin.value()
+            'pause_speech_threshold': self.pause_speech_threshold_spin.value(),
+            'overlength_action': self.overlength_action_combo.currentText()
         }
         
         settings_file = Path.home() / '.speech_splitter_settings.json'

@@ -151,7 +151,8 @@ class SpeechSplitter:
         cutoff_action: str = "rename",
         hybrid_pause_detection: bool = True,
         pause_speech_threshold: float = 0.2,
-        buffer_validation_threshold: float = 0.3
+        buffer_validation_threshold: float = 0.3,
+        overlength_action: str = "rename"
     ):
         self.whisper_model = whisper_model
         self.language = language
@@ -175,6 +176,7 @@ class SpeechSplitter:
         self.hybrid_pause_detection = hybrid_pause_detection
         self.pause_speech_threshold = pause_speech_threshold
         self.buffer_validation_threshold = buffer_validation_threshold
+        self.overlength_action = overlength_action
         
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.audio_dir = self.output_dir / "audio"
@@ -189,7 +191,6 @@ class SpeechSplitter:
             self.yamnet_filter = YAMNetFilter()
             if self.hybrid_pause_detection and self.yamnet_filter.model:
                 print("✓ Hybrid pause detection enabled (Whisper + YAMNet)")
-                print("  All pauses will be validated with audio analysis")
         else:
             self.yamnet_filter = None
             print("⚠ Audio filtering disabled")
@@ -502,6 +503,37 @@ class SpeechSplitter:
         
         return str(audio_file), str(transcript_file), metadata
     
+    def handle_overlength_segment(self, audio_chunk: AudioSegment, text: str,
+                                 base_name: str, idx: int, sample_rate: int) -> Tuple[Optional[str], Optional[str], Optional[Dict]]:
+        if self.overlength_action == "skip":
+            print(f"  ⚠ Skipping segment {idx} due to overlength")
+            return None, None, None
+        elif self.overlength_action == "rename":
+            chunk_name = f"{base_name}_{idx:04d}_LONG"
+        else:
+            chunk_name = f"{base_name}_{idx:04d}"
+        
+        audio_file = self.get_unique_filename(self.audio_dir, chunk_name, f".{self.export_format}")
+        transcript_file = self.get_unique_filename(self.text_dir, chunk_name, ".txt")
+        
+        audio_chunk.export(
+            audio_file,
+            format=self.export_format,
+            parameters=["-ar", str(sample_rate)]
+        )
+        
+        with open(transcript_file, 'w', encoding='utf-8') as f:
+            f.write(text.strip())
+        
+        metadata = {
+            'duration': len(audio_chunk) / 1000.0,
+            'text_length': len(text.strip()),
+            'sample_rate': sample_rate,
+            'overlength': True
+        }
+        
+        return str(audio_file), str(transcript_file), metadata
+    
     def get_unique_filename(self, base_path: Path, stem: str, suffix: str) -> Path:
         counter = 0
         path = base_path / f"{stem}{suffix}"
@@ -547,11 +579,6 @@ class SpeechSplitter:
             transcription_result = self.transcribe_full_audio(temp_audio_path)
         finally:
             os.unlink(temp_audio_path)
-        
-        print(f"Transcription result keys: {list(transcription_result.keys())}")
-        print(f"Number of words: {len(transcription_result.get('words', []))}")
-        if transcription_result.get('words'):
-            print(f"Sample words: {transcription_result.get('words', [])[:3]}")
         
         segments = self.segment_by_pauses(transcription_result['words'], audio)
         
@@ -671,6 +698,19 @@ class SpeechSplitter:
             )
             
             audio_chunk = audio[validated_start:validated_end]
+            segment_duration = len(audio_chunk) / 1000.0
+
+            if segment_duration > self.max_segment_length:
+                print(f"  ⚠ Overlength segment detected: {segment_duration:.2f}s > {self.max_segment_length:.2f}s")
+                audio_file, transcript_file, metadata = self.handle_overlength_segment(
+                    audio_chunk, seg['text'], base_name, idx, sample_rate
+                )
+                
+                if audio_file is None:
+                    continue
+                
+                output_files.append((audio_file, transcript_file, metadata))
+                continue
 
             has_cutoff, cutoff_type = self.detect_cutoff(audio_chunk, seg['text'])
             
@@ -810,6 +850,7 @@ def main():
     parser.add_argument('--hybrid-pause-detection', action='store_true', default=True)
     parser.add_argument('--pause-speech-threshold', type=float, default=0.2)
     parser.add_argument('--buffer-validation-threshold', type=float, default=0.3)
+    parser.add_argument('--overlength-action', default='rename', choices=['rename', 'skip', 'include'])
     
     args = parser.parse_args()
     
@@ -835,7 +876,8 @@ def main():
         cutoff_action=args.cutoff_action,
         hybrid_pause_detection=args.hybrid_pause_detection,
         pause_speech_threshold=args.pause_speech_threshold,
-        buffer_validation_threshold=args.buffer_validation_threshold
+        buffer_validation_threshold=args.buffer_validation_threshold,
+        overlength_action=args.overlength_action
     )
     
     input_path = Path(args.input)
