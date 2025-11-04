@@ -310,7 +310,7 @@ class SpeechSplitter:
         
         if file_output_dir.exists():
             if audio_dir.exists() and list(audio_dir.glob(f'*.{self.export_format}')):
-                print(f"⭐ Skipping: Output folder already exists with processed files")
+                print(f"⏭ Skipping: Output folder already exists with processed files")
                 print(f"   Location: {file_output_dir}")
                 print(f"{'='*60}\n")
                 
@@ -352,13 +352,14 @@ class SpeechSplitter:
                 'manifest_file': None
             }
         
+        # FIXED: Keep original sample rate, only convert to mono if needed
+        original_sample_rate = audio.frame_rate
         if audio.channels > 1:
             audio = audio.set_channels(1)
-        if audio.frame_rate != 16000:
-            audio = audio.set_frame_rate(16000)
         
-        print(f"✓ Loaded: {len(audio)/1000:.1f}s, {audio.frame_rate}Hz, {audio.channels} channel(s)\n")
+        print(f"✓ Loaded: {len(audio)/1000:.1f}s, {audio.frame_rate}Hz (original), {audio.channels} channel(s)\n")
         
+        # Create temporary file for Whisper (Whisper handles its own resampling internally)
         import tempfile
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
             audio.export(tmp.name, format='wav')
@@ -386,6 +387,7 @@ class SpeechSplitter:
                 'manifest_file': None
             }
         
+        # FIXED: Filter segments BEFORE exporting (preventing desync)
         print(f"\nFiltering {len(segments)} segments...")
         filtered_segments = []
         filtered_music = 0
@@ -396,6 +398,7 @@ class SpeechSplitter:
         for seg in tqdm(segments, desc="Filtering"):
             chunk = audio[seg['start_ms']:seg['end_ms']]
             
+            # Music filtering
             if self.yamnet_filter and self.yamnet_filter.model:
                 is_filtered, classification = self.yamnet_filter.is_music_or_mixed(
                     chunk,
@@ -405,25 +408,29 @@ class SpeechSplitter:
                 if is_filtered:
                     filtered_music += 1
                     print(f"  ⚠ Filtered music segment: {seg['duration']:.2f}s")
-                    continue
+                    continue  # SKIP - don't add to filtered_segments
             
+            # Noise filtering
             if self.is_noisy(chunk):
                 filtered_noise += 1
-                continue
+                continue  # SKIP - don't add to filtered_segments
             
+            # Confidence filtering
             if seg['confidence'] < self.min_confidence:
                 filtered_confidence += 1
                 print(f"  ⚠ Filtered low confidence segment: {seg['confidence']:.3f} < {self.min_confidence:.3f}")
-                continue
+                continue  # SKIP - don't add to filtered_segments
             
+            # Text validation filtering
             if not self.validate_segment_text(seg['text']):
                 filtered_text += 1
                 print(f"  ⚠ Filtered invalid text segment: '{seg['text']}'")
-                continue
+                continue  # SKIP - don't add to filtered_segments
             
+            # If we got here, segment passed all filters
             filtered_segments.append(seg)
         
-        print(f"\n✓ Kept {len(filtered_segments)} segments")
+        print(f"\n✓ Kept {len(filtered_segments)} segments (out of {len(segments)} initial segments)")
         if filtered_music > 0:
             print(f"⚠ Filtered {filtered_music} segments (music/mixed)")
         if filtered_noise > 0:
@@ -433,12 +440,21 @@ class SpeechSplitter:
         if filtered_text > 0:
             print(f"⚠ Filtered {filtered_text} segments (invalid text)")
         
-        output_files = self.export_segments(audio, filtered_segments, base_name, audio_dir, text_dir)
+        # FIXED: Export only the filtered segments (keeping audio/text in sync)
+        output_files = self.export_segments(
+            audio, 
+            filtered_segments,  # Only export segments that passed filters
+            base_name, 
+            audio_dir, 
+            text_dir,
+            original_sample_rate  # Pass original sample rate
+        )
         
         metadata = {
             'source_file': str(audio_path.name),
             'speaker_id': speaker_id,
             'language': self.language,
+            'sample_rate': original_sample_rate,
             'total_segments': len(output_files),
             'segments': [
                 {
@@ -480,6 +496,7 @@ class SpeechSplitter:
         print(f"Segments: {len(output_files)}")
         print(f"Duration: {total_duration:.2f}s")
         print(f"Average: {avg_duration:.2f}s per segment")
+        print(f"Sample Rate: {original_sample_rate}Hz (preserved)")
         print(f"Output: {file_output_dir}")
         print(f"{'='*60}\n")
         
@@ -497,9 +514,10 @@ class SpeechSplitter:
             segments: List[Dict],
             base_name: str,
             audio_dir: Path,
-            text_dir: Path
+            text_dir: Path,
+            sample_rate: int
     ) -> List[Tuple[str, str, Dict]]:
-        print(f"Exporting {len(segments)} segments...")
+        print(f"Exporting {len(segments)} segments at {sample_rate}Hz...")
 
         output_files = []
 
@@ -513,15 +531,17 @@ class SpeechSplitter:
             start_ms = int(seg['start_ms'])
             end_ms = int(seg['end_ms'])
             
+            # Add buffers to capture complete word boundaries
             buffered_start_ms = max(start_ms - self.word_start_buffer_ms, 0)
             buffered_end_ms = min(end_ms + self.word_end_buffer_ms, len(audio))
             audio_chunk = audio[buffered_start_ms:buffered_end_ms]
 
+            # FIXED: Export at original sample rate (no resampling)
             audio_file = audio_dir / f"{chunk_name}.{self.export_format}"
             audio_chunk.export(
                 audio_file,
                 format=self.export_format,
-                parameters=["-ar", "16000"]
+                parameters=["-ar", str(sample_rate)]
             )
 
             transcript_file = text_dir / f"{chunk_name}.txt"
@@ -531,13 +551,12 @@ class SpeechSplitter:
             metadata = {
                 'duration': len(audio_chunk) / 1000.0,
                 'text_length': len(seg['text'].strip()),
-                'sample_rate': 16000
+                'sample_rate': sample_rate
             }
 
             output_files.append((str(audio_file), str(transcript_file), metadata))
-            print(f"  ✓ Exported: {chunk_name} ({metadata['duration']:.2f}s)")
 
-        print(f"✓ Exported {len(output_files)} segments")
+        print(f"✓ Exported {len(output_files)} segments at original sample rate ({sample_rate}Hz)")
         return output_files
 
 
