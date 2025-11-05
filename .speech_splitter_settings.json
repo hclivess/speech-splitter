@@ -6,7 +6,7 @@
   "max_length": 12.0,
   "pause_threshold": 0.4,
   "word_start_buffer": 200,
-  "word_end_buffer": 300,
+  "word_end_buffer": 750,
   "format": "wav",
   "min_confidence": 0.5,
   "filter_noise": true,
@@ -19,11 +19,10 @@
   "cutoff_silence_threshold": 0.35,
   "cutoff_action": "rename",
   "hybrid_pause_detection": true,
-  "pause_speech_threshold": 0.2,
+  "pause_speech_threshold": 0.5,
   "overlength_action": "rename",
   "trim_silence": true,
   "trim_threshold_db": -38.0,
   "trim_chunk_ms": 10,
   "trim_pad_ms": 150
-
 }
