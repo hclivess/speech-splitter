@@ -65,8 +65,8 @@ class ProcessingThread(QThread):
                 pause_speech_threshold=self.settings.get('pause_speech_threshold', 0.2),
                 overlength_action=self.settings.get('overlength_action', 'rename'),
                 trim_silence=self.settings.get('trim_silence', True),
-                trim_threshold_db=self.settings.get('trim_threshold_db', -40.0),
-                trim_chunk_ms=self.settings.get('trim_chunk_ms', 10)
+                trim_threshold_db=self.settings.get('trim_threshold_db', -38.0),
+                trim_chunk_ms=self.settings.get('trim_chunk_ms', 20)
             )
             
             self.log.emit("✓ Models loaded\n")

@@ -547,63 +547,38 @@ class SpeechSplitter:
             counter += 1
             path = base_path / f"{stem}_{counter:03d}{suffix}"
         return path
-    
+
     def trim_silence_from_audio(self, audio_chunk: AudioSegment) -> AudioSegment:
-        """
-        Trim silence from the beginning and end of an audio segment using VAD.
-        Uses amplitude-based detection as primary method.
-        """
-        if not self.trim_silence or len(audio_chunk) < 100:
+        if not self.trim_silence or len(audio_chunk) < 200:
             return audio_chunk
-        
-        def detect_nonsilent(audio_segment, min_silence_len=10, silence_thresh=-40):
-            """Detect non-silent chunks in audio."""
-            # Convert to raw audio data
-            seg_len = len(audio_segment)
-            
-            # Find the first non-silent chunk from start
-            start_trim = 0
-            for i in range(0, seg_len, self.trim_chunk_ms):
-                chunk = audio_segment[i:i + self.trim_chunk_ms]
-                if chunk.dBFS > silence_thresh:
-                    start_trim = i
-                    break
-            
-            # Find the first non-silent chunk from end
-            end_trim = seg_len
-            for i in range(seg_len, 0, -self.trim_chunk_ms):
-                chunk = audio_segment[max(0, i - self.trim_chunk_ms):i]
-                if chunk.dBFS > silence_thresh:
-                    end_trim = i
-                    break
-            
-            return start_trim, end_trim
-        
-        try:
-            start_trim, end_trim = detect_nonsilent(
-                audio_chunk,
-                min_silence_len=self.trim_chunk_ms,
-                silence_thresh=self.trim_threshold_db
-            )
-            
-            # Apply trimming with small safety margins (5ms on each side)
-            safety_margin = 5
-            start_trim = max(0, start_trim - safety_margin)
-            end_trim = min(len(audio_chunk), end_trim + safety_margin)
-            
-            if start_trim < end_trim and end_trim - start_trim >= 100:
-                trimmed = audio_chunk[start_trim:end_trim]
-                trimmed_duration = (len(audio_chunk) - len(trimmed)) / 1000.0
-                if trimmed_duration > 0.01:  # Only log if we trimmed more than 10ms
-                    print(f"    Trimmed {trimmed_duration:.3f}s of silence")
-                return trimmed
-            else:
-                return audio_chunk
-                
-        except Exception as e:
-            print(f"    ⚠ Error trimming silence: {e}, keeping original")
+
+        # Minimum silence to always preserve
+        min_silence_pad_ms = 150
+
+        seg_len = len(audio_chunk)
+
+        # Scan for first non-silent region
+        start_trim = 0
+        for i in range(0, seg_len, self.trim_chunk_ms):
+            chunk = audio_chunk[i:i + self.trim_chunk_ms]
+            if chunk.dBFS > self.trim_threshold_db:
+                start_trim = max(0, i - min_silence_pad_ms)
+                break
+
+        # Scan for last non-silent region
+        end_trim = seg_len
+        for i in range(seg_len, 0, -self.trim_chunk_ms):
+            chunk = audio_chunk[max(0, i - self.trim_chunk_ms):i]
+            if chunk.dBFS > self.trim_threshold_db:
+                end_trim = min(seg_len, i + min_silence_pad_ms)
+                break
+
+        if start_trim >= end_trim:
             return audio_chunk
-    
+
+        trimmed_audio = audio_chunk[start_trim:end_trim]
+        return trimmed_audio
+
     def process_file(self, audio_path: str, speaker_id: Optional[str] = None) -> Dict:
         audio_path = Path(audio_path)
         base_name = speaker_id or audio_path.stem
