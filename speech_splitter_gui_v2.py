@@ -38,6 +38,8 @@ class ProcessingThread(QThread):
             
             self.status.emit("Initializing models...")
             self.log.emit(f"Loading Whisper model: {self.settings['model']}")
+            if self.settings.get('use_vad', True):
+                self.log.emit("Loading Silero VAD for trimming and pause detection...")
             if self.settings.get('filter_music', True):
                 self.log.emit("Loading YAMNet for music filtering...")
             
@@ -63,7 +65,10 @@ class ProcessingThread(QThread):
                 cutoff_action=self.settings.get('cutoff_action', 'rename'),
                 hybrid_pause_detection=self.settings.get('hybrid_pause_detection', True),
                 pause_speech_threshold=self.settings.get('pause_speech_threshold', 0.2),
-                overlength_action=self.settings.get('overlength_action', 'rename')
+                overlength_action=self.settings.get('overlength_action', 'rename'),
+                use_vad=self.settings.get('use_vad', True),
+                vad_threshold=self.settings.get('vad_threshold', 0.5),
+                vad_speech_pad_ms=self.settings.get('vad_speech_pad_ms', 50)
             )
             
             self.log.emit("✓ Models loaded\n")
@@ -139,7 +144,7 @@ class SpeechSplitterGUI(QMainWindow):
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
         
-        subtitle = QLabel("Single-Pass Whisper • HuggingFace Compatible • No Audio Resampling")
+        subtitle = QLabel("Single-Pass Whisper • VAD Trimming • HuggingFace Compatible • No Audio Resampling")
         subtitle.setAlignment(Qt.AlignCenter)
         layout.addWidget(subtitle)
         
@@ -297,6 +302,37 @@ class SpeechSplitterGUI(QMainWindow):
         pause_layout.addStretch()
         pause_tab.setLayout(pause_layout)
         tabs.addTab(pause_tab, "Pause Detection")
+        
+        vad_tab = QWidget()
+        vad_layout = QVBoxLayout()
+        
+        self.use_vad_check = QCheckBox("Enable VAD Trimming & Pause Detection")
+        self.use_vad_check.setChecked(True)
+        vad_layout.addWidget(self.use_vad_check)
+        
+        vad_info = QLabel("Silero VAD trims silence from segment boundaries and improves pause detection accuracy.")
+        vad_info.setWordWrap(True)
+        vad_info.setStyleSheet("QLabel { color: gray; font-size: 10px; }")
+        vad_layout.addWidget(vad_info)
+        
+        vad_layout.addWidget(QLabel("VAD Speech Threshold:"))
+        self.vad_threshold_spin = QDoubleSpinBox()
+        self.vad_threshold_spin.setRange(0.1, 0.9)
+        self.vad_threshold_spin.setValue(0.5)
+        self.vad_threshold_spin.setSingleStep(0.05)
+        self.vad_threshold_spin.setDecimals(2)
+        vad_layout.addWidget(self.vad_threshold_spin)
+        
+        vad_layout.addWidget(QLabel("VAD Padding (ms):"))
+        self.vad_speech_pad_spin = QSpinBox()
+        self.vad_speech_pad_spin.setRange(0, 200)
+        self.vad_speech_pad_spin.setValue(50)
+        self.vad_speech_pad_spin.setSingleStep(10)
+        vad_layout.addWidget(self.vad_speech_pad_spin)
+        
+        vad_layout.addStretch()
+        vad_tab.setLayout(vad_layout)
+        tabs.addTab(vad_tab, "VAD")
         
         cutoff_tab = QWidget()
         cutoff_layout = QVBoxLayout()
@@ -473,7 +509,10 @@ class SpeechSplitterGUI(QMainWindow):
             'cutoff_action': self.cutoff_action_combo.currentText(),
             'hybrid_pause_detection': self.hybrid_pause_check.isChecked(),
             'pause_speech_threshold': self.pause_speech_threshold_spin.value(),
-            'overlength_action': self.overlength_action_combo.currentText()
+            'overlength_action': self.overlength_action_combo.currentText(),
+            'use_vad': self.use_vad_check.isChecked(),
+            'vad_threshold': self.vad_threshold_spin.value(),
+            'vad_speech_pad_ms': self.vad_speech_pad_spin.value()
         }
         
         self.log_text.clear()
@@ -555,6 +594,9 @@ class SpeechSplitterGUI(QMainWindow):
                 self.hybrid_pause_check.setChecked(settings.get('hybrid_pause_detection', True))
                 self.pause_speech_threshold_spin.setValue(settings.get('pause_speech_threshold', 0.2))
                 self.overlength_action_combo.setCurrentText(settings.get('overlength_action', 'rename'))
+                self.use_vad_check.setChecked(settings.get('use_vad', True))
+                self.vad_threshold_spin.setValue(settings.get('vad_threshold', 0.5))
+                self.vad_speech_pad_spin.setValue(settings.get('vad_speech_pad_ms', 50))
             except Exception as e:
                 print(f"Error loading settings: {e}")
     
@@ -581,7 +623,10 @@ class SpeechSplitterGUI(QMainWindow):
             'cutoff_action': self.cutoff_action_combo.currentText(),
             'hybrid_pause_detection': self.hybrid_pause_check.isChecked(),
             'pause_speech_threshold': self.pause_speech_threshold_spin.value(),
-            'overlength_action': self.overlength_action_combo.currentText()
+            'overlength_action': self.overlength_action_combo.currentText(),
+            'use_vad': self.use_vad_check.isChecked(),
+            'vad_threshold': self.vad_threshold_spin.value(),
+            'vad_speech_pad_ms': self.vad_speech_pad_spin.value()
         }
         
         settings_file = Path.home() / '.speech_splitter_settings.json'
