@@ -5,6 +5,8 @@
 
 ![image](aavsnx.jpg)
 
+![image](thumb.jpg)
+
 Advanced audio segmentation tool for TTS training data preparation with intelligent music detection, hybrid pause validation, and validated audio buffering.
 
 ## Features
