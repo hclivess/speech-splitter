@@ -646,7 +646,7 @@ class SpeechSplitter:
             temp_audio_path = tmp.name
         
         try:
-            transcription_result = self.transcribe_full_audio(temp_audio_path)
+            transcription_result = self.transcribe_full_audio(temp_audio_path, str(audio_path))
         finally:
             os.unlink(temp_audio_path)
         
