@@ -12,99 +12,6 @@ import whisper
 from pydub import AudioSegment
 import numpy as np
 from tqdm import tqdm
-import torch
-
-
-class SileroVADTrimmer:
-    
-    def __init__(self):
-        self.model = None
-        self.utils = None
-        self._load_model()
-    
-    def _load_model(self):
-        try:
-            torch.set_num_threads(1)
-            print("Loading Silero VAD model...")
-            self.model, self.utils = torch.hub.load(
-                repo_or_dir='snakers4/silero-vad',
-                model='silero_vad',
-                force_reload=False,
-                onnx=False
-            )
-            print("✓ Silero VAD loaded")
-        except Exception as e:
-            print(f"⚠ Failed to load Silero VAD: {e}")
-            print("⚠ VAD trimming will be disabled")
-            self.model = None
-    
-    def get_speech_probability(self, audio_segment: AudioSegment) -> float:
-        """Get average speech probability for audio segment"""
-        if self.model is None:
-            return 1.0
-        
-        try:
-            # Convert to 16kHz mono (Silero requirement)
-            audio_16k = audio_segment.set_frame_rate(16000).set_channels(1)
-            samples = np.array(audio_16k.get_array_of_samples()).astype(np.float32) / 32768.0
-            
-            # Get speech probability for chunks
-            speech_probs = []
-            chunk_size = 512  # 32ms at 16kHz
-            
-            for i in range(0, len(samples), chunk_size):
-                chunk = samples[i:i+chunk_size]
-                if len(chunk) < chunk_size:
-                    chunk = np.pad(chunk, (0, chunk_size - len(chunk)))
-                
-                prob = self.model(torch.from_numpy(chunk), 16000).item()
-                speech_probs.append(prob)
-            
-            return float(np.mean(speech_probs)) if speech_probs else 0.0
-            
-        except Exception as e:
-            print(f"⚠ VAD error: {e}")
-            return 1.0
-    
-    def trim_silence(self, audio_segment: AudioSegment, 
-                     threshold: float = 0.5,
-                     min_silence_ms: int = 100,
-                     padding_ms: int = 50) -> AudioSegment:
-        """Trim silence from start and end of audio"""
-        if self.model is None or self.utils is None:
-            return audio_segment
-        
-        try:
-            # Convert to 16kHz mono
-            audio_16k = audio_segment.set_frame_rate(16000).set_channels(1)
-            samples = np.array(audio_16k.get_array_of_samples()).astype(np.float32) / 32768.0
-            
-            # Get speech timestamps
-            get_speech_timestamps = self.utils[0]
-            speech_timestamps = get_speech_timestamps(
-                torch.from_numpy(samples),
-                self.model,
-                threshold=threshold,
-                min_silence_duration_ms=min_silence_ms,
-                return_seconds=False
-            )
-            
-            if not speech_timestamps:
-                return audio_segment
-            
-            # Convert samples to ms in original sample rate
-            scale = audio_segment.frame_rate / 16000
-            start_sample = speech_timestamps[0]['start']
-            end_sample = speech_timestamps[-1]['end']
-            
-            start_ms = max(0, int((start_sample / 16) * scale) - padding_ms)
-            end_ms = min(len(audio_segment), int((end_sample / 16) * scale) + padding_ms)
-            
-            return audio_segment[start_ms:end_ms]
-            
-        except Exception as e:
-            print(f"⚠ VAD trim error: {e}")
-            return audio_segment
 
 
 class YAMNetFilter:
@@ -246,9 +153,9 @@ class SpeechSplitter:
         pause_speech_threshold: float = 0.2,
         buffer_validation_threshold: float = 0.3,
         overlength_action: str = "rename",
-        use_vad: bool = True,
-        vad_threshold: float = 0.5,
-        vad_speech_pad_ms: int = 50
+        trim_silence: bool = True,
+        trim_threshold_db: float = -40.0,
+        trim_chunk_ms: int = 10
     ):
         self.whisper_model = whisper_model
         self.language = language
@@ -273,9 +180,9 @@ class SpeechSplitter:
         self.pause_speech_threshold = pause_speech_threshold
         self.buffer_validation_threshold = buffer_validation_threshold
         self.overlength_action = overlength_action
-        self.use_vad = use_vad
-        self.vad_threshold = vad_threshold
-        self.vad_speech_pad_ms = vad_speech_pad_ms
+        self.trim_silence = trim_silence
+        self.trim_threshold_db = trim_threshold_db
+        self.trim_chunk_ms = trim_chunk_ms
         
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.audio_dir = self.output_dir / "audio"
@@ -286,17 +193,10 @@ class SpeechSplitter:
         print(f"Loading Whisper model ({whisper_model})...")
         self.model = whisper.load_model(whisper_model)
         
-        # Initialize VAD
-        if self.use_vad:
-            self.vad_trimmer = SileroVADTrimmer()
-            if self.vad_trimmer.model:
-                print("✓ VAD enabled for pause detection and trimming")
-        else:
-            self.vad_trimmer = None
-        
-        # Initialize YAMNet
         if self.filter_music or self.filter_noise or self.check_cutoff or self.hybrid_pause_detection:
             self.yamnet_filter = YAMNetFilter()
+            if self.hybrid_pause_detection and self.yamnet_filter.model:
+                print("✓ Hybrid pause detection enabled (Whisper + YAMNet)")
         else:
             self.yamnet_filter = None
             print("⚠ Audio filtering disabled")
@@ -357,67 +257,47 @@ class SpeechSplitter:
         if pause_duration < self.pause_threshold:
             return False
         
-        if not self.hybrid_pause_detection:
+        if not self.hybrid_pause_detection or not self.yamnet_filter or not self.yamnet_filter.model:
             return True
         
-        gap_audio = audio[word_end_ms:next_word_start_ms]
-        
-        # Use VAD first (faster and more accurate for speech detection)
-        if self.vad_trimmer and self.vad_trimmer.model:
-            vad_speech_prob = self.vad_trimmer.get_speech_probability(gap_audio)
+        try:
+            gap_audio = audio[word_end_ms:next_word_start_ms]
             
-            if vad_speech_prob < 0.2:  # Clear non-speech
-                return True
-            elif vad_speech_prob > 0.5:  # Clear speech
-                return False
-            # If ambiguous (0.2-0.5), fall through to YAMNet
-        
-        # Fall back to YAMNet for music/noise detection
-        if self.yamnet_filter and self.yamnet_filter.model:
-            try:
-                is_pause = self.yamnet_filter.is_true_pause(
-                    gap_audio, 
-                    self.noise_silence_threshold,
-                    self.pause_speech_threshold
-                )
-                return is_pause
-            except Exception as e:
-                print(f"    ⚠ Error validating pause: {e}, falling back to timestamp")
-                return True
-        
-        return True
+            is_pause = self.yamnet_filter.is_true_pause(
+                gap_audio, 
+                self.noise_silence_threshold,
+                self.pause_speech_threshold
+            )
+            
+            return is_pause
+            
+        except Exception as e:
+            print(f"    ⚠ Error validating pause: {e}, falling back to timestamp")
+            return True
     
     def validate_buffer_zone(self, audio: AudioSegment, start_ms: int, end_ms: int) -> bool:
+        if not self.yamnet_filter or not self.yamnet_filter.model:
+            return True
+        
         if end_ms <= start_ms or start_ms < 0 or end_ms > len(audio):
             return False
         
-        if end_ms - start_ms < 20:
-            return True
-        
-        buffer_audio = audio[start_ms:end_ms]
-        
-        # Use VAD first
-        if self.vad_trimmer and self.vad_trimmer.model:
-            vad_speech_prob = self.vad_trimmer.get_speech_probability(buffer_audio)
-            if vad_speech_prob < 0.3:  # Safe buffer
+        try:
+            buffer_audio = audio[start_ms:end_ms]
+            if len(buffer_audio) < 20:
                 return True
-            elif vad_speech_prob > 0.6:  # Contains speech
-                return False
-        
-        # Fall back to YAMNet
-        if self.yamnet_filter and self.yamnet_filter.model:
-            try:
-                is_safe = self.yamnet_filter.is_true_pause(
-                    buffer_audio,
-                    self.buffer_validation_threshold,
-                    self.pause_speech_threshold
-                )
-                return is_safe
-            except Exception as e:
-                print(f"    ⚠ Error validating buffer: {e}, skipping buffer")
-                return False
-        
-        return True
+            
+            is_safe = self.yamnet_filter.is_true_pause(
+                buffer_audio,
+                self.buffer_validation_threshold,
+                self.pause_speech_threshold
+            )
+            
+            return is_safe
+            
+        except Exception as e:
+            print(f"    ⚠ Error validating buffer: {e}, skipping buffer")
+            return False
     
     def get_validated_boundaries(self, audio: AudioSegment, start_ms: int, end_ms: int,
                                 prev_word_end_ms: Optional[int], next_word_start_ms: Optional[int]) -> Tuple[int, int]:
@@ -461,7 +341,7 @@ class SpeechSplitter:
             print("⚠ No words found for segmentation")
             return []
         
-        mode_str = "VAD + YAMNet" if (self.vad_trimmer and self.vad_trimmer.model) else "timestamp-only"
+        mode_str = "hybrid (Whisper + YAMNet)" if self.hybrid_pause_detection else "timestamp-only"
         print(f"Segmenting by natural pauses ({mode_str})...")
         
         segments = []
@@ -552,7 +432,7 @@ class SpeechSplitter:
                 current_segment_words = []
         
         print(f"✓ Created {len(segments)} segments from word timestamps")
-        if self.hybrid_pause_detection:
+        if self.hybrid_pause_detection and self.yamnet_filter and self.yamnet_filter.model:
             print(f"  Pause validation stats:")
             print(f"    - Potential pauses (by timestamp): {total_potential_pauses}")
             print(f"    - Validated (true silence): {validated_pauses}")
@@ -567,33 +447,18 @@ class SpeechSplitter:
         return self.yamnet_filter.is_silent(audio_chunk, self.noise_silence_threshold)
 
     def detect_cutoff(self, audio_chunk: AudioSegment, text: str) -> Tuple[bool, str]:
-        if not self.check_cutoff:
+        if not self.check_cutoff or not self.yamnet_filter or not self.yamnet_filter.model:
             return False, ""
-        
+
         start_check_duration = min(self.cutoff_boundary_ms, len(audio_chunk))
         end_check_duration = min(self.cutoff_boundary_ms, len(audio_chunk))
 
         start_chunk = audio_chunk[:start_check_duration] if start_check_duration > 0 else None
         end_chunk = audio_chunk[-end_check_duration:] if end_check_duration > 0 else None
 
-        # Use VAD first for cutoff detection
-        start_has_silence = False
-        end_has_silence = False
-        
-        if self.vad_trimmer and self.vad_trimmer.model:
-            if start_chunk:
-                start_speech_prob = self.vad_trimmer.get_speech_probability(start_chunk)
-                start_has_silence = start_speech_prob < 0.3
-            
-            if end_chunk:
-                end_speech_prob = self.vad_trimmer.get_speech_probability(end_chunk)
-                end_has_silence = end_speech_prob < 0.3
-        elif self.yamnet_filter and self.yamnet_filter.model:
-            # Fall back to YAMNet
-            start_has_silence = self.yamnet_filter.is_silent(start_chunk, self.cutoff_silence_threshold) if start_chunk else False
-            end_has_silence = self.yamnet_filter.is_silent(end_chunk, self.cutoff_silence_threshold) if end_chunk else False
-        else:
-            return False, ""
+        start_has_silence = self.yamnet_filter.is_silent(start_chunk,
+                                                         self.cutoff_silence_threshold) if start_chunk else False
+        end_has_silence = self.yamnet_filter.is_silent(end_chunk, self.cutoff_silence_threshold) if end_chunk else False
 
         if not start_has_silence and not end_has_silence:
             return True, "both"
@@ -682,6 +547,62 @@ class SpeechSplitter:
             counter += 1
             path = base_path / f"{stem}_{counter:03d}{suffix}"
         return path
+    
+    def trim_silence_from_audio(self, audio_chunk: AudioSegment) -> AudioSegment:
+        """
+        Trim silence from the beginning and end of an audio segment using VAD.
+        Uses amplitude-based detection as primary method.
+        """
+        if not self.trim_silence or len(audio_chunk) < 100:
+            return audio_chunk
+        
+        def detect_nonsilent(audio_segment, min_silence_len=10, silence_thresh=-40):
+            """Detect non-silent chunks in audio."""
+            # Convert to raw audio data
+            seg_len = len(audio_segment)
+            
+            # Find the first non-silent chunk from start
+            start_trim = 0
+            for i in range(0, seg_len, self.trim_chunk_ms):
+                chunk = audio_segment[i:i + self.trim_chunk_ms]
+                if chunk.dBFS > silence_thresh:
+                    start_trim = i
+                    break
+            
+            # Find the first non-silent chunk from end
+            end_trim = seg_len
+            for i in range(seg_len, 0, -self.trim_chunk_ms):
+                chunk = audio_segment[max(0, i - self.trim_chunk_ms):i]
+                if chunk.dBFS > silence_thresh:
+                    end_trim = i
+                    break
+            
+            return start_trim, end_trim
+        
+        try:
+            start_trim, end_trim = detect_nonsilent(
+                audio_chunk,
+                min_silence_len=self.trim_chunk_ms,
+                silence_thresh=self.trim_threshold_db
+            )
+            
+            # Apply trimming with small safety margins (5ms on each side)
+            safety_margin = 5
+            start_trim = max(0, start_trim - safety_margin)
+            end_trim = min(len(audio_chunk), end_trim + safety_margin)
+            
+            if start_trim < end_trim and end_trim - start_trim >= 100:
+                trimmed = audio_chunk[start_trim:end_trim]
+                trimmed_duration = (len(audio_chunk) - len(trimmed)) / 1000.0
+                if trimmed_duration > 0.01:  # Only log if we trimmed more than 10ms
+                    print(f"    Trimmed {trimmed_duration:.3f}s of silence")
+                return trimmed
+            else:
+                return audio_chunk
+                
+        except Exception as e:
+            print(f"    ⚠ Error trimming silence: {e}, keeping original")
+            return audio_chunk
     
     def process_file(self, audio_path: str, speaker_id: Optional[str] = None) -> Dict:
         audio_path = Path(audio_path)
@@ -819,7 +740,6 @@ class SpeechSplitter:
         print(f"Exporting {len(segments)} segments at {sample_rate}Hz...")
 
         output_files = []
-        vad_trimmed_count = 0
 
         for idx, seg in enumerate(tqdm(segments, desc="Exporting"), 1):
             if not self.validate_segment_text(seg['text']):
@@ -841,23 +761,14 @@ class SpeechSplitter:
             
             audio_chunk = audio[validated_start:validated_end]
             
-            # IMPORTANT: Check cutoff BEFORE trimming
-            has_cutoff, cutoff_type = self.detect_cutoff(audio_chunk, seg['text'])
+            # Trim silence from beginning and end (VAD-based)
+            if self.trim_silence:
+                audio_chunk = self.trim_silence_from_audio(audio_chunk)
             
-            # Check overlength BEFORE trimming
             segment_duration = len(audio_chunk) / 1000.0
+
             if segment_duration > self.max_segment_length:
                 print(f"  ⚠ Overlength segment detected: {segment_duration:.2f}s > {self.max_segment_length:.2f}s")
-                
-                # Trim with VAD before handling overlength
-                if self.use_vad and self.vad_trimmer and self.vad_trimmer.model:
-                    audio_chunk = self.vad_trimmer.trim_silence(
-                        audio_chunk,
-                        threshold=self.vad_threshold,
-                        padding_ms=self.vad_speech_pad_ms
-                    )
-                    vad_trimmed_count += 1
-                
                 audio_file, transcript_file, metadata = self.handle_overlength_segment(
                     audio_chunk, seg['text'], base_name, idx, sample_rate
                 )
@@ -868,19 +779,10 @@ class SpeechSplitter:
                 output_files.append((audio_file, transcript_file, metadata))
                 continue
 
-            # Handle cutoff segments
+            has_cutoff, cutoff_type = self.detect_cutoff(audio_chunk, seg['text'])
+            
             if has_cutoff:
                 print(f"  ⚠ Cutoff detected at {cutoff_type} in segment {idx}")
-                
-                # Trim with VAD before handling cutoff
-                if self.use_vad and self.vad_trimmer and self.vad_trimmer.model:
-                    audio_chunk = self.vad_trimmer.trim_silence(
-                        audio_chunk,
-                        threshold=self.vad_threshold,
-                        padding_ms=self.vad_speech_pad_ms
-                    )
-                    vad_trimmed_count += 1
-                
                 audio_file, transcript_file, metadata = self.handle_cutoff_segment(
                     audio_chunk, seg['text'], cutoff_type, base_name, idx
                 )
@@ -888,15 +790,6 @@ class SpeechSplitter:
                 if audio_file is None:
                     continue
             else:
-                # Normal segment - trim with VAD then export
-                if self.use_vad and self.vad_trimmer and self.vad_trimmer.model:
-                    audio_chunk = self.vad_trimmer.trim_silence(
-                        audio_chunk,
-                        threshold=self.vad_threshold,
-                        padding_ms=self.vad_speech_pad_ms
-                    )
-                    vad_trimmed_count += 1
-                
                 audio_file = self.get_unique_filename(self.audio_dir, chunk_name, f".{self.export_format}")
                 audio_chunk.export(
                     audio_file,
@@ -918,9 +811,6 @@ class SpeechSplitter:
             output_files.append((str(audio_file), str(transcript_file), metadata))
 
         print(f"✓ Exported {len(output_files)} segments at original sample rate ({sample_rate}Hz)")
-        if vad_trimmed_count > 0:
-            print(f"✓ VAD trimmed {vad_trimmed_count} segments")
-        
         return output_files
     
     def regenerate_folder_metadata(self):
@@ -1028,9 +918,9 @@ def main():
     parser.add_argument('--pause-speech-threshold', type=float, default=0.2)
     parser.add_argument('--buffer-validation-threshold', type=float, default=0.3)
     parser.add_argument('--overlength-action', default='rename', choices=['rename', 'skip', 'include'])
-    parser.add_argument('--use-vad', action='store_true', default=True)
-    parser.add_argument('--vad-threshold', type=float, default=0.5)
-    parser.add_argument('--vad-speech-pad', type=int, default=50)
+    parser.add_argument('--trim-silence', action='store_true', default=True)
+    parser.add_argument('--trim-threshold-db', type=float, default=-40.0)
+    parser.add_argument('--trim-chunk-ms', type=int, default=10)
     
     args = parser.parse_args()
     
@@ -1058,9 +948,9 @@ def main():
         pause_speech_threshold=args.pause_speech_threshold,
         buffer_validation_threshold=args.buffer_validation_threshold,
         overlength_action=args.overlength_action,
-        use_vad=args.use_vad,
-        vad_threshold=args.vad_threshold,
-        vad_speech_pad_ms=args.vad_speech_pad
+        trim_silence=args.trim_silence,
+        trim_threshold_db=args.trim_threshold_db,
+        trim_chunk_ms=args.trim_chunk_ms
     )
     
     input_path = Path(args.input)
