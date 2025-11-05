@@ -231,28 +231,64 @@ class SpeechSplitter:
             return False
         
         return True
-    
-    def transcribe_full_audio(self, audio_path: str) -> Dict:
+
+    def transcribe_full_audio(self, audio_path: str, original_audio_path: str = None) -> Dict:
+        # Use original_audio_path for cache file location, or audio_path if not provided
+        cache_base_path = Path(original_audio_path) if original_audio_path else Path(audio_path)
+        cache_file = cache_base_path.parent / f"{cache_base_path.stem}.transcription.json"
+
+        # Try to load cached transcription
+        if cache_file.exists():
+            try:
+                print(f"Loading cached transcription from {cache_file.name}...")
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    cached_data = json.load(f)
+
+                # Verify the cache has the required structure
+                if 'words' in cached_data and 'text' in cached_data:
+                    print(f"✓ Loaded {len(cached_data['words'])} words from cache")
+                    return cached_data
+                else:
+                    print("⚠ Cache file invalid, re-transcribing...")
+            except Exception as e:
+                print(f"⚠ Error loading cache: {e}, re-transcribing...")
+
+        # No cache or invalid cache - transcribe with Whisper
         print("Transcribing full audio with Whisper...")
-        
+
         result = self.model.transcribe(
             audio_path,
             language=self.language,
             word_timestamps=True,
             verbose=False
         )
-        
+
         all_words = []
         for segment in result.get('segments', []):
             if 'words' in segment:
                 all_words.extend(segment['words'])
-        
+
         print(f"✓ Transcribed {len(all_words)} words")
-        return {
+
+        # Prepare data for caching
+        transcription_data = {
             'text': result['text'],
             'words': all_words,
-            'segments': result.get('segments', [])
+            'segments': result.get('segments', []),
+            'language': self.language,
+            'model': self.whisper_model
         }
+
+        # Save to cache file
+        try:
+            print(f"Saving transcription cache to {cache_file.name}...")
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                json.dump(transcription_data, f, ensure_ascii=False, indent=2)
+            print("✓ Transcription cached")
+        except Exception as e:
+            print(f"⚠ Warning: Could not save transcription cache: {e}")
+
+        return transcription_data
     
     def is_pause_validated(self, audio: AudioSegment, word_end_ms: int, next_word_start_ms: int, 
                           pause_duration: float) -> bool:
