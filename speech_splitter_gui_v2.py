@@ -116,6 +116,15 @@ class ProcessingThread(QThread):
             self.log.emit(f"Output: {self.settings['output_dir']}")
             self.log.emit(f"{'='*60}\n")
             
+            if self._is_running and results:  # Only if processing wasn't cancelled
+                self.status.emit("Generating metadata...")
+                self.log.emit("Generating metadata files...")
+                try:
+                    splitter.regenerate_folder_metadata()
+                    self.log.emit("✓ Metadata files created\n")
+                except Exception as e:
+                    self.log.emit(f"⚠ Error generating metadata: {e}\n")
+
             self.finished.emit({'results': results, 'success': success, 'total_segments': total_segs})
             
         except Exception as e:

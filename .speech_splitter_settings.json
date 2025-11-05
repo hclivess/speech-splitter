@@ -19,13 +19,10 @@
   "cutoff_silence_threshold": 0.35,
   "cutoff_action": "rename",
   "hybrid_pause_detection": true,
-  "pause_speech_threshold": 0.1,
+  "pause_speech_threshold": 0.2,
   "overlength_action": "rename",
   "trim_silence": true,
   "trim_threshold_db": -38.0,
   "trim_chunk_ms": 10,
   "trim_pad_ms": 150
 }
-
-
-
