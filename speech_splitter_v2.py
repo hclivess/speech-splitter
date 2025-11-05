@@ -155,7 +155,8 @@ class SpeechSplitter:
         overlength_action: str = "rename",
         trim_silence: bool = True,
         trim_threshold_db: float = -40.0,
-        trim_chunk_ms: int = 10
+        trim_chunk_ms: int = 10,
+        trim_pad_ms: int = 150
     ):
         self.whisper_model = whisper_model
         self.language = language
@@ -183,6 +184,7 @@ class SpeechSplitter:
         self.trim_silence = trim_silence
         self.trim_threshold_db = trim_threshold_db
         self.trim_chunk_ms = trim_chunk_ms
+        self.trim_pad_ms = trim_pad_ms
         
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.audio_dir = self.output_dir / "audio"
@@ -552,25 +554,20 @@ class SpeechSplitter:
         if not self.trim_silence or len(audio_chunk) < 200:
             return audio_chunk
 
-        # Minimum silence to always preserve
-        min_silence_pad_ms = 150
-
         seg_len = len(audio_chunk)
 
-        # Scan for first non-silent region
         start_trim = 0
         for i in range(0, seg_len, self.trim_chunk_ms):
             chunk = audio_chunk[i:i + self.trim_chunk_ms]
             if chunk.dBFS > self.trim_threshold_db:
-                start_trim = max(0, i - min_silence_pad_ms)
+                start_trim = max(0, i - self.trim_pad_ms)
                 break
 
-        # Scan for last non-silent region
         end_trim = seg_len
         for i in range(seg_len, 0, -self.trim_chunk_ms):
             chunk = audio_chunk[max(0, i - self.trim_chunk_ms):i]
             if chunk.dBFS > self.trim_threshold_db:
-                end_trim = min(seg_len, i + min_silence_pad_ms)
+                end_trim = min(seg_len, i + self.trim_pad_ms)
                 break
 
         if start_trim >= end_trim:
@@ -736,7 +733,6 @@ class SpeechSplitter:
             
             audio_chunk = audio[validated_start:validated_end]
             
-            # Trim silence from beginning and end (VAD-based)
             if self.trim_silence:
                 audio_chunk = self.trim_silence_from_audio(audio_chunk)
             
@@ -896,6 +892,7 @@ def main():
     parser.add_argument('--trim-silence', action='store_true', default=True)
     parser.add_argument('--trim-threshold-db', type=float, default=-40.0)
     parser.add_argument('--trim-chunk-ms', type=int, default=10)
+    parser.add_argument('--trim-pad-ms', type=int, default=150)
     
     args = parser.parse_args()
     
@@ -925,7 +922,8 @@ def main():
         overlength_action=args.overlength_action,
         trim_silence=args.trim_silence,
         trim_threshold_db=args.trim_threshold_db,
-        trim_chunk_ms=args.trim_chunk_ms
+        trim_chunk_ms=args.trim_chunk_ms,
+        trim_pad_ms=args.trim_pad_ms
     )
     
     input_path = Path(args.input)

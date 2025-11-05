@@ -66,7 +66,8 @@ class ProcessingThread(QThread):
                 overlength_action=self.settings.get('overlength_action', 'rename'),
                 trim_silence=self.settings.get('trim_silence', True),
                 trim_threshold_db=self.settings.get('trim_threshold_db', -38.0),
-                trim_chunk_ms=self.settings.get('trim_chunk_ms', 20)
+                trim_chunk_ms=self.settings.get('trim_chunk_ms', 20),
+                trim_pad_ms=self.settings.get('trim_pad_ms', 150)
             )
             
             self.log.emit("✓ Models loaded\n")
@@ -366,6 +367,12 @@ class SpeechSplitterGUI(QMainWindow):
         self.trim_chunk_spin.setValue(10)
         vad_layout.addWidget(self.trim_chunk_spin)
         
+        vad_layout.addWidget(QLabel("Silence Padding (ms):"))
+        self.trim_pad_spin = QSpinBox()
+        self.trim_pad_spin.setRange(0, 500)
+        self.trim_pad_spin.setValue(150)
+        vad_layout.addWidget(self.trim_pad_spin)
+        
         vad_layout.addStretch()
         vad_tab.setLayout(vad_layout)
         tabs.addTab(vad_tab, "VAD Trimming")
@@ -504,7 +511,8 @@ class SpeechSplitterGUI(QMainWindow):
             'overlength_action': self.overlength_action_combo.currentText(),
             'trim_silence': self.trim_silence_check.isChecked(),
             'trim_threshold_db': self.trim_threshold_spin.value(),
-            'trim_chunk_ms': self.trim_chunk_spin.value()
+            'trim_chunk_ms': self.trim_chunk_spin.value(),
+            'trim_pad_ms': self.trim_pad_spin.value()
         }
         
         self.log_text.clear()
@@ -589,6 +597,7 @@ class SpeechSplitterGUI(QMainWindow):
                 self.trim_silence_check.setChecked(settings.get('trim_silence', True))
                 self.trim_threshold_spin.setValue(settings.get('trim_threshold_db', -40.0))
                 self.trim_chunk_spin.setValue(settings.get('trim_chunk_ms', 10))
+                self.trim_pad_spin.setValue(settings.get('trim_pad_ms', 150))
             except Exception as e:
                 print(f"Error loading settings: {e}")
     
@@ -618,7 +627,8 @@ class SpeechSplitterGUI(QMainWindow):
             'overlength_action': self.overlength_action_combo.currentText(),
             'trim_silence': self.trim_silence_check.isChecked(),
             'trim_threshold_db': self.trim_threshold_spin.value(),
-            'trim_chunk_ms': self.trim_chunk_spin.value()
+            'trim_chunk_ms': self.trim_chunk_spin.value(),
+            'trim_pad_ms': self.trim_pad_spin.value()
         }
         
         settings_file = Path.home() / '.speech_splitter_settings.json'
