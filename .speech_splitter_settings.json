@@ -4,7 +4,7 @@
   "output_dir": "output",
   "min_length": 3.0,
   "max_length": 12.0,
-  "pause_threshold": 0.6,
+  "pause_threshold": 0.4,
   "word_start_buffer": 200,
   "word_end_buffer": 750,
   "format": "wav",
@@ -26,5 +26,6 @@
   "trim_chunk_ms": 10,
   "trim_pad_ms": 150
 }
+
 
 
