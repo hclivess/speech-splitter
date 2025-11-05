@@ -205,6 +205,42 @@ class SpeechSplitter:
         
         print("✓ Models loaded\n")
     
+    def safe_write_transcript(self, transcript_file: Path, text: str) -> bool:
+        """
+        Safely write transcript as binary UTF-8.
+        Returns True if successful, False otherwise.
+        Preserves exact content by writing as binary.
+        """
+        # Ensure text is a string
+        if not isinstance(text, str):
+            try:
+                text = str(text)
+            except Exception as e:
+                print(f"  ⚠ Could not convert text to string: {e}")
+                return False
+        
+        # Strip whitespace (this is already done in the original code)
+        text = text.strip()
+        
+        if not text:
+            print(f"  ⚠ Empty text, skipping transcript save")
+            return False
+        
+        # Write as binary UTF-8 - eliminates all encoding issues
+        try:
+            with open(transcript_file, 'wb') as f:
+                f.write(text.encode('utf-8'))
+            return True
+        except PermissionError as e:
+            print(f"  ✗ Permission denied: {e}")
+            return False
+        except OSError as e:
+            print(f"  ✗ OS error writing file: {e}")
+            return False
+        except Exception as e:
+            print(f"  ✗ Unexpected error saving transcript: {e}")
+            return False
+    
     def validate_segment_text(self, text: str) -> bool:
         if not text or not text.strip():
             return False
@@ -534,8 +570,8 @@ class SpeechSplitter:
             parameters=["-ar", str(audio_chunk.frame_rate)]
         )
         
-        with open(transcript_file, 'w', encoding='utf-8') as f:
-            f.write(text.strip())
+        if not self.safe_write_transcript(transcript_file, text):
+            print(f"  ⚠ Warning: Transcript save failed for cutoff segment {idx}")
         
         metadata = {
             'duration': len(audio_chunk) / 1000.0,
@@ -566,8 +602,8 @@ class SpeechSplitter:
             parameters=["-ar", str(sample_rate)]
         )
         
-        with open(transcript_file, 'w', encoding='utf-8') as f:
-            f.write(text.strip())
+        if not self.safe_write_transcript(transcript_file, text):
+            print(f"  ⚠ Warning: Transcript save failed for overlength segment {idx}")
         
         metadata = {
             'duration': len(audio_chunk) / 1000.0,
@@ -805,8 +841,8 @@ class SpeechSplitter:
                 )
 
                 transcript_file = self.get_unique_filename(self.text_dir, chunk_name, ".txt")
-                with open(transcript_file, 'w', encoding='utf-8') as f:
-                    f.write(seg['text'].strip())
+                if not self.safe_write_transcript(transcript_file, seg['text']):
+                    print(f"  ⚠ Warning: Transcript save failed for segment {idx}")
 
                 metadata = {
                     'duration': len(audio_chunk) / 1000.0,
@@ -845,8 +881,8 @@ class SpeechSplitter:
                 duration = 0.0
             
             try:
-                with open(transcript_file, 'r', encoding='utf-8') as f:
-                    text = f.read().strip()
+                with open(transcript_file, 'rb') as f:
+                    text = f.read().decode('utf-8').strip()
             except Exception as e:
                 print(f"⚠ Error reading {transcript_file.name}: {e}, using empty text")
                 text = ""
@@ -884,8 +920,8 @@ class SpeechSplitter:
             for segment in segments:
                 transcript_file = self.text_dir / segment['transcript']
                 try:
-                    with open(transcript_file, 'r', encoding='utf-8') as tf:
-                        text = tf.read().strip()
+                    with open(transcript_file, 'rb') as tf:
+                        text = tf.read().decode('utf-8').strip()
                     text = text.replace('"', '""')
                     f.write(f'"{segment["audio"]}","{text}"\n')
                 except Exception as e:
