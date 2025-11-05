@@ -2,7 +2,7 @@
   "model": "large",
   "language": "cs",
   "output_dir": "output",
-  "min_length": 1.0,
+  "min_length": 3.0,
   "max_length": 12.0,
   "pause_threshold": 0.4,
   "word_start_buffer": 200,
@@ -25,4 +25,5 @@
   "trim_threshold_db": -38.0,
   "trim_chunk_ms": 10,
   "trim_pad_ms": 150
+
 }
