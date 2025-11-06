@@ -12,18 +12,44 @@ import whisper
 from pydub import AudioSegment
 import numpy as np
 from tqdm import tqdm
+import torch
+
+
+def check_gpu():
+    """Check GPU availability and display info."""
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"✓ GPU available: {gpu_name}")
+        print(f"  GPU Memory: {gpu_memory:.2f} GB")
+        return True
+    else:
+        print("⚠ No GPU available, will use CPU (slower)")
+        return False
 
 
 class YAMNetFilter:
     
-    def __init__(self):
+    def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
         self.model = None
         self.class_names = None
+        self.device = device
         self._load_model()
     
     def _load_model(self):
         try:
             import tensorflow as tf
+            
+            # Configure TensorFlow to use GPU if available
+            gpus = tf.config.list_physical_devices('GPU')
+            if gpus and self.device == 'cuda':
+                try:
+                    for gpu in gpus:
+                        tf.config.experimental.set_memory_growth(gpu, True)
+                    print(f"✓ TensorFlow configured to use GPU for YAMNet")
+                except RuntimeError as e:
+                    print(f"⚠ GPU configuration error: {e}")
+            
             import tensorflow_hub as hub
             
             tf.get_logger().setLevel('ERROR')
@@ -156,8 +182,15 @@ class SpeechSplitter:
         trim_silence: bool = True,
         trim_threshold_db: float = -40.0,
         trim_chunk_ms: int = 10,
-        trim_pad_ms: int = 150
+        trim_pad_ms: int = 150,
+        device: str = None
     ):
+        # Set device
+        if device is None:
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        else:
+            self.device = device
+        
         self.whisper_model = whisper_model
         self.language = language
         self.output_dir = Path(output_dir)
@@ -192,11 +225,11 @@ class SpeechSplitter:
         self.audio_dir.mkdir(exist_ok=True)
         self.text_dir.mkdir(exist_ok=True)
         
-        print(f"Loading Whisper model ({whisper_model})...")
-        self.model = whisper.load_model(whisper_model)
+        print(f"Loading Whisper model ({whisper_model}) on {self.device.upper()}...")
+        self.model = whisper.load_model(whisper_model, device=self.device)
         
         if self.filter_music or self.filter_noise or self.check_cutoff or self.hybrid_pause_detection:
-            self.yamnet_filter = YAMNetFilter()
+            self.yamnet_filter = YAMNetFilter(device=self.device)
             if self.hybrid_pause_detection and self.yamnet_filter.model:
                 print("✓ Hybrid pause detection enabled (Whisper + YAMNet)")
         else:
@@ -206,12 +239,6 @@ class SpeechSplitter:
         print("✓ Models loaded\n")
     
     def safe_write_transcript(self, transcript_file: Path, text: str) -> bool:
-        """
-        Safely write transcript as binary UTF-8.
-        Returns True if successful, False otherwise.
-        Preserves exact content by writing as binary.
-        """
-        # Ensure text is a string
         if not isinstance(text, str):
             try:
                 text = str(text)
@@ -219,14 +246,12 @@ class SpeechSplitter:
                 print(f"  ⚠ Could not convert text to string: {e}")
                 return False
         
-        # Strip whitespace (this is already done in the original code)
         text = text.strip()
         
         if not text:
             print(f"  ⚠ Empty text, skipping transcript save")
             return False
         
-        # Write as binary UTF-8 - eliminates all encoding issues
         try:
             with open(transcript_file, 'wb') as f:
                 f.write(text.encode('utf-8'))
@@ -269,18 +294,15 @@ class SpeechSplitter:
         return True
 
     def transcribe_full_audio(self, audio_path: str, original_audio_path: str = None) -> Dict:
-        # Use original_audio_path for cache file location, or audio_path if not provided
         cache_base_path = Path(original_audio_path) if original_audio_path else Path(audio_path)
         cache_file = cache_base_path.parent / f"{cache_base_path.stem}.transcription.json"
 
-        # Try to load cached transcription
         if cache_file.exists():
             try:
                 print(f"Loading cached transcription from {cache_file.name}...")
                 with open(cache_file, 'r', encoding='utf-8') as f:
                     cached_data = json.load(f)
 
-                # Verify the cache has the required structure
                 if 'words' in cached_data and 'text' in cached_data:
                     print(f"✓ Loaded {len(cached_data['words'])} words from cache")
                     return cached_data
@@ -289,7 +311,6 @@ class SpeechSplitter:
             except Exception as e:
                 print(f"⚠ Error loading cache: {e}, re-transcribing...")
 
-        # No cache or invalid cache - transcribe with Whisper
         print("Transcribing full audio with Whisper...")
 
         result = self.model.transcribe(
@@ -306,7 +327,6 @@ class SpeechSplitter:
 
         print(f"✓ Transcribed {len(all_words)} words")
 
-        # Prepare data for caching
         transcription_data = {
             'text': result['text'],
             'words': all_words,
@@ -315,7 +335,6 @@ class SpeechSplitter:
             'model': self.whisper_model
         }
 
-        # Save to cache file
         try:
             print(f"Saving transcription cache to {cache_file.name}...")
             with open(cache_file, 'w', encoding='utf-8') as f:
@@ -965,8 +984,17 @@ def main():
     parser.add_argument('--trim-threshold-db', type=float, default=-40.0)
     parser.add_argument('--trim-chunk-ms', type=int, default=10)
     parser.add_argument('--trim-pad-ms', type=int, default=150)
+    parser.add_argument('--device', default=None, choices=['cuda', 'cpu'], 
+                       help='Force device (cuda/cpu), auto-detect if not specified')
     
     args = parser.parse_args()
+    
+    # Display GPU info at startup
+    print("\n" + "="*60)
+    print("GPU CHECK")
+    print("="*60)
+    check_gpu()
+    print("="*60 + "\n")
     
     splitter = SpeechSplitter(
         whisper_model=args.model,
@@ -995,7 +1023,8 @@ def main():
         trim_silence=args.trim_silence,
         trim_threshold_db=args.trim_threshold_db,
         trim_chunk_ms=args.trim_chunk_ms,
-        trim_pad_ms=args.trim_pad_ms
+        trim_pad_ms=args.trim_pad_ms,
+        device=args.device
     )
     
     input_path = Path(args.input)
