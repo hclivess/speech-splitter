@@ -3,8 +3,10 @@
 import os
 import json
 import argparse
+import logging
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
+from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -15,25 +17,66 @@ from tqdm import tqdm
 import torch
 
 
-def check_gpu():
+def setup_logging(output_dir: Path, log_level: str = "INFO") -> logging.Logger:
+    """Setup logging with both file and console handlers."""
+    log_dir = output_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = log_dir / f"speech_splitter_{timestamp}.log"
+    
+    logger = logging.getLogger("SpeechSplitter")
+    logger.setLevel(getattr(logging, log_level.upper()))
+    
+    # Remove existing handlers
+    logger.handlers.clear()
+    
+    # File handler - detailed logging
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    file_handler.setFormatter(file_formatter)
+    
+    # Console handler - cleaner output
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(getattr(logging, log_level.upper()))
+    
+    console_formatter = logging.Formatter(
+    '%(asctime)s - %(levelname)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S')
+    
+    console_handler.setFormatter(console_formatter)   
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    logger.info(f"Logging initialized. Log file: {log_file}")
+    
+    return logger
+
+
+def check_gpu(logger: logging.Logger) -> bool:
     """Check GPU availability and display info."""
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0)
         gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        print(f"✓ GPU available: {gpu_name}")
-        print(f"  GPU Memory: {gpu_memory:.2f} GB")
+        logger.info(f"GPU available: {gpu_name}")
+        logger.info(f"GPU Memory: {gpu_memory:.2f} GB")
         return True
     else:
-        print("⚠ No GPU available, will use CPU (slower)")
+        logger.warning("No GPU available, will use CPU (slower)")
         return False
 
 
 class YAMNetFilter:
     
-    def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
+    def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu', logger=None):
         self.model = None
         self.class_names = None
         self.device = device
+        self.logger = logger or logging.getLogger("SpeechSplitter.YAMNetFilter")
         self._load_model()
     
     def _load_model(self):
@@ -46,26 +89,26 @@ class YAMNetFilter:
                 try:
                     for gpu in gpus:
                         tf.config.experimental.set_memory_growth(gpu, True)
-                    print(f"✓ TensorFlow configured to use GPU for YAMNet")
+                    self.logger.info("TensorFlow configured to use GPU for YAMNet")
                 except RuntimeError as e:
-                    print(f"⚠ GPU configuration error: {e}")
+                    self.logger.warning(f"GPU configuration error: {e}")
             
             import tensorflow_hub as hub
             
             tf.get_logger().setLevel('ERROR')
             os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
             
-            print("Loading YAMNet model...")
+            self.logger.info("Loading YAMNet model...")
             self.model = hub.load('https://tfhub.dev/google/yamnet/1')
             
             class_map_path = self.model.class_map_path().numpy()
             self.class_names = self._load_class_names(class_map_path)
             
-            print("✓ YAMNet model loaded")
+            self.logger.info("YAMNet model loaded successfully")
             
         except Exception as e:
-            print(f"⚠ Failed to load YAMNet: {e}")
-            print("⚠ Audio filtering will be disabled")
+            self.logger.error(f"Failed to load YAMNet: {e}", exc_info=True)
+            self.logger.warning("Audio filtering will be disabled")
             self.model = None
     
     def _load_class_names(self, class_map_csv):
@@ -120,7 +163,7 @@ class YAMNetFilter:
             }
             
         except Exception as e:
-            print(f"⚠ YAMNet classification error: {e}")
+            self.logger.error(f"YAMNet classification error: {e}", exc_info=True)
             return {'music': 0.0, 'speech': 1.0, 'music_speech_mixed': 0.0, 'silence': 0.0}
     
     def is_music_or_mixed(self, audio_segment: AudioSegment, 
@@ -183,17 +226,30 @@ class SpeechSplitter:
         trim_threshold_db: float = -40.0,
         trim_chunk_ms: int = 10,
         trim_pad_ms: int = 150,
-        device: str = None
+        device: str = None,
+        log_level: str = "INFO"
     ):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Setup logging first
+        self.logger = setup_logging(self.output_dir, log_level)
+        
+        self.logger.info("="*60)
+        self.logger.info("Initializing SpeechSplitter")
+        self.logger.info("="*60)
+        
         # Set device
         if device is None:
             self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         else:
             self.device = device
         
+        self.logger.info(f"Device: {self.device.upper()}")
+        
+        # Store all parameters
         self.whisper_model = whisper_model
         self.language = language
-        self.output_dir = Path(output_dir)
         self.min_segment_length = min_segment_length
         self.max_segment_length = max_segment_length
         self.export_format = export_format
@@ -219,37 +275,58 @@ class SpeechSplitter:
         self.trim_chunk_ms = trim_chunk_ms
         self.trim_pad_ms = trim_pad_ms
         
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        # Log configuration
+        self.logger.info("Configuration:")
+        self.logger.info(f"  Whisper Model: {whisper_model}")
+        self.logger.info(f"  Language: {language}")
+        self.logger.info(f"  Segment Length: {min_segment_length}s - {max_segment_length}s")
+        self.logger.info(f"  Pause Threshold: {pause_threshold}s")
+        self.logger.info(f"  Min Confidence: {min_confidence}")
+        self.logger.info(f"  Filter Music: {filter_music}")
+        self.logger.info(f"  Filter Noise: {filter_noise}")
+        self.logger.info(f"  Hybrid Pause Detection: {hybrid_pause_detection}")
+        self.logger.info(f"  Trim Silence: {trim_silence}")
+        
+        # Setup directories
         self.audio_dir = self.output_dir / "audio"
         self.text_dir = self.output_dir / "transcripts"
         self.audio_dir.mkdir(exist_ok=True)
         self.text_dir.mkdir(exist_ok=True)
         
-        print(f"Loading Whisper model ({whisper_model}) on {self.device.upper()}...")
-        self.model = whisper.load_model(whisper_model, device=self.device)
+        self.logger.info(f"Output directory: {self.output_dir}")
+        
+        # Load models
+        self.logger.info(f"Loading Whisper model ({whisper_model}) on {self.device.upper()}...")
+        try:
+            self.model = whisper.load_model(whisper_model, device=self.device)
+            self.logger.info("Whisper model loaded successfully")
+        except Exception as e:
+            self.logger.error(f"Failed to load Whisper model: {e}", exc_info=True)
+            raise
         
         if self.filter_music or self.filter_noise or self.check_cutoff or self.hybrid_pause_detection:
-            self.yamnet_filter = YAMNetFilter(device=self.device)
+            self.yamnet_filter = YAMNetFilter(device=self.device, logger=self.logger)
             if self.hybrid_pause_detection and self.yamnet_filter.model:
-                print("✓ Hybrid pause detection enabled (Whisper + YAMNet)")
+                self.logger.info("Hybrid pause detection enabled (Whisper + YAMNet)")
         else:
             self.yamnet_filter = None
-            print("⚠ Audio filtering disabled")
+            self.logger.warning("Audio filtering disabled")
         
-        print("✓ Models loaded\n")
+        self.logger.info("="*60)
+        self.logger.info("")
     
     def safe_write_transcript(self, transcript_file: Path, text: str) -> bool:
         if not isinstance(text, str):
             try:
                 text = str(text)
             except Exception as e:
-                print(f"  ⚠ Could not convert text to string: {e}")
+                self.logger.error(f"Could not convert text to string: {e}")
                 return False
         
         text = text.strip()
         
         if not text:
-            print(f"  ⚠ Empty text, skipping transcript save")
+            self.logger.warning("Empty text, skipping transcript save")
             return False
         
         try:
@@ -257,13 +334,13 @@ class SpeechSplitter:
                 f.write(text.encode('utf-8'))
             return True
         except PermissionError as e:
-            print(f"  ✗ Permission denied: {e}")
+            self.logger.error(f"Permission denied writing transcript: {e}")
             return False
         except OSError as e:
-            print(f"  ✗ OS error writing file: {e}")
+            self.logger.error(f"OS error writing transcript: {e}")
             return False
         except Exception as e:
-            print(f"  ✗ Unexpected error saving transcript: {e}")
+            self.logger.error(f"Unexpected error saving transcript: {e}", exc_info=True)
             return False
     
     def validate_segment_text(self, text: str) -> bool:
@@ -299,33 +376,37 @@ class SpeechSplitter:
 
         if cache_file.exists():
             try:
-                print(f"Loading cached transcription from {cache_file.name}...")
+                self.logger.info(f"Loading cached transcription from {cache_file.name}...")
                 with open(cache_file, 'r', encoding='utf-8') as f:
                     cached_data = json.load(f)
 
                 if 'words' in cached_data and 'text' in cached_data:
-                    print(f"✓ Loaded {len(cached_data['words'])} words from cache")
+                    self.logger.info(f"Loaded {len(cached_data['words'])} words from cache")
                     return cached_data
                 else:
-                    print("⚠ Cache file invalid, re-transcribing...")
+                    self.logger.warning("Cache file invalid, re-transcribing...")
             except Exception as e:
-                print(f"⚠ Error loading cache: {e}, re-transcribing...")
+                self.logger.warning(f"Error loading cache: {e}, re-transcribing...")
 
-        print("Transcribing full audio with Whisper...")
+        self.logger.info("Transcribing full audio with Whisper...")
 
-        result = self.model.transcribe(
-            audio_path,
-            language=self.language,
-            word_timestamps=True,
-            verbose=False
-        )
+        try:
+            result = self.model.transcribe(
+                audio_path,
+                language=self.language,
+                word_timestamps=True,
+                verbose=False
+            )
+        except Exception as e:
+            self.logger.error(f"Transcription failed: {e}", exc_info=True)
+            raise
 
         all_words = []
         for segment in result.get('segments', []):
             if 'words' in segment:
                 all_words.extend(segment['words'])
 
-        print(f"✓ Transcribed {len(all_words)} words")
+        self.logger.info(f"Transcribed {len(all_words)} words")
 
         transcription_data = {
             'text': result['text'],
@@ -336,12 +417,12 @@ class SpeechSplitter:
         }
 
         try:
-            print(f"Saving transcription cache to {cache_file.name}...")
+            self.logger.info(f"Saving transcription cache to {cache_file.name}...")
             with open(cache_file, 'w', encoding='utf-8') as f:
                 json.dump(transcription_data, f, ensure_ascii=False, indent=2)
-            print("✓ Transcription cached")
+            self.logger.info("Transcription cached successfully")
         except Exception as e:
-            print(f"⚠ Warning: Could not save transcription cache: {e}")
+            self.logger.warning(f"Could not save transcription cache: {e}")
 
         return transcription_data
     
@@ -365,7 +446,7 @@ class SpeechSplitter:
             return is_pause
             
         except Exception as e:
-            print(f"    ⚠ Error validating pause: {e}, falling back to timestamp")
+            self.logger.debug(f"Error validating pause: {e}, falling back to timestamp")
             return True
     
     def validate_buffer_zone(self, audio: AudioSegment, start_ms: int, end_ms: int) -> bool:
@@ -389,7 +470,7 @@ class SpeechSplitter:
             return is_safe
             
         except Exception as e:
-            print(f"    ⚠ Error validating buffer: {e}, skipping buffer")
+            self.logger.debug(f"Error validating buffer: {e}, skipping buffer")
             return False
     
     def get_validated_boundaries(self, audio: AudioSegment, start_ms: int, end_ms: int,
@@ -403,8 +484,9 @@ class SpeechSplitter:
             if requested_start < start_ms:
                 if self.validate_buffer_zone(audio, requested_start, start_ms):
                     validated_start = requested_start
+                    self.logger.debug(f"Start buffer applied: {start_ms - requested_start}ms")
                 else:
-                    print(f"    ⚠ Start buffer rejected: contains speech/noise")
+                    self.logger.debug("Start buffer rejected: contains speech/noise")
         
         if self.word_end_buffer_ms > 0 and next_word_start_ms is not None:
             requested_end = min(end_ms + self.word_end_buffer_ms, next_word_start_ms)
@@ -412,8 +494,9 @@ class SpeechSplitter:
             if requested_end > end_ms:
                 if self.validate_buffer_zone(audio, end_ms, requested_end):
                     validated_end = requested_end
+                    self.logger.debug(f"End buffer applied: {requested_end - end_ms}ms")
                 else:
-                    print(f"    ⚠ End buffer rejected: contains speech/noise")
+                    self.logger.debug("End buffer rejected: contains speech/noise")
         
         if prev_word_end_ms is None and self.word_start_buffer_ms > 0:
             requested_start = max(0, start_ms - self.word_start_buffer_ms)
@@ -431,11 +514,11 @@ class SpeechSplitter:
     
     def segment_by_pauses(self, words: List[Dict], audio: AudioSegment) -> List[Dict]:
         if not words:
-            print("⚠ No words found for segmentation")
+            self.logger.warning("No words found for segmentation")
             return []
         
         mode_str = "hybrid (Whisper + YAMNet)" if self.hybrid_pause_detection else "timestamp-only"
-        print(f"Segmenting by natural pauses ({mode_str})...")
+        self.logger.info(f"Segmenting by natural pauses ({mode_str})...")
         
         segments = []
         current_segment_words = []
@@ -445,7 +528,7 @@ class SpeechSplitter:
         
         for i, word in enumerate(words):
             if 'start' not in word or 'end' not in word:
-                print(f"⚠ Skipping word with missing timestamps: {word}")
+                self.logger.warning(f"Skipping word with missing timestamps: {word}")
                 continue
                 
             current_segment_words.append(word)
@@ -468,7 +551,7 @@ class SpeechSplitter:
                             validated_pauses += 1
                         else:
                             rejected_pauses += 1
-                            print(f"  ✗ Rejected pause at {word['end']:.2f}s ({pause_duration:.3f}s) - contains speech/noise")
+                            self.logger.debug(f"Rejected pause at {word['end']:.2f}s ({pause_duration:.3f}s)")
             
             if i == len(words) - 1:
                 should_split = True
@@ -478,7 +561,7 @@ class SpeechSplitter:
                 last_word = current_segment_words[-1]
                 
                 if 'start' not in first_word or 'end' not in last_word:
-                    print("⚠ Skipping segment with invalid timestamps")
+                    self.logger.warning("Skipping segment with invalid timestamps")
                     current_segment_words = []
                     continue
                 
@@ -518,18 +601,18 @@ class SpeechSplitter:
                         'prev_word_end_ms': prev_word_end_ms,
                         'next_word_start_ms': next_word_start_ms
                     })
-                    print(f"✓ Created segment: {segment_duration_s:.2f}s, '{segment_text[:50]}...'")
+                    self.logger.debug(f"Created segment: {segment_duration_s:.2f}s, '{segment_text[:50]}...'")
                 else:
-                    print(f"⚠ Skipping segment: {segment_duration_s:.2f}s, text valid: {self.validate_segment_text(segment_text)}")
+                    self.logger.debug(f"Skipping segment: {segment_duration_s:.2f}s, text valid: {self.validate_segment_text(segment_text)}")
                 
                 current_segment_words = []
         
-        print(f"✓ Created {len(segments)} segments from word timestamps")
+        self.logger.info(f"Created {len(segments)} segments from word timestamps")
         if self.hybrid_pause_detection and self.yamnet_filter and self.yamnet_filter.model:
-            print(f"  Pause validation stats:")
-            print(f"    - Potential pauses (by timestamp): {total_potential_pauses}")
-            print(f"    - Validated (true silence): {validated_pauses}")
-            print(f"    - Rejected (contains audio): {rejected_pauses}")
+            self.logger.info(f"Pause validation stats:")
+            self.logger.info(f"  - Potential pauses (by timestamp): {total_potential_pauses}")
+            self.logger.info(f"  - Validated (true silence): {validated_pauses}")
+            self.logger.info(f"  - Rejected (contains audio): {rejected_pauses}")
         
         return segments
     
@@ -565,7 +648,7 @@ class SpeechSplitter:
     def handle_cutoff_segment(self, audio_chunk: AudioSegment, text: str, cutoff_type: str, 
                             base_name: str, idx: int) -> Tuple[Optional[str], Optional[str], Optional[Dict]]:
         if self.cutoff_action == "skip":
-            print(f"  ⚠ Skipping segment {idx} due to cutoff words at {cutoff_type}")
+            self.logger.info(f"Skipping segment {idx} due to cutoff words at {cutoff_type}")
             return None, None, None
         elif self.cutoff_action == "rename":
             cutoff_indicator = ""
@@ -590,7 +673,7 @@ class SpeechSplitter:
         )
         
         if not self.safe_write_transcript(transcript_file, text):
-            print(f"  ⚠ Warning: Transcript save failed for cutoff segment {idx}")
+            self.logger.warning(f"Transcript save failed for cutoff segment {idx}")
         
         metadata = {
             'duration': len(audio_chunk) / 1000.0,
@@ -605,7 +688,7 @@ class SpeechSplitter:
     def handle_overlength_segment(self, audio_chunk: AudioSegment, text: str,
                                  base_name: str, idx: int, sample_rate: int) -> Tuple[Optional[str], Optional[str], Optional[Dict]]:
         if self.overlength_action == "skip":
-            print(f"  ⚠ Skipping segment {idx} due to overlength")
+            self.logger.info(f"Skipping segment {idx} due to overlength")
             return None, None, None
         elif self.overlength_action == "rename":
             chunk_name = f"{base_name}_{idx:04d}_LONG"
@@ -622,7 +705,7 @@ class SpeechSplitter:
         )
         
         if not self.safe_write_transcript(transcript_file, text):
-            print(f"  ⚠ Warning: Transcript save failed for overlength segment {idx}")
+            self.logger.warning(f"Transcript save failed for overlength segment {idx}")
         
         metadata = {
             'duration': len(audio_chunk) / 1000.0,
@@ -665,22 +748,23 @@ class SpeechSplitter:
             return audio_chunk
 
         trimmed_audio = audio_chunk[start_trim:end_trim]
+        self.logger.debug(f"Trimmed silence: {start_trim}ms from start, {seg_len - end_trim}ms from end")
         return trimmed_audio
 
     def process_file(self, audio_path: str, speaker_id: Optional[str] = None) -> Dict:
         audio_path = Path(audio_path)
         base_name = speaker_id or audio_path.stem
         
-        print(f"\n{'='*60}")
-        print(f"Processing: {audio_path.name}")
-        print(f"Speaker: {base_name}")
-        print(f"{'='*60}\n")
+        self.logger.info("="*60)
+        self.logger.info(f"Processing: {audio_path.name}")
+        self.logger.info(f"Speaker: {base_name}")
+        self.logger.info("="*60)
         
-        print("Loading audio...")
+        self.logger.info("Loading audio...")
         try:
             audio = AudioSegment.from_file(audio_path)
         except Exception as e:
-            print(f"✗ Error loading audio: {e}")
+            self.logger.error(f"Error loading audio: {e}", exc_info=True)
             return {
                 'total_segments': 0,
                 'total_duration': 0,
@@ -692,8 +776,9 @@ class SpeechSplitter:
         original_sample_rate = audio.frame_rate
         if audio.channels > 1:
             audio = audio.set_channels(1)
+            self.logger.info("Converted to mono")
         
-        print(f"✓ Loaded: {len(audio)/1000:.1f}s, {audio.frame_rate}Hz (original), {audio.channels} channel(s)\n")
+        self.logger.info(f"Loaded: {len(audio)/1000:.1f}s, {audio.frame_rate}Hz, {audio.channels} channel(s)")
         
         import tempfile
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
@@ -708,7 +793,7 @@ class SpeechSplitter:
         segments = self.segment_by_pauses(transcription_result['words'], audio)
         
         if not segments:
-            print("⚠ No segments created")
+            self.logger.warning("No segments created")
             return {
                 'total_segments': 0,
                 'total_duration': 0,
@@ -717,14 +802,14 @@ class SpeechSplitter:
                 'manifest_file': None
             }
         
-        print(f"\nFiltering {len(segments)} segments...")
+        self.logger.info(f"Filtering {len(segments)} segments...")
         filtered_segments = []
         filtered_music = 0
         filtered_noise = 0
         filtered_confidence = 0
         filtered_text = 0
         
-        for seg in tqdm(segments, desc="Filtering"):
+        for seg in tqdm(segments, desc="Filtering", disable=self.logger.level > logging.INFO):
             chunk = audio[seg['start_ms']:seg['end_ms']]
             
             if self.yamnet_filter and self.yamnet_filter.model and self.filter_music:
@@ -735,35 +820,35 @@ class SpeechSplitter:
                 )
                 if is_filtered:
                     filtered_music += 1
-                    print(f"  ⚠ Filtered music segment: {seg['duration']:.2f}s")
+                    self.logger.debug(f"Filtered music segment: {seg['duration']:.2f}s")
                     continue
             
             if self.is_noisy(chunk):
                 filtered_noise += 1
-                print(f"  ⚠ Filtered noisy/silent segment")
+                self.logger.debug("Filtered noisy/silent segment")
                 continue
             
             if seg['confidence'] < self.min_confidence:
                 filtered_confidence += 1
-                print(f"  ⚠ Filtered low confidence segment: {seg['confidence']:.3f} < {self.min_confidence:.3f}")
+                self.logger.debug(f"Filtered low confidence segment: {seg['confidence']:.3f}")
                 continue
             
             if not self.validate_segment_text(seg['text']):
                 filtered_text += 1
-                print(f"  ⚠ Filtered invalid text segment: '{seg['text']}'")
+                self.logger.debug(f"Filtered invalid text segment: '{seg['text']}'")
                 continue
             
             filtered_segments.append(seg)
         
-        print(f"\n✓ Kept {len(filtered_segments)} segments (out of {len(segments)} initial segments)")
+        self.logger.info(f"Kept {len(filtered_segments)} segments (out of {len(segments)} initial segments)")
         if filtered_music > 0:
-            print(f"⚠ Filtered {filtered_music} segments (music/mixed)")
+            self.logger.info(f"Filtered {filtered_music} segments (music/mixed)")
         if filtered_noise > 0:
-            print(f"⚠ Filtered {filtered_noise} segments (noisy/silent)")
+            self.logger.info(f"Filtered {filtered_noise} segments (noisy/silent)")
         if filtered_confidence > 0:
-            print(f"⚠ Filtered {filtered_confidence} segments (low confidence < {self.min_confidence:.2f})")
+            self.logger.info(f"Filtered {filtered_confidence} segments (low confidence)")
         if filtered_text > 0:
-            print(f"⚠ Filtered {filtered_text} segments (invalid text)")
+            self.logger.info(f"Filtered {filtered_text} segments (invalid text)")
         
         output_files = self.export_segments(
             audio, 
@@ -775,15 +860,15 @@ class SpeechSplitter:
         total_duration = sum(m['duration'] for _, _, m in output_files)
         avg_duration = total_duration / len(output_files) if output_files else 0
         
-        print(f"\n{'='*60}")
-        print(f"SUMMARY")
-        print(f"{'='*60}")
-        print(f"Segments: {len(output_files)}")
-        print(f"Duration: {total_duration:.2f}s")
-        print(f"Average: {avg_duration:.2f}s per segment")
-        print(f"Sample Rate: {original_sample_rate}Hz (preserved)")
-        print(f"Output: {self.output_dir}")
-        print(f"{'='*60}\n")
+        self.logger.info("="*60)
+        self.logger.info("SUMMARY")
+        self.logger.info("="*60)
+        self.logger.info(f"Segments: {len(output_files)}")
+        self.logger.info(f"Duration: {total_duration:.2f}s")
+        self.logger.info(f"Average: {avg_duration:.2f}s per segment")
+        self.logger.info(f"Sample Rate: {original_sample_rate}Hz (preserved)")
+        self.logger.info(f"Output: {self.output_dir}")
+        self.logger.info("="*60)
         
         return {
             'total_segments': len(output_files),
@@ -800,13 +885,13 @@ class SpeechSplitter:
             base_name: str,
             sample_rate: int
     ) -> List[Tuple[str, str, Dict]]:
-        print(f"Exporting {len(segments)} segments at {sample_rate}Hz...")
+        self.logger.info(f"Exporting {len(segments)} segments at {sample_rate}Hz...")
 
         output_files = []
 
-        for idx, seg in enumerate(tqdm(segments, desc="Exporting"), 1):
+        for idx, seg in enumerate(tqdm(segments, desc="Exporting", disable=self.logger.level > logging.INFO), 1):
             if not self.validate_segment_text(seg['text']):
-                print(f"⚠ Skipping segment {idx} due to invalid text")
+                self.logger.debug(f"Skipping segment {idx} due to invalid text")
                 continue
 
             chunk_name = f"{base_name}_{idx:04d}"
@@ -830,7 +915,7 @@ class SpeechSplitter:
             segment_duration = len(audio_chunk) / 1000.0
 
             if segment_duration > self.max_segment_length:
-                print(f"  ⚠ Overlength segment detected: {segment_duration:.2f}s > {self.max_segment_length:.2f}s")
+                self.logger.warning(f"Overlength segment detected: {segment_duration:.2f}s > {self.max_segment_length:.2f}s")
                 audio_file, transcript_file, metadata = self.handle_overlength_segment(
                     audio_chunk, seg['text'], base_name, idx, sample_rate
                 )
@@ -844,7 +929,7 @@ class SpeechSplitter:
             has_cutoff, cutoff_type = self.detect_cutoff(audio_chunk, seg['text'])
             
             if has_cutoff:
-                print(f"  ⚠ Cutoff detected at {cutoff_type} in segment {idx}")
+                self.logger.info(f"Cutoff detected at {cutoff_type} in segment {idx}")
                 audio_file, transcript_file, metadata = self.handle_cutoff_segment(
                     audio_chunk, seg['text'], cutoff_type, base_name, idx
                 )
@@ -861,7 +946,7 @@ class SpeechSplitter:
 
                 transcript_file = self.get_unique_filename(self.text_dir, chunk_name, ".txt")
                 if not self.safe_write_transcript(transcript_file, seg['text']):
-                    print(f"  ⚠ Warning: Transcript save failed for segment {idx}")
+                    self.logger.warning(f"Transcript save failed for segment {idx}")
 
                 metadata = {
                     'duration': len(audio_chunk) / 1000.0,
@@ -872,38 +957,38 @@ class SpeechSplitter:
 
             output_files.append((str(audio_file), str(transcript_file), metadata))
 
-        print(f"✓ Exported {len(output_files)} segments at original sample rate ({sample_rate}Hz)")
+        self.logger.info(f"Exported {len(output_files)} segments at original sample rate ({sample_rate}Hz)")
         return output_files
     
     def regenerate_folder_metadata(self):
-        print(f"\nRegenerating metadata for entire folder: {self.output_dir}")
+        self.logger.info(f"Regenerating metadata for entire folder: {self.output_dir}")
         
         audio_files = list(self.audio_dir.glob(f'*.{self.export_format}'))
         if not audio_files:
-            print("⚠ No audio files found in output directory")
+            self.logger.warning("No audio files found in output directory")
             return
         
-        print(f"Found {len(audio_files)} audio files")
+        self.logger.info(f"Found {len(audio_files)} audio files")
         
         segments = []
         for audio_file in audio_files:
             transcript_file = self.text_dir / f"{audio_file.stem}.txt"
             if not transcript_file.exists():
-                print(f"⚠ Transcript not found for {audio_file.name}, skipping")
+                self.logger.warning(f"Transcript not found for {audio_file.name}, skipping")
                 continue
             
             try:
                 audio = AudioSegment.from_file(audio_file)
                 duration = len(audio) / 1000.0
             except Exception as e:
-                print(f"⚠ Error loading {audio_file.name}: {e}, using 0 duration")
+                self.logger.error(f"Error loading {audio_file.name}: {e}, using 0 duration")
                 duration = 0.0
             
             try:
                 with open(transcript_file, 'rb') as f:
                     text = f.read().decode('utf-8').strip()
             except Exception as e:
-                print(f"⚠ Error reading {transcript_file.name}: {e}, using empty text")
+                self.logger.error(f"Error reading {transcript_file.name}: {e}, using empty text")
                 text = ""
             
             segments.append({
@@ -915,7 +1000,7 @@ class SpeechSplitter:
             })
         
         if not segments:
-            print("⚠ No valid segments found for metadata generation")
+            self.logger.warning("No valid segments found for metadata generation")
             return
         
         metadata = {
@@ -944,57 +1029,70 @@ class SpeechSplitter:
                     text = text.replace('"', '""')
                     f.write(f'"{segment["audio"]}","{text}"\n')
                 except Exception as e:
-                    print(f"⚠ Error reading {transcript_file}: {e}")
+                    self.logger.error(f"Error reading {transcript_file}: {e}")
                     f.write(f'"{segment["audio"]}",""\n')
         
-        print(f"✓ Regenerated metadata for {len(segments)} segments:")
-        print(f"  - {metadata_path}")
-        print(f"  - {manifest_path}")
-        print(f"  - {hf_metadata_path}")
+        self.logger.info(f"Regenerated metadata for {len(segments)} segments:")
+        self.logger.info(f"  - {metadata_path}")
+        self.logger.info(f"  - {manifest_path}")
+        self.logger.info(f"  - {hf_metadata_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('input')
-    parser.add_argument('--model', default='large')
-    parser.add_argument('--language', default='cs')
-    parser.add_argument('--output-dir', default='output')
-    parser.add_argument('--speaker-id')
-    parser.add_argument('--min-length', type=float, default=1.0)
-    parser.add_argument('--max-length', type=float, default=15.0)
-    parser.add_argument('--format', default='wav', choices=['wav', 'mp3'])
-    parser.add_argument('--pause-threshold', type=float, default=0.5)
-    parser.add_argument('--min-confidence', type=float, default=0.5)
-    parser.add_argument('--filter-noise', action='store_true')
-    parser.add_argument('--noise-silence-threshold', type=float, default=0.3)
-    parser.add_argument('--filter-music', action='store_true', default=True)
-    parser.add_argument('--music-threshold', type=float, default=0.3)
-    parser.add_argument('--mixed-threshold', type=float, default=0.2)
-    parser.add_argument('--word-start-buffer', type=int, default=250)
-    parser.add_argument('--word-end-buffer', type=int, default=750)
-    parser.add_argument('--check-cutoff', action='store_true', default=True)
-    parser.add_argument('--cutoff-boundary-ms', type=int, default=50)
-    parser.add_argument('--cutoff-silence-threshold', type=float, default=0.3)
-    parser.add_argument('--cutoff-action', default='rename', choices=['rename', 'skip', 'include'])
-    parser.add_argument('--hybrid-pause-detection', action='store_true', default=True)
-    parser.add_argument('--pause-speech-threshold', type=float, default=0.2)
-    parser.add_argument('--buffer-validation-threshold', type=float, default=0.3)
-    parser.add_argument('--overlength-action', default='rename', choices=['rename', 'skip', 'include'])
-    parser.add_argument('--trim-silence', action='store_true', default=True)
-    parser.add_argument('--trim-threshold-db', type=float, default=-40.0)
-    parser.add_argument('--trim-chunk-ms', type=int, default=10)
-    parser.add_argument('--trim-pad-ms', type=int, default=150)
+    parser = argparse.ArgumentParser(description="Split audio by speech pauses with Whisper + YAMNet")
+    parser.add_argument('input', help="Input audio file or directory")
+    parser.add_argument('--model', default='large', help="Whisper model size")
+    parser.add_argument('--language', default='cs', help="Language code")
+    parser.add_argument('--output-dir', default='output', help="Output directory")
+    parser.add_argument('--speaker-id', help="Speaker ID for naming")
+    parser.add_argument('--min-length', type=float, default=1.0, help="Minimum segment length (seconds)")
+    parser.add_argument('--max-length', type=float, default=15.0, help="Maximum segment length (seconds)")
+    parser.add_argument('--format', default='wav', choices=['wav', 'mp3'], help="Output audio format")
+    parser.add_argument('--pause-threshold', type=float, default=0.5, help="Pause detection threshold (seconds)")
+    parser.add_argument('--min-confidence', type=float, default=0.5, help="Minimum transcription confidence")
+    parser.add_argument('--filter-noise', action='store_true', help="Filter out noisy/silent segments")
+    parser.add_argument('--noise-silence-threshold', type=float, default=0.3, help="Noise silence threshold")
+    parser.add_argument('--filter-music', action='store_true', default=True, help="Filter out music segments")
+    parser.add_argument('--music-threshold', type=float, default=0.3, help="Music detection threshold")
+    parser.add_argument('--mixed-threshold', type=float, default=0.2, help="Mixed music/speech threshold")
+    parser.add_argument('--word-start-buffer', type=int, default=250, help="Buffer before word start (ms)")
+    parser.add_argument('--word-end-buffer', type=int, default=750, help="Buffer after word end (ms)")
+    parser.add_argument('--check-cutoff', action='store_true', default=True, help="Check for cutoff words")
+    parser.add_argument('--cutoff-boundary-ms', type=int, default=50, help="Cutoff boundary check (ms)")
+    parser.add_argument('--cutoff-silence-threshold', type=float, default=0.3, help="Cutoff silence threshold")
+    parser.add_argument('--cutoff-action', default='rename', choices=['rename', 'skip', 'include'], help="Action for cutoff segments")
+    parser.add_argument('--hybrid-pause-detection', action='store_true', default=True, help="Use Whisper + YAMNet for pause detection")
+    parser.add_argument('--pause-speech-threshold', type=float, default=0.2, help="Speech threshold for pause validation")
+    parser.add_argument('--buffer-validation-threshold', type=float, default=0.3, help="Buffer validation threshold")
+    parser.add_argument('--overlength-action', default='rename', choices=['rename', 'skip', 'include'], help="Action for overlength segments")
+    parser.add_argument('--trim-silence', action='store_true', default=True, help="Trim silence from segment boundaries")
+    parser.add_argument('--trim-threshold-db', type=float, default=-40.0, help="Silence trim threshold (dB)")
+    parser.add_argument('--trim-chunk-ms', type=int, default=10, help="Trim check chunk size (ms)")
+    parser.add_argument('--trim-pad-ms', type=int, default=150, help="Trim padding (ms)")
     parser.add_argument('--device', default=None, choices=['cuda', 'cpu'], 
                        help='Force device (cuda/cpu), auto-detect if not specified')
+    parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+                       help='Logging level')
     
     args = parser.parse_args()
     
+    # Create output directory first for logging
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Setup temporary logger for GPU check
+    temp_logger = logging.getLogger("SpeechSplitter.Startup")
+    temp_logger.setLevel(logging.INFO)
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+    temp_logger.addHandler(console_handler)
+    
     # Display GPU info at startup
-    print("\n" + "="*60)
-    print("GPU CHECK")
-    print("="*60)
-    check_gpu()
-    print("="*60 + "\n")
+    temp_logger.info("="*60)
+    temp_logger.info("GPU CHECK")
+    temp_logger.info("="*60)
+    check_gpu(temp_logger)
+    temp_logger.info("="*60)
     
     splitter = SpeechSplitter(
         whisper_model=args.model,
@@ -1024,7 +1122,8 @@ def main():
         trim_threshold_db=args.trim_threshold_db,
         trim_chunk_ms=args.trim_chunk_ms,
         trim_pad_ms=args.trim_pad_ms,
-        device=args.device
+        device=args.device,
+        log_level=args.log_level
     )
     
     input_path = Path(args.input)
@@ -1032,14 +1131,16 @@ def main():
         splitter.process_file(str(input_path), args.speaker_id)
     elif input_path.is_dir():
         audio_files = list(input_path.glob('*.wav')) + list(input_path.glob('*.mp3')) + list(input_path.glob('*.flac'))
+        splitter.logger.info(f"Found {len(audio_files)} audio files in directory")
         for audio_file in audio_files:
             speaker_id = audio_file.stem if not args.speaker_id else args.speaker_id
             splitter.process_file(str(audio_file), speaker_id)
     else:
-        print(f"Error: {args.input} is not a valid file or directory")
+        splitter.logger.error(f"{args.input} is not a valid file or directory")
         return
     
     splitter.regenerate_folder_metadata()
+    splitter.logger.info("Processing complete!")
 
 
 if __name__ == '__main__':
