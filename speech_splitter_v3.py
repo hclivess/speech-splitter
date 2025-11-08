@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime
 import warnings
+import sys
 warnings.filterwarnings('ignore')
 
 import whisper

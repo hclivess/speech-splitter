@@ -275,7 +275,7 @@ class SpeechSplitterGUI(QMainWindow):
         
         model_layout.addWidget(QLabel("Model Size:"))
         self.model_combo = QComboBox()
-        self.model_combo.addItems(['tiny', 'base', 'small', 'medium', 'large', 'large-v2', 'large-3'])
+        self.model_combo.addItems(['tiny', 'base', 'small', 'medium', 'large', 'large-v2', 'large-v3'])
         self.model_combo.setCurrentText('large')
         self.model_combo.setMinimumHeight(32)
         self.model_combo.setToolTip("Larger models are more accurate but slower")
