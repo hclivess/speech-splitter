@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 import os
 import json
 import argparse
@@ -214,6 +212,7 @@ class SpeechSplitter:
         mixed_threshold: float = 0.2,
         word_start_buffer_ms: int = 500,
         word_end_buffer_ms: int = 500,
+        word_end_extension_ms: int = 300,
         check_cutoff: bool = True,
         cutoff_boundary_ms: int = 50,
         cutoff_silence_threshold: float = 0.3,
@@ -262,6 +261,7 @@ class SpeechSplitter:
         self.mixed_threshold = mixed_threshold
         self.word_start_buffer_ms = word_start_buffer_ms
         self.word_end_buffer_ms = word_end_buffer_ms
+        self.word_end_extension_ms = word_end_extension_ms
         self.check_cutoff = check_cutoff
         self.cutoff_boundary_ms = cutoff_boundary_ms
         self.cutoff_silence_threshold = cutoff_silence_threshold
@@ -489,7 +489,10 @@ class SpeechSplitter:
                     self.logger.debug("Start buffer rejected: contains speech/noise")
         
         if self.word_end_buffer_ms > 0 and next_word_start_ms is not None:
-            requested_end = min(end_ms + self.word_end_buffer_ms, next_word_start_ms)
+            # Allow extension beyond next_word_start_ms by word_end_extension_ms
+            # This gives more room for word endings before trim_silence cuts it back
+            max_extension = next_word_start_ms + self.word_end_extension_ms
+            requested_end = min(end_ms + self.word_end_buffer_ms, max_extension)
             
             if requested_end > end_ms:
                 if self.validate_buffer_zone(audio, end_ms, requested_end):
@@ -1057,6 +1060,7 @@ def main():
     parser.add_argument('--mixed-threshold', type=float, default=0.2, help="Mixed music/speech threshold")
     parser.add_argument('--word-start-buffer', type=int, default=250, help="Buffer before word start (ms)")
     parser.add_argument('--word-end-buffer', type=int, default=750, help="Buffer after word end (ms)")
+    parser.add_argument('--word-end-extension', type=int, default=300, help="Extra extension after word end into pause (ms) - gets trimmed back by silence trimming")
     parser.add_argument('--check-cutoff', action='store_true', default=True, help="Check for cutoff words")
     parser.add_argument('--cutoff-boundary-ms', type=int, default=50, help="Cutoff boundary check (ms)")
     parser.add_argument('--cutoff-silence-threshold', type=float, default=0.3, help="Cutoff silence threshold")
@@ -1110,6 +1114,7 @@ def main():
         mixed_threshold=args.mixed_threshold,
         word_start_buffer_ms=args.word_start_buffer,
         word_end_buffer_ms=args.word_end_buffer,
+        word_end_extension_ms=args.word_end_extension,
         check_cutoff=args.check_cutoff,
         cutoff_boundary_ms=args.cutoff_boundary_ms,
         cutoff_silence_threshold=args.cutoff_silence_threshold,

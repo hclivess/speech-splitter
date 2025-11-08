@@ -57,6 +57,7 @@ class ProcessingThread(QThread):
                 mixed_threshold=self.settings.get('mixed_threshold', 0.2),
                 word_start_buffer_ms=self.settings.get('word_start_buffer', 250),
                 word_end_buffer_ms=self.settings.get('word_end_buffer', 750),
+                word_end_extension_ms=self.settings.get('word_end_extension', 300),
                 check_cutoff=self.settings.get('check_cutoff', True),
                 cutoff_boundary_ms=self.settings.get('cutoff_boundary_ms', 50),
                 cutoff_silence_threshold=self.settings.get('cutoff_silence_threshold', 0.3),
@@ -170,20 +171,27 @@ class SpeechSplitterGUI(QMainWindow):
         self.model_combo = QComboBox()
         self.model_combo.addItems(['tiny', 'base', 'small', 'medium', 'large', 'large-v2'])
         self.model_combo.setCurrentText('large')
+        self.model_combo.setToolTip("Whisper model size. Larger = more accurate but slower.\n"
+                                     "Recommended: 'large' for best quality")
         basic_layout.addWidget(self.model_combo)
         
         basic_layout.addWidget(QLabel("Language:"))
         self.language_combo = QComboBox()
         self.language_combo.addItems(['cs', 'en', 'de', 'es', 'fr', 'it', 'pl', 'ru'])
+        self.language_combo.setToolTip("Target language for transcription.\n"
+                                        "Must match your audio language")
         basic_layout.addWidget(self.language_combo)
         
         basic_layout.addWidget(QLabel("Speaker ID (optional):"))
         self.speaker_input = QLineEdit()
+        self.speaker_input.setToolTip("Optional identifier for output filenames.\n"
+                                       "If empty, uses input filename")
         basic_layout.addWidget(self.speaker_input)
         
         basic_layout.addWidget(QLabel("Output Directory:"))
         output_layout = QHBoxLayout()
         self.output_input = QLineEdit("output")
+        self.output_input.setToolTip("Directory where segments will be saved")
         output_layout.addWidget(self.output_input)
         browse_btn = QPushButton("Browse")
         browse_btn.clicked.connect(self.browse_output_dir)
@@ -193,6 +201,9 @@ class SpeechSplitterGUI(QMainWindow):
         basic_layout.addWidget(QLabel("Output Format:"))
         self.format_combo = QComboBox()
         self.format_combo.addItems(['wav', 'mp3'])
+        self.format_combo.setToolTip("Audio format for output segments.\n"
+                                      "WAV: Lossless, larger files\n"
+                                      "MP3: Compressed, smaller files")
         basic_layout.addWidget(self.format_combo)
         
         basic_layout.addStretch()
@@ -207,6 +218,9 @@ class SpeechSplitterGUI(QMainWindow):
         self.min_length_spin.setRange(0.5, 10.0)
         self.min_length_spin.setValue(1.0)
         self.min_length_spin.setSingleStep(0.5)
+        self.min_length_spin.setToolTip("Minimum duration for a valid segment.\n"
+                                         "Shorter segments will be filtered out.\n"
+                                         "Recommended: 1.0s for TTS training")
         segment_layout.addWidget(self.min_length_spin)
         
         segment_layout.addWidget(QLabel("Max Segment Length (s):"))
@@ -214,6 +228,9 @@ class SpeechSplitterGUI(QMainWindow):
         self.max_length_spin.setRange(5.0, 30.0)
         self.max_length_spin.setValue(15.0)
         self.max_length_spin.setSingleStep(1.0)
+        self.max_length_spin.setToolTip("Maximum duration for a segment.\n"
+                                         "Longer segments will be marked as LONG.\n"
+                                         "Recommended: 10-15s for most TTS models")
         segment_layout.addWidget(self.max_length_spin)
         
         segment_layout.addWidget(QLabel("Pause Threshold (s):"))
@@ -221,19 +238,43 @@ class SpeechSplitterGUI(QMainWindow):
         self.pause_threshold_spin.setRange(0.1, 2.0)
         self.pause_threshold_spin.setValue(0.5)
         self.pause_threshold_spin.setSingleStep(0.1)
+        self.pause_threshold_spin.setToolTip("Minimum pause duration to split segments.\n"
+                                              "Lower = more splits (shorter segments)\n"
+                                              "Higher = fewer splits (longer segments)\n"
+                                              "Recommended: 0.5s for natural speech breaks")
         segment_layout.addWidget(self.pause_threshold_spin)
         
         segment_layout.addWidget(QLabel("Word Start Buffer (ms):"))
         self.word_start_buffer_spin = QSpinBox()
         self.word_start_buffer_spin.setRange(0, 1000)
         self.word_start_buffer_spin.setValue(250)
+        self.word_start_buffer_spin.setToolTip("Audio padding BEFORE the first word.\n"
+                                                "Prevents cutting off word beginnings.\n"
+                                                "Validated to avoid including previous speech.\n"
+                                                "Recommended: 200-300ms")
         segment_layout.addWidget(self.word_start_buffer_spin)
         
         segment_layout.addWidget(QLabel("Word End Buffer (ms):"))
         self.word_end_buffer_spin = QSpinBox()
         self.word_end_buffer_spin.setRange(0, 1000)
         self.word_end_buffer_spin.setValue(750)
+        self.word_end_buffer_spin.setToolTip("Audio padding AFTER the last word.\n"
+                                              "Prevents cutting off word endings.\n"
+                                              "Validated to avoid including next speech.\n"
+                                              "Recommended: 500-800ms")
         segment_layout.addWidget(self.word_end_buffer_spin)
+        
+        segment_layout.addWidget(QLabel("Word End Extension (ms):"))
+        self.word_end_extension_spin = QSpinBox()
+        self.word_end_extension_spin.setRange(0, 1000)
+        self.word_end_extension_spin.setValue(300)
+        self.word_end_extension_spin.setToolTip("⭐ FIX FOR CUT-OFF WORD ENDINGS ⭐\n"
+                                                 "Extends segment END into the pause before next word.\n"
+                                                 "Gets trimmed back by silence trimming anyway,\n"
+                                                 "but gives word endings breathing room.\n"
+                                                 "Won't cut into next word - safe to use!\n"
+                                                 "Recommended: 200-400ms")
+        segment_layout.addWidget(self.word_end_extension_spin)
         
         segment_layout.addStretch()
         segment_tab.setLayout(segment_layout)
@@ -247,10 +288,16 @@ class SpeechSplitterGUI(QMainWindow):
         self.min_confidence_spin.setRange(0.0, 1.0)
         self.min_confidence_spin.setValue(0.5)
         self.min_confidence_spin.setSingleStep(0.05)
+        self.min_confidence_spin.setToolTip("Minimum Whisper confidence score (0.0-1.0).\n"
+                                             "Segments with lower confidence are filtered out.\n"
+                                             "Higher = stricter quality, fewer segments\n"
+                                             "Recommended: 0.5 for balanced quality")
         quality_layout.addWidget(self.min_confidence_spin)
         
         self.filter_noise_check = QCheckBox("Enable Noise Filtering")
         self.filter_noise_check.setChecked(True)
+        self.filter_noise_check.setToolTip("Use YAMNet AI to detect and filter out\n"
+                                            "noisy or silent segments automatically")
         quality_layout.addWidget(self.filter_noise_check)
         
         quality_layout.addWidget(QLabel("Noise Silence Threshold:"))
@@ -259,6 +306,10 @@ class SpeechSplitterGUI(QMainWindow):
         self.noise_silence_threshold_spin.setValue(0.3)
         self.noise_silence_threshold_spin.setSingleStep(0.05)
         self.noise_silence_threshold_spin.setDecimals(2)
+        self.noise_silence_threshold_spin.setToolTip("YAMNet threshold for silence detection.\n"
+                                                      "Higher = more aggressive filtering\n"
+                                                      "Lower = keeps more segments\n"
+                                                      "Recommended: 0.3")
         quality_layout.addWidget(self.noise_silence_threshold_spin)
         
         quality_layout.addStretch()
@@ -270,6 +321,8 @@ class SpeechSplitterGUI(QMainWindow):
         
         self.filter_music_check = QCheckBox("Enable YAMNet Music Filtering")
         self.filter_music_check.setChecked(True)
+        self.filter_music_check.setToolTip("Use YAMNet AI to detect and filter out\n"
+                                            "segments containing music or background music")
         music_layout.addWidget(self.filter_music_check)
         
         music_layout.addWidget(QLabel("Music Detection Threshold:"))
@@ -278,6 +331,10 @@ class SpeechSplitterGUI(QMainWindow):
         self.music_threshold_spin.setValue(0.3)
         self.music_threshold_spin.setSingleStep(0.05)
         self.music_threshold_spin.setDecimals(2)
+        self.music_threshold_spin.setToolTip("YAMNet threshold for pure music detection.\n"
+                                              "Higher = only filter obvious music\n"
+                                              "Lower = filter anything music-like\n"
+                                              "Recommended: 0.3")
         music_layout.addWidget(self.music_threshold_spin)
         
         music_layout.addWidget(QLabel("Music+Speech Mix Threshold:"))
@@ -286,6 +343,10 @@ class SpeechSplitterGUI(QMainWindow):
         self.mixed_threshold_spin.setValue(0.2)
         self.mixed_threshold_spin.setSingleStep(0.05)
         self.mixed_threshold_spin.setDecimals(2)
+        self.mixed_threshold_spin.setToolTip("YAMNet threshold for speech with background music.\n"
+                                              "Filters segments where music + speech mix.\n"
+                                              "Lower = more sensitive to background music\n"
+                                              "Recommended: 0.2")
         music_layout.addWidget(self.mixed_threshold_spin)
         
         music_layout.addStretch()
@@ -297,6 +358,10 @@ class SpeechSplitterGUI(QMainWindow):
         
         self.hybrid_pause_check = QCheckBox("Enable Hybrid Pause Detection")
         self.hybrid_pause_check.setChecked(True)
+        self.hybrid_pause_check.setToolTip("Use both Whisper timestamps AND YAMNet AI\n"
+                                            "to validate pauses are truly silent.\n"
+                                            "Prevents splitting on false pauses.\n"
+                                            "Recommended: Enabled for better quality")
         pause_layout.addWidget(self.hybrid_pause_check)
         
         pause_layout.addWidget(QLabel("Pause Speech Threshold:"))
@@ -305,6 +370,10 @@ class SpeechSplitterGUI(QMainWindow):
         self.pause_speech_threshold_spin.setValue(0.2)
         self.pause_speech_threshold_spin.setSingleStep(0.05)
         self.pause_speech_threshold_spin.setDecimals(2)
+        self.pause_speech_threshold_spin.setToolTip("Maximum speech probability allowed in pauses.\n"
+                                                     "Lower = stricter pause validation\n"
+                                                     "Higher = more lenient (may split mid-speech)\n"
+                                                     "Recommended: 0.2")
         pause_layout.addWidget(self.pause_speech_threshold_spin)
         
         pause_layout.addStretch()
@@ -316,18 +385,30 @@ class SpeechSplitterGUI(QMainWindow):
         
         self.check_cutoff_check = QCheckBox("Enable Cutoff Detection")
         self.check_cutoff_check.setChecked(True)
+        self.check_cutoff_check.setToolTip("Detect segments where words are cut off\n"
+                                            "at the beginning or end (missing silence).\n"
+                                            "Marks them as _CUTSTART, _CUTEND, _CUTBOTH\n"
+                                            "Recommended: Enabled for data quality")
         cutoff_layout.addWidget(self.check_cutoff_check)
         
         cutoff_layout.addWidget(QLabel("Cutoff Action:"))
         self.cutoff_action_combo = QComboBox()
         self.cutoff_action_combo.addItems(['rename', 'skip', 'include'])
         self.cutoff_action_combo.setCurrentText('rename')
+        self.cutoff_action_combo.setToolTip("Action for cutoff segments:\n"
+                                             "rename: Mark with _CUT* suffix\n"
+                                             "skip: Discard completely\n"
+                                             "include: Keep without marking")
         cutoff_layout.addWidget(self.cutoff_action_combo)
         
         cutoff_layout.addWidget(QLabel("Cutoff Boundary Check (ms):"))
         self.cutoff_boundary_spin = QSpinBox()
         self.cutoff_boundary_spin.setRange(10, 200)
         self.cutoff_boundary_spin.setValue(50)
+        self.cutoff_boundary_spin.setToolTip("Duration of start/end to check for silence.\n"
+                                              "Smaller = stricter cutoff detection\n"
+                                              "Larger = more lenient\n"
+                                              "Recommended: 50ms")
         cutoff_layout.addWidget(self.cutoff_boundary_spin)
         
         cutoff_layout.addWidget(QLabel("Cutoff Silence Threshold:"))
@@ -336,6 +417,10 @@ class SpeechSplitterGUI(QMainWindow):
         self.cutoff_silence_threshold_spin.setValue(0.3)
         self.cutoff_silence_threshold_spin.setSingleStep(0.05)
         self.cutoff_silence_threshold_spin.setDecimals(2)
+        self.cutoff_silence_threshold_spin.setToolTip("YAMNet threshold for detecting silence\n"
+                                                       "at segment boundaries.\n"
+                                                       "Higher = requires more obvious silence\n"
+                                                       "Recommended: 0.3")
         cutoff_layout.addWidget(self.cutoff_silence_threshold_spin)
         
         cutoff_layout.addStretch()
@@ -349,6 +434,10 @@ class SpeechSplitterGUI(QMainWindow):
         self.overlength_action_combo = QComboBox()
         self.overlength_action_combo.addItems(['rename', 'skip', 'include'])
         self.overlength_action_combo.setCurrentText('rename')
+        self.overlength_action_combo.setToolTip("Action for segments exceeding max length:\n"
+                                                 "rename: Mark with _LONG suffix\n"
+                                                 "skip: Discard completely\n"
+                                                 "include: Keep without marking")
         overlength_layout.addWidget(self.overlength_action_combo)
         
         overlength_layout.addStretch()
@@ -360,6 +449,10 @@ class SpeechSplitterGUI(QMainWindow):
         
         self.trim_silence_check = QCheckBox("Enable VAD Silence Trimming")
         self.trim_silence_check.setChecked(True)
+        self.trim_silence_check.setToolTip("Automatically trim silence from segment edges.\n"
+                                            "Uses Voice Activity Detection (VAD).\n"
+                                            "Works together with word_end_extension!\n"
+                                            "Recommended: Always enabled")
         vad_layout.addWidget(self.trim_silence_check)
         
         vad_layout.addWidget(QLabel("Silence Threshold (dB):"))
@@ -368,18 +461,30 @@ class SpeechSplitterGUI(QMainWindow):
         self.trim_threshold_spin.setValue(-40.0)
         self.trim_threshold_spin.setSingleStep(1.0)
         self.trim_threshold_spin.setDecimals(1)
+        self.trim_threshold_spin.setToolTip("Audio level threshold for silence detection.\n"
+                                             "More negative = only trim very quiet parts\n"
+                                             "Less negative = trim more aggressively\n"
+                                             "Recommended: -38 to -40 dB")
         vad_layout.addWidget(self.trim_threshold_spin)
         
         vad_layout.addWidget(QLabel("Detection Chunk Size (ms):"))
         self.trim_chunk_spin = QSpinBox()
         self.trim_chunk_spin.setRange(5, 50)
         self.trim_chunk_spin.setValue(10)
+        self.trim_chunk_spin.setToolTip("Size of audio chunks analyzed for silence.\n"
+                                         "Smaller = more precise trimming\n"
+                                         "Larger = faster but less precise\n"
+                                         "Recommended: 10-20ms")
         vad_layout.addWidget(self.trim_chunk_spin)
         
         vad_layout.addWidget(QLabel("Silence Padding (ms):"))
         self.trim_pad_spin = QSpinBox()
         self.trim_pad_spin.setRange(0, 500)
         self.trim_pad_spin.setValue(150)
+        self.trim_pad_spin.setToolTip("Audio padding kept after trimming silence.\n"
+                                       "Prevents too-aggressive trimming.\n"
+                                       "Ensures natural sound.\n"
+                                       "Recommended: 100-150ms")
         vad_layout.addWidget(self.trim_pad_spin)
         
         vad_layout.addStretch()
@@ -511,6 +616,7 @@ class SpeechSplitterGUI(QMainWindow):
             'mixed_threshold': self.mixed_threshold_spin.value(),
             'word_start_buffer': self.word_start_buffer_spin.value(),
             'word_end_buffer': self.word_end_buffer_spin.value(),
+            'word_end_extension': self.word_end_extension_spin.value(),
             'check_cutoff': self.check_cutoff_check.isChecked(),
             'cutoff_boundary_ms': self.cutoff_boundary_spin.value(),
             'cutoff_silence_threshold': self.cutoff_silence_threshold_spin.value(),
@@ -589,6 +695,7 @@ class SpeechSplitterGUI(QMainWindow):
                 self.pause_threshold_spin.setValue(settings.get('pause_threshold', 0.5))
                 self.word_start_buffer_spin.setValue(settings.get('word_start_buffer', 250))
                 self.word_end_buffer_spin.setValue(settings.get('word_end_buffer', 750))
+                self.word_end_extension_spin.setValue(settings.get('word_end_extension', 300))
                 self.format_combo.setCurrentText(settings.get('format', 'wav'))
                 self.min_confidence_spin.setValue(settings.get('min_confidence', 0.5))
                 self.filter_noise_check.setChecked(settings.get('filter_noise', True))
@@ -620,6 +727,7 @@ class SpeechSplitterGUI(QMainWindow):
             'pause_threshold': self.pause_threshold_spin.value(),
             'word_start_buffer': self.word_start_buffer_spin.value(),
             'word_end_buffer': self.word_end_buffer_spin.value(),
+            'word_end_extension': self.word_end_extension_spin.value(),
             'format': self.format_combo.currentText(),
             'min_confidence': self.min_confidence_spin.value(),
             'filter_noise': self.filter_noise_check.isChecked(),
