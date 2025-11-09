@@ -715,19 +715,20 @@ class SpeechSplitterGUI(QMainWindow):
     def add_file(self, file_path: str):
         if file_path not in self.selected_files:
             self.selected_files.append(file_path)
-            
+        
             item = QListWidgetItem(Path(file_path).name)
-            
-            # Try to get duration
+        
+            # Fast duration check using tinytag (no fallback)
             try:
-                from pydub import AudioSegment
-                audio = AudioSegment.from_file(file_path)
-                duration = len(audio) / 1000
-                item.setText(f"{Path(file_path).name} ({duration:.1f}s)")
-            except:
+                from tinytag import TinyTag
+                tag = TinyTag.get(file_path)
+                if tag.duration:
+                    item.setText(f"{Path(file_path).name} ({tag.duration:.1f}s)")
+            except Exception:
+                # If reading fails, just show filename without duration
                 pass
-            
-            self.file_list.addItem(item)
+        
+        self.file_list.addItem(item)
     
     def add_files(self):
         files, _ = QFileDialog.getOpenFileNames(
