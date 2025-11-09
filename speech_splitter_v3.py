@@ -1,4 +1,5 @@
-# speech_splitter_v3.py
+
+# speech_splitter_v3_fixed.py
 import os
 import json
 import argparse
@@ -207,7 +208,7 @@ class SpeechSplitter:
         
         # Log initialization
         self.logger.info("SpeechSplitter initializing", extra={
-            'version': '3.0',
+            'version': '3.1',
             'device': kwargs.get('device', 'auto')
         })
         
@@ -216,14 +217,14 @@ class SpeechSplitter:
         if self.device is None:
             self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
-        # Store parameters
+        # Store parameters - UPDATED DEFAULTS
         self.params = {
             'whisper_model': kwargs.get('whisper_model', 'large'),
             'language': kwargs.get('language', 'cs'),
             'min_segment_length': kwargs.get('min_segment_length', 1.0),
             'max_segment_length': kwargs.get('max_segment_length', 15.0),
             'export_format': kwargs.get('export_format', 'wav'),
-            'pause_threshold': kwargs.get('pause_threshold', 0.5),
+            'pause_threshold': kwargs.get('pause_threshold', 0.3),  # Lowered from 0.5
             'min_confidence': kwargs.get('min_confidence', 0.5),
             'filter_noise': kwargs.get('filter_noise', True),
             'noise_silence_threshold': kwargs.get('noise_silence_threshold', 0.3),
@@ -231,10 +232,10 @@ class SpeechSplitter:
             'music_threshold': kwargs.get('music_threshold', 0.3),
             'mixed_threshold': kwargs.get('mixed_threshold', 0.2),
             'word_start_buffer_ms': kwargs.get('word_start_buffer_ms', 250),
-            'word_end_buffer_ms': kwargs.get('word_end_buffer_ms', 750),
-            'word_end_extension_ms': kwargs.get('word_end_extension_ms', 300),
+            'word_end_buffer_ms': kwargs.get('word_end_buffer_ms', 1500),  # Increased from 750
+            'word_end_extension_ms': kwargs.get('word_end_extension_ms', 0),  # Disabled flawed logic
             'check_cutoff': kwargs.get('check_cutoff', True),
-            'cutoff_boundary_ms': kwargs.get('cutoff_boundary_ms', 50),
+            'cutoff_boundary_ms': kwargs.get('cutoff_boundary_ms', 100),  # Increased from 50
             'cutoff_silence_threshold': kwargs.get('cutoff_silence_threshold', 0.3),
             'cutoff_action': kwargs.get('cutoff_action', 'rename'),
             'hybrid_pause_detection': kwargs.get('hybrid_pause_detection', True),
@@ -242,9 +243,9 @@ class SpeechSplitter:
             'buffer_validation_threshold': kwargs.get('buffer_validation_threshold', 0.3),
             'overlength_action': kwargs.get('overlength_action', 'rename'),
             'trim_silence': kwargs.get('trim_silence', True),
-            'trim_threshold_db': kwargs.get('trim_threshold_db', -40.0),
+            'trim_threshold_db': kwargs.get('trim_threshold_db', -45.0),  # Lowered from -40
             'trim_chunk_ms': kwargs.get('trim_chunk_ms', 10),
-            'trim_pad_ms': kwargs.get('trim_pad_ms', 150)
+            'trim_pad_ms': kwargs.get('trim_pad_ms', 50),  # Reduced from 150
         }
         
         # Log configuration as JSON
@@ -415,6 +416,10 @@ class SpeechSplitter:
                     text = ''.join([w.get('word', '') for w in current_words]).strip()
                     duration = last_word['end'] - first_word['start']
                     
+                    # FIX: Calculate context timestamps for boundary validation
+                    prev_word_end_ms = int(words[i - len(current_words)]['end'] * 1000) if i - len(current_words) >= 0 else None
+                    next_word_start_ms = int(words[i + 1]['start'] * 1000) if i + 1 < len(words) else None
+                    
                     if self.validate_segment_text(text) and duration >= self.params['min_segment_length']:
                         segments.append({
                             'start_ms': int(first_word['start'] * 1000),
@@ -422,9 +427,12 @@ class SpeechSplitter:
                             'duration': duration,
                             'words': current_words.copy(),
                             'text': text,
-                            'confidence': sum(w.get('probability', 1.0) for w in current_words) / len(current_words)
+                            'confidence': sum(w.get('probability', 1.0) for w in current_words) / len(current_words),
+                            'prev_word_end_ms': prev_word_end_ms,  # FIX: Store previous word end
+                            'next_word_start_ms': next_word_start_ms  # FIX: Store next word start
                         })
                 
+                # CRITICAL FIX: Clear current_words after processing split
                 current_words = []
         
         self.logger.info(f"Segmentation complete: {len(segments)} segments", extra={
@@ -452,19 +460,20 @@ class SpeechSplitter:
     
     def get_validated_boundaries(self, audio: AudioSegment, start_ms: int, end_ms: int,
                                 prev_word_end_ms: Optional[int], next_word_start_ms: Optional[int]) -> Tuple[int, int]:
+        """FIXED: Preserve ALL silence between words until next word starts"""
         validated_start = start_ms
         validated_end = end_ms
         
-        # Apply start buffer
+        # START: Extend backward by buffer, but not into previous word
         if self.params['word_start_buffer_ms'] > 0 and prev_word_end_ms is not None:
-            requested_start = max(start_ms - self.params['word_start_buffer_ms'], prev_word_end_ms)
+            requested_start = max(prev_word_end_ms, start_ms - self.params['word_start_buffer_ms'])
             if requested_start < start_ms and self.validate_buffer_zone(audio, requested_start, start_ms):
                 validated_start = requested_start
         
-        # Apply end buffer
-        if self.params['word_end_buffer_ms'] > 0 and next_word_start_ms is not None:
-            max_extension = next_word_start_ms + self.params['word_end_extension_ms']
-            requested_end = min(end_ms + self.params['word_end_buffer_ms'], max_extension)
+        # END: Extend forward to include ALL silence until next word (FIXED)
+        if next_word_start_ms is not None:
+            # Use min() to ensure we don't exceed next word's start
+            requested_end = min(end_ms + self.params['word_end_buffer_ms'], next_word_start_ms)
             if requested_end > end_ms and self.validate_buffer_zone(audio, end_ms, requested_end):
                 validated_end = requested_end
         
@@ -527,24 +536,26 @@ class SpeechSplitter:
             path = base_path / f"{stem}_{counter:03d}{suffix}"
         return path
     
-    def trim_silence_from_audio(self, audio_chunk: AudioSegment) -> AudioSegment:
+    def trim_silence_from_audio(self, audio_chunk: AudioSegment, trim_end: bool = True) -> AudioSegment:
+        """FIXED: Added trim_end parameter to control end trimming"""
         if not self.params['trim_silence'] or len(audio_chunk) < 200:
             return audio_chunk
         
-        # Find first non-silent chunk
+        # Trim start
         start_trim = 0
         for i in range(0, len(audio_chunk), self.params['trim_chunk_ms']):
             if audio_chunk[i:i + self.params['trim_chunk_ms']].dBFS > self.params['trim_threshold_db']:
                 start_trim = max(0, i - self.params['trim_pad_ms'])
                 break
         
-        # Find last non-silent chunk
+        # Trim end (only if enabled)
         end_trim = len(audio_chunk)
-        for i in range(len(audio_chunk), 0, -self.params['trim_chunk_ms']):
-            chunk = audio_chunk[max(0, i - self.params['trim_chunk_ms']):i]
-            if chunk.dBFS > self.params['trim_threshold_db']:
-                end_trim = min(len(audio_chunk), i + self.params['trim_pad_ms'])
-                break
+        if trim_end:
+            for i in range(len(audio_chunk), 0, -self.params['trim_chunk_ms']):
+                chunk = audio_chunk[max(0, i - self.params['trim_chunk_ms']):i]
+                if chunk.dBFS > self.params['trim_threshold_db']:
+                    end_trim = min(len(audio_chunk), i + self.params['trim_pad_ms'])
+                    break
         
         if start_trim >= end_trim:
             return audio_chunk
@@ -656,7 +667,7 @@ class SpeechSplitter:
             if not self.validate_segment_text(seg['text']):
                 continue
             
-            # Get validated boundaries
+            # Get validated boundaries with context
             start_ms, end_ms = self.get_validated_boundaries(
                 audio,
                 seg['start_ms'],
@@ -666,7 +677,9 @@ class SpeechSplitter:
             )
             
             audio_chunk = audio[start_ms:end_ms]
-            audio_chunk = self.trim_silence_from_audio(audio_chunk)
+            
+            # FIX: Don't trim end silence to preserve word endings
+            audio_chunk = self.trim_silence_from_audio(audio_chunk, trim_end=False)
             
             duration = len(audio_chunk) / 1000.0
             
@@ -759,7 +772,7 @@ class SpeechSplitter:
         })
 
 def main():
-    parser = argparse.ArgumentParser(description="Speech Splitter v3 - TTS Data Generator")
+    parser = argparse.ArgumentParser(description="Speech Splitter v3.1 - TTS Data Generator (FIXED)")
     parser.add_argument('input', help="Input audio file or directory")
     parser.add_argument('--model', default='large', help="Whisper model size")
     parser.add_argument('--language', default='cs', help="Language code")
@@ -768,7 +781,7 @@ def main():
     parser.add_argument('--min-length', type=float, default=1.0, help="Minimum segment length (seconds)")
     parser.add_argument('--max-length', type=float, default=15.0, help="Maximum segment length (seconds)")
     parser.add_argument('--format', default='wav', choices=['wav', 'mp3'], help="Output format")
-    parser.add_argument('--pause-threshold', type=float, default=0.5, help="Pause detection threshold")
+    parser.add_argument('--pause-threshold', type=float, default=0.3, help="Pause detection threshold")
     parser.add_argument('--min-confidence', type=float, default=0.5, help="Minimum confidence")
     parser.add_argument('--filter-noise', action='store_true', help="Filter noisy segments")
     parser.add_argument('--noise-silence-threshold', type=float, default=0.3, help="Noise threshold")
@@ -776,19 +789,19 @@ def main():
     parser.add_argument('--music-threshold', type=float, default=0.3, help="Music threshold")
     parser.add_argument('--mixed-threshold', type=float, default=0.2, help="Mixed threshold")
     parser.add_argument('--word-start-buffer', type=int, default=250, help="Start buffer (ms)")
-    parser.add_argument('--word-end-buffer', type=int, default=750, help="End buffer (ms)")
-    parser.add_argument('--word-end-extension', type=int, default=300, help="End extension (ms)")
+    parser.add_argument('--word-end-buffer', type=int, default=1500, help="End buffer (ms) - MAX silence to keep")
+    parser.add_argument('--word-end-extension', type=int, default=0, help="Disabled - use word-end-buffer instead")
     parser.add_argument('--check-cutoff', action='store_true', default=True, help="Check for cutoffs")
-    parser.add_argument('--cutoff-boundary-ms', type=int, default=50, help="Cutoff boundary")
+    parser.add_argument('--cutoff-boundary-ms', type=int, default=100, help="Cutoff boundary")
     parser.add_argument('--cutoff-silence-threshold', type=float, default=0.3, help="Cutoff threshold")
     parser.add_argument('--cutoff-action', default='rename', choices=['rename', 'skip', 'include'], help="Cutoff action")
     parser.add_argument('--hybrid-pause-detection', action='store_true', default=True, help="Hybrid pause detection")
     parser.add_argument('--pause-speech-threshold', type=float, default=0.2, help="Pause speech threshold")
     parser.add_argument('--overlength-action', default='rename', choices=['rename', 'skip', 'include'], help="Overlength action")
     parser.add_argument('--trim-silence', action='store_true', default=True, help="Trim silence")
-    parser.add_argument('--trim-threshold-db', type=float, default=-40.0, help="Trim threshold")
+    parser.add_argument('--trim-threshold-db', type=float, default=-45.0, help="Trim threshold")
     parser.add_argument('--trim-chunk-ms', type=int, default=10, help="Trim chunk size")
-    parser.add_argument('--trim-pad-ms', type=int, default=150, help="Trim padding")
+    parser.add_argument('--trim-pad-ms', type=int, default=50, help="Trim padding")
     parser.add_argument('--device', default=None, choices=['cuda', 'cpu'], help="Force device")
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help="Log level")
     
