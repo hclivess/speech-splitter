@@ -36,7 +36,7 @@ class ProcessingThread(QThread):
     
     def run(self):
         try:
-            from speech_splitter_v4_optimized import SpeechSplitter
+            from speech_splitter_v3 import SpeechSplitter
             
             self.status.emit("Initializing models...")
             self.log.emit(f"Loading Whisper model: <b>{self.settings['model']}</b>", "info")
@@ -87,8 +87,11 @@ class ProcessingThread(QThread):
             
             if self._is_running and results:
                 self.status.emit("Generating metadata files...")
-                splitter.regenerate_folder_metadata()
-                self.log.emit("✓ Metadata files created", "success")
+                try:
+                    splitter.generate_metadata()
+                    self.log.emit("✓ Metadata files created", "success")
+                except Exception as e:
+                    self.log.emit(f"⚠ Metadata generation warning: {e}", "warning")
             
             self.finished.emit({'results': results, 'success': success, 'total_segments': total_segs})
             
