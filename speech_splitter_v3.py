@@ -189,7 +189,42 @@ class YAMNetFilter:
             os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
             
             self.logger.info("Loading YAMNet model...")
-            self.model = hub.load('https://tfhub.dev/google/yamnet/1')
+            
+            # Clear corrupted cache and reload
+            import shutil
+            import tempfile
+            
+            # Get TFHub cache directory
+            tfhub_cache = os.path.join(tempfile.gettempdir(), 'tfhub_modules')
+            corrupt_model_hash = '9616fd04ec2360621642ef9455b84f4b668e219e'
+            corrupt_path = os.path.join(tfhub_cache, corrupt_model_hash)
+            
+            # Remove corrupted cache if it exists
+            if os.path.exists(corrupt_path):
+                self.logger.info(f"Removing corrupted cache: {corrupt_path}")
+                try:
+                    shutil.rmtree(corrupt_path)
+                except Exception as e:
+                    self.logger.warning(f"Failed to remove cache: {e}")
+            
+            # Load model with retry
+            max_retries = 2
+            for attempt in range(max_retries):
+                try:
+                    self.model = hub.load('https://tfhub.dev/google/yamnet/1')
+                    break
+                except ValueError as e:
+                    if attempt < max_retries - 1:
+                        self.logger.warning(f"Attempt {attempt + 1} failed, retrying after clearing cache...")
+                        # Clear entire tfhub cache on retry
+                        if os.path.exists(tfhub_cache):
+                            try:
+                                shutil.rmtree(tfhub_cache)
+                                os.makedirs(tfhub_cache, exist_ok=True)
+                            except Exception as clear_error:
+                                self.logger.warning(f"Failed to clear cache: {clear_error}")
+                    else:
+                        raise
             
             class_map_path = self.model.class_map_path().numpy()
             self.class_names = self._load_class_names(class_map_path)
