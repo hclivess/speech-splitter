@@ -36,7 +36,7 @@ class ProcessingThread(QThread):
     
     def run(self):
         try:
-            from speech_splitter_v3 import SpeechSplitter
+            from speech_splitter_v4_optimized import SpeechSplitter
             
             self.status.emit("Initializing models...")
             self.log.emit(f"Loading Whisper model: <b>{self.settings['model']}</b>", "info")
@@ -451,14 +451,6 @@ class SpeechSplitterGUI(QMainWindow):
         self.word_end_buffer_spin.setToolTip("Padding after last word")
         buffer_layout.addWidget(self.word_end_buffer_spin)
         
-        buffer_layout.addWidget(QLabel("End Extension (ms):"))
-        self.word_end_extension_spin = QSpinBox()
-        self.word_end_extension_spin.setRange(0, 1000)
-        self.word_end_extension_spin.setValue(300)
-        self.word_end_extension_spin.setMinimumHeight(32)
-        self.word_end_extension_spin.setToolTip("Extra room for word endings")
-        buffer_layout.addWidget(self.word_end_extension_spin)
-        
         buffer_group.setLayout(buffer_layout)
         layout.addWidget(buffer_group)
         
@@ -482,42 +474,6 @@ class SpeechSplitterGUI(QMainWindow):
         
         pause_group.setLayout(pause_layout)
         layout.addWidget(pause_group)
-        
-        # Cutoff detection
-        cutoff_group = QGroupBox("Cutoff Detection")
-        cutoff_layout = QVBoxLayout()
-        cutoff_layout.setSpacing(8)
-        
-        self.check_cutoff_check = QCheckBox("Enable Cutoff Detection")
-        self.check_cutoff_check.setChecked(True)
-        self.check_cutoff_check.setMinimumHeight(28)
-        cutoff_layout.addWidget(self.check_cutoff_check)
-        
-        cutoff_layout.addWidget(QLabel("Boundary (ms):"))
-        self.cutoff_boundary_spin = QSpinBox()
-        self.cutoff_boundary_spin.setRange(0, 500)
-        self.cutoff_boundary_spin.setValue(50)
-        self.cutoff_boundary_spin.setMinimumHeight(32)
-        self.cutoff_boundary_spin.setToolTip("Threshold for detecting cutoffs near segment boundaries")
-        cutoff_layout.addWidget(self.cutoff_boundary_spin)
-        
-        cutoff_layout.addWidget(QLabel("Silence Threshold:"))
-        self.cutoff_silence_threshold_spin = QDoubleSpinBox()
-        self.cutoff_silence_threshold_spin.setRange(0.0, 1.0)
-        self.cutoff_silence_threshold_spin.setValue(0.3)
-        self.cutoff_silence_threshold_spin.setSingleStep(0.05)
-        self.cutoff_silence_threshold_spin.setMinimumHeight(32)
-        cutoff_layout.addWidget(self.cutoff_silence_threshold_spin)
-        
-        cutoff_layout.addWidget(QLabel("Action:"))
-        self.cutoff_action_combo = QComboBox()
-        self.cutoff_action_combo.addItems(['rename', 'skip', 'include'])
-        self.cutoff_action_combo.setCurrentText('rename')
-        self.cutoff_action_combo.setMinimumHeight(32)
-        cutoff_layout.addWidget(self.cutoff_action_combo)
-        
-        cutoff_group.setLayout(cutoff_layout)
-        layout.addWidget(cutoff_group)
         
         # Overlength action
         overlength_group = QGroupBox("Overlength Handling")
@@ -856,11 +812,6 @@ class SpeechSplitterGUI(QMainWindow):
             'mixed_threshold': self.mixed_threshold_spin.value(),
             'word_start_buffer_ms': self.word_start_buffer_spin.value(),
             'word_end_buffer_ms': self.word_end_buffer_spin.value(),
-            'word_end_extension_ms': self.word_end_extension_spin.value(),
-            'check_cutoff': self.check_cutoff_check.isChecked(),
-            'cutoff_boundary_ms': self.cutoff_boundary_spin.value(),
-            'cutoff_silence_threshold': self.cutoff_silence_threshold_spin.value(),
-            'cutoff_action': self.cutoff_action_combo.currentText(),
             'hybrid_pause_detection': self.hybrid_pause_check.isChecked(),
             'pause_speech_threshold': self.pause_speech_threshold_spin.value(),
             'overlength_action': self.overlength_action_combo.currentText(),
@@ -917,13 +868,8 @@ class SpeechSplitterGUI(QMainWindow):
         # Advanced tab
         self.word_start_buffer_spin.setValue(250)
         self.word_end_buffer_spin.setValue(750)
-        self.word_end_extension_spin.setValue(300)
         self.hybrid_pause_check.setChecked(True)
         self.pause_speech_threshold_spin.setValue(0.2)
-        self.check_cutoff_check.setChecked(True)
-        self.cutoff_action_combo.setCurrentText('rename')
-        self.cutoff_boundary_spin.setValue(50)
-        self.cutoff_silence_threshold_spin.setValue(0.3)
         self.overlength_action_combo.setCurrentText('rename')
         
         # Output tab
@@ -979,11 +925,6 @@ class SpeechSplitterGUI(QMainWindow):
         self.mixed_threshold_spin.setValue(settings.get('mixed_threshold', 0.2))
         self.word_start_buffer_spin.setValue(settings.get('word_start_buffer_ms', 250))
         self.word_end_buffer_spin.setValue(settings.get('word_end_buffer_ms', 750))
-        self.word_end_extension_spin.setValue(settings.get('word_end_extension_ms', 300))
-        self.check_cutoff_check.setChecked(settings.get('check_cutoff', True))
-        self.cutoff_boundary_spin.setValue(settings.get('cutoff_boundary_ms', 50))
-        self.cutoff_silence_threshold_spin.setValue(settings.get('cutoff_silence_threshold', 0.3))
-        self.cutoff_action_combo.setCurrentText(settings.get('cutoff_action', 'rename'))
         self.hybrid_pause_check.setChecked(settings.get('hybrid_pause_detection', True))
         self.pause_speech_threshold_spin.setValue(settings.get('pause_speech_threshold', 0.2))
         self.overlength_action_combo.setCurrentText(settings.get('overlength_action', 'rename'))
