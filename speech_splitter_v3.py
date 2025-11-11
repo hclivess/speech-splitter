@@ -721,27 +721,31 @@ class ExportManager:
         self.logger.info(f"Exporting {len(segments)} segments...")
         
         output_files = []
+        skipped_cutoff = 0
+        
         for idx, seg in enumerate(segments, 1):
-            # Get validated boundaries
-            start_ms, end_ms = self._get_validated_boundaries(
+            start_ms, end_ms, should_skip = self._get_validated_boundaries_with_cutoff_check(
                 audio, seg.start_ms, seg.end_ms, 
-                seg.prev_word_end_ms, seg.next_word_start_ms
+                seg.prev_word_end_ms, seg.next_word_start_ms,
+                seg.text
             )
+            
+            if should_skip:
+                skipped_cutoff += 1
+                continue
             
             audio_chunk = audio[start_ms:end_ms]
             
-            # Trim silence (vectorized - Issue #10)
             audio_chunk = AudioProcessor.trim_silence_vectorized(
                 audio_chunk,
                 self.params['trim_threshold_db'],
                 self.params['trim_chunk_ms'],
                 self.params['trim_pad_ms'],
-                trim_end=False  # Don't trim end to preserve word endings
+                trim_end=False
             )
             
             duration = len(audio_chunk) / 1000.0
             
-            # Handle overlength segments
             if duration > self.params['max_segment_length']:
                 self.logger.debug(f"Segment {idx} overlength: {duration:.2f}s")
                 if self.params['overlength_action'] == 'skip':
@@ -750,12 +754,10 @@ class ExportManager:
             else:
                 suffix = ""
             
-            # Generate filenames
             chunk_name = f"{base_name}_{idx:04d}{suffix}"
             audio_file = self._get_unique_filename(self.audio_dir, chunk_name, f".{self.params['export_format']}")
             transcript_file = self._get_unique_filename(self.text_dir, chunk_name, ".txt")
             
-            # Export files
             audio_chunk.export(audio_file, format=self.params['export_format'], parameters=["-ar", str(sample_rate)])
             transcript_file.write_text(seg.text, encoding='utf-8')
             
@@ -767,29 +769,32 @@ class ExportManager:
                 'classification': seg.classification
             }))
         
+        if skipped_cutoff > 0:
+            self.logger.info(f"Skipped {skipped_cutoff} segments due to cutoff detection")
+        
         self.logger.info(f"Export complete: {len(output_files)} segments")
         return output_files
     
     def _get_validated_boundaries(self, audio: AudioSegment, start_ms: int, end_ms: int,
                                    prev_word_end_ms: Optional[int], 
                                    next_word_start_ms: Optional[int]) -> Tuple[int, int]:
-        """
-        Get validated segment boundaries with buffers
-        FIXED: Buffer validation to prevent overlap (Issue #7)
-        """
+        """Get validated segment boundaries with buffers"""
         validated_start = start_ms
         validated_end = end_ms
         
-        # START: Extend backward by buffer, but not into previous word
-        if self.params['word_start_buffer_ms'] > 0 and prev_word_end_ms is not None:
-            requested_start = max(prev_word_end_ms, start_ms - self.params['word_start_buffer_ms'])
-            validated_start = requested_start
-        elif self.params['word_start_buffer_ms'] > 0:
-            validated_start = max(0, start_ms - self.params['word_start_buffer_ms'])
+        if self.params['word_start_buffer_ms'] > 0:
+            buffer_start = start_ms - self.params['word_start_buffer_ms']
+            
+            if prev_word_end_ms is not None:
+                gap = start_ms - prev_word_end_ms
+                if gap < 200:
+                    validated_start = max(prev_word_end_ms - 150, buffer_start, 0)
+                else:
+                    validated_start = max(prev_word_end_ms, buffer_start, 0)
+            else:
+                validated_start = max(0, buffer_start)
         
-        # END: Extend forward but cap at next word start (Issue #7)
         if next_word_start_ms is not None:
-            # FIXED: Don't exceed gap size (Issue #7)
             max_gap = next_word_start_ms - end_ms
             actual_buffer = min(self.params['word_end_buffer_ms'], max_gap)
             validated_end = end_ms + actual_buffer
@@ -797,6 +802,67 @@ class ExportManager:
             validated_end = end_ms + self.params['word_end_buffer_ms']
         
         return validated_start, validated_end
+    
+    def _check_for_cutoff(self, audio_chunk: AudioSegment, is_start: bool = True) -> bool:
+        """Check if audio is cut off at the beginning or end"""
+        if not self.params.get('check_cutoff', False):
+            return False
+        
+        boundary_ms = self.params.get('cutoff_boundary_ms', 50)
+        silence_threshold = self.params.get('cutoff_silence_threshold', 0.35)
+        
+        if is_start:
+            boundary = audio_chunk[:boundary_ms]
+        else:
+            boundary = audio_chunk[-boundary_ms:]
+        
+        if len(boundary) < 10:
+            return False
+        
+        samples = np.array(boundary.get_array_of_samples(), dtype=np.float32)
+        rms = np.sqrt(np.mean(samples ** 2))
+        normalized_rms = rms / 32768.0
+        
+        is_cutoff = normalized_rms > silence_threshold
+        
+        if is_cutoff:
+            self.logger.debug(f"Cutoff detected at {'start' if is_start else 'end'}: RMS={normalized_rms:.3f}")
+        
+        return is_cutoff
+    
+    def _get_validated_boundaries_with_cutoff_check(self, audio: AudioSegment, 
+                                                      start_ms: int, end_ms: int,
+                                                      prev_word_end_ms: Optional[int], 
+                                                      next_word_start_ms: Optional[int],
+                                                      seg_text: str) -> Tuple[int, int, bool]:
+        """Enhanced boundary validation with cutoff detection"""
+        validated_start, validated_end = self._get_validated_boundaries(
+            audio, start_ms, end_ms, prev_word_end_ms, next_word_start_ms
+        )
+        
+        if not self.params.get('check_cutoff', False):
+            return validated_start, validated_end, False
+        
+        audio_chunk = audio[validated_start:validated_end]
+        
+        if self._check_for_cutoff(audio_chunk, is_start=True):
+            self.logger.debug(f"Start cutoff detected: '{seg_text[:30]}...'")
+            
+            extended_start = max(0, validated_start - 500)
+            if prev_word_end_ms is not None:
+                extended_start = max(prev_word_end_ms - 300, extended_start, 0)
+            
+            extended_chunk = audio[extended_start:validated_end]
+            if not self._check_for_cutoff(extended_chunk, is_start=True):
+                self.logger.debug("Extension successful")
+                validated_start = extended_start
+            else:
+                cutoff_action = self.params.get('cutoff_action', 'skip')
+                if cutoff_action == 'skip':
+                    self.logger.warning(f"Skipping segment with cutoff: '{seg_text[:50]}...'")
+                    return validated_start, validated_end, True
+        
+        return validated_start, validated_end, False
     
     def _get_unique_filename(self, base_path: Path, stem: str, suffix: str) -> Path:
         """Generate unique filename to avoid overwrites"""
@@ -896,7 +962,10 @@ class SpeechSplitter:
             'mixed_threshold': kwargs.get('mixed_threshold', 0.2),
             'word_start_buffer_ms': kwargs.get('word_start_buffer_ms', 250),
             'word_end_buffer_ms': kwargs.get('word_end_buffer_ms', 250),
-            # REMOVED: word_end_extension_ms (Issue #4)
+            'check_cutoff': kwargs.get('check_cutoff', False),
+            'cutoff_boundary_ms': kwargs.get('cutoff_boundary_ms', 50),
+            'cutoff_silence_threshold': kwargs.get('cutoff_silence_threshold', 0.35),
+            'cutoff_action': kwargs.get('cutoff_action', 'skip'),
             'hybrid_pause_detection': kwargs.get('hybrid_pause_detection', True),
             'pause_speech_threshold': kwargs.get('pause_speech_threshold', 0.2),
             'overlength_action': kwargs.get('overlength_action', 'rename'),
