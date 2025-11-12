@@ -11,7 +11,6 @@ import warnings
 import sys
 warnings.filterwarnings('ignore')
 
-import whisper
 from pydub import AudioSegment
 import numpy as np
 from tqdm import tqdm
@@ -441,26 +440,33 @@ class AudioProcessor:
 # =============================================================================
 
 class TranscriptionManager:
-    """Handle Whisper transcription and caching"""
+    """Handle WhisperX transcription with forced alignment"""
     
     def __init__(self, model_name: str, language: str, device: str, logger: logging.Logger):
         self.model_name = model_name
         self.language = language
         self.device = device
         self.logger = logger
+        self.use_whisperx = True
         
-        self.logger.info(f"Loading Whisper model: {model_name} on {device.upper()}")
-        self.model = whisper.load_model(model_name, device=device)
-        self.logger.info("Whisper model loaded")
+        try:
+            import whisperx
+            self.whisperx = whisperx
+            self.logger.info(f"Loading WhisperX model: {model_name} on {device.upper()}")
+            self.model = whisperx.load_model(model_name, device=device, compute_type="float16" if device == "cuda" else "int8")
+            self.logger.info("WhisperX model loaded")
+        except ImportError:
+            self.logger.warning("WhisperX not installed, falling back to standard Whisper")
+            self.use_whisperx = False
+            self.logger.info(f"Loading Whisper model: {model_name} on {device.upper()}")
+            self.model = whisper.load_model(model_name, device=device)
+            self.logger.info("Whisper model loaded")
     
     def transcribe(self, audio_path: str, original_audio_path: str = None) -> Dict:
-        """
-        Transcribe audio with intelligent caching (Issue #9)
-        """
+        """Transcribe audio with WhisperX forced alignment"""
         cache_base_path = Path(original_audio_path) if original_audio_path else Path(audio_path)
         cache_file = cache_base_path.parent / f"{cache_base_path.stem}.transcription.json"
         
-        # Check cache
         if cache_file.exists():
             try:
                 self.logger.info(f"Loading cached transcription: {cache_file.name}")
@@ -475,8 +481,56 @@ class TranscriptionManager:
             except Exception as e:
                 self.logger.warning(f"Cache load failed: {e}")
         
-        # Transcribe
-        self.logger.info("Transcribing audio with Whisper")
+        if self.use_whisperx:
+            return self._transcribe_whisperx(audio_path, cache_file)
+        else:
+            return self._transcribe_whisper(audio_path, cache_file)
+    
+    def _transcribe_whisperx(self, audio_path: str, cache_file: Path) -> Dict:
+        """WhisperX with forced alignment for better timestamps"""
+        self.logger.info("Transcribing with WhisperX (forced alignment)")
+        
+        audio = self.whisperx.load_audio(audio_path)
+        result = self.model.transcribe(audio, batch_size=16, language=self.language)
+        
+        self.logger.info("Loading alignment model...")
+        model_a, metadata = self.whisperx.load_align_model(language_code=self.language, device=self.device)
+        result = self.whisperx.align(result["segments"], model_a, metadata, audio, self.device, return_char_alignments=False)
+        
+        all_words = []
+        for segment in result.get('segments', []):
+            if 'words' in segment:
+                for word in segment['words']:
+                    all_words.append({
+                        'word': word.get('word', ''),
+                        'start': word.get('start', 0),
+                        'end': word.get('end', 0),
+                        'probability': word.get('score', 1.0)
+                    })
+        
+        self.logger.info(f"WhisperX complete: {len(all_words)} words (aligned)")
+        
+        transcription_data = {
+            'text': ' '.join([w['word'] for w in all_words]),
+            'words': all_words,
+            'segments': result.get('segments', []),
+            'language': self.language,
+            'model': f"{self.model_name}-whisperx",
+            'aligned': True
+        }
+        
+        try:
+            self.logger.debug(f"Saving transcription cache: {cache_file.name}")
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                json.dump(transcription_data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.logger.warning(f"Cache save failed: {e}")
+        
+        return transcription_data
+    
+    def _transcribe_whisper(self, audio_path: str, cache_file: Path) -> Dict:
+        """Fallback to standard Whisper"""
+        self.logger.info("Transcribing with standard Whisper")
         result = self.model.transcribe(
             audio_path,
             language=self.language,
@@ -484,24 +538,22 @@ class TranscriptionManager:
             verbose=False
         )
         
-        # Extract words
         all_words = []
         for segment in result.get('segments', []):
             if 'words' in segment:
                 all_words.extend(segment['words'])
         
-        self.logger.info(f"Transcription complete: {len(all_words)} words")
+        self.logger.info(f"Whisper complete: {len(all_words)} words")
         
-        # Prepare cache data
         transcription_data = {
             'text': result['text'],
             'words': all_words,
             'segments': result.get('segments', []),
             'language': self.language,
-            'model': self.model_name
+            'model': self.model_name,
+            'aligned': False
         }
         
-        # Save cache
         try:
             self.logger.debug(f"Saving transcription cache: {cache_file.name}")
             with open(cache_file, 'w', encoding='utf-8') as f:

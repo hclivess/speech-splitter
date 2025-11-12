@@ -1,10 +1,20 @@
-# speech_splitter_gui_v3.py
 import sys
 import os
 from pathlib import Path
 from typing import List
 import json
 import mimetypes
+
+# Fix for torch._pytree compatibility issue - MUST BE BEFORE PySide6 imports
+import warnings
+warnings.filterwarnings('ignore')
+
+try:
+    import torch.utils._pytree as pytree
+    if not hasattr(pytree, 'register_pytree_node'):
+        pytree.register_pytree_node = lambda *args, **kwargs: None
+except (ImportError, AttributeError):
+    pass
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -108,7 +118,7 @@ class SpeechSplitterGUI(QMainWindow):
         self.load_settings()
     
     def init_ui(self):
-        self.setWindowTitle("Speech Splitter v3 - TTS Data Generator")
+        self.setWindowTitle("Speech Splitter v4 - TTS Data Generator")
         self.setMinimumSize(1200, 800)
         
         # Menu bar
@@ -188,11 +198,11 @@ class SpeechSplitterGUI(QMainWindow):
         layout = QHBoxLayout(header)
         layout.setContentsMargins(0, 0, 0, 0)
         
-        title = QLabel("Speech Splitter v3")
+        title = QLabel("Speech Splitter v4")
         title.setFont(QFont("Segoe UI", 24, QFont.Bold))
         title.setStyleSheet("color: #2c3e50;")
         
-        subtitle = QLabel("AI-Powered TTS Dataset Generator")
+        subtitle = QLabel("AI-Powered TTS Dataset Generator (Optimized)")
         subtitle.setFont(QFont("Segoe UI", 12))
         subtitle.setStyleSheet("color: #7f8c8d;")
         
@@ -218,8 +228,8 @@ class SpeechSplitterGUI(QMainWindow):
                 else:
                     gpu_label.setText("💻 CPU Mode")
                     gpu_label.setStyleSheet("padding: 5px 10px; border-radius: 5px; background: #fff3cd; color: #856404;")
-            except:
-                gpu_label.setText("⚠ GPU Check Failed")
+            except Exception as e:
+                gpu_label.setText(f"⚠ GPU Check Failed: {str(e)[:30]}")
                 gpu_label.setStyleSheet("padding: 5px 10px; border-radius: 5px; background: #f8d7da; color: #721c24;")
         
         import threading
@@ -842,10 +852,10 @@ class SpeechSplitterGUI(QMainWindow):
             'language': self.language_combo.currentText(),
             'speaker_id': self.speaker_input.text() or None,
             'output_dir': self.output_input.text(),
-            'min_length': self.min_length_spin.value(),
-            'max_length': self.max_length_spin.value(),
+            'min_segment_length': self.min_length_spin.value(),
+            'max_segment_length': self.max_length_spin.value(),
             'pause_threshold': self.pause_threshold_spin.value(),
-            'format': self.format_combo.currentText(),
+            'export_format': self.format_combo.currentText(),
             'min_confidence': self.min_confidence_spin.value(),
             'filter_noise': self.filter_noise_check.isChecked(),
             'noise_silence_threshold': self.noise_silence_threshold_spin.value(),
@@ -861,7 +871,6 @@ class SpeechSplitterGUI(QMainWindow):
             'hybrid_pause_detection': self.hybrid_pause_check.isChecked(),
             'pause_speech_threshold': self.pause_speech_threshold_spin.value(),
             'overlength_action': self.overlength_action_combo.currentText(),
-            'trim_silence': self.trim_silence_check.isChecked(),
             'trim_threshold_db': self.trim_threshold_spin.value(),
             'trim_chunk_ms': self.trim_chunk_spin.value(),
             'trim_pad_ms': self.trim_pad_spin.value(),
@@ -873,7 +882,7 @@ class SpeechSplitterGUI(QMainWindow):
         settings = self.get_settings()
         warnings = []
         
-        if settings['min_length'] >= settings['max_length']:
+        if settings['min_segment_length'] >= settings['max_segment_length']:
             warnings.append("Min length should be less than max length")
         
         if settings['word_start_buffer_ms'] + settings['word_end_buffer_ms'] > 2000:
@@ -963,10 +972,10 @@ class SpeechSplitterGUI(QMainWindow):
         self.language_combo.setCurrentText(settings.get('language', 'cs'))
         self.output_input.setText(settings.get('output_dir', 'output'))
         self.speaker_input.setText(settings.get('speaker_id', ''))
-        self.min_length_spin.setValue(settings.get('min_length', 1.0))
-        self.max_length_spin.setValue(settings.get('max_length', 15.0))
+        self.min_length_spin.setValue(settings.get('min_segment_length', 1.0))
+        self.max_length_spin.setValue(settings.get('max_segment_length', 15.0))
         self.pause_threshold_spin.setValue(settings.get('pause_threshold', 0.5))
-        self.format_combo.setCurrentText(settings.get('format', 'wav'))
+        self.format_combo.setCurrentText(settings.get('export_format', 'wav'))
         self.min_confidence_spin.setValue(settings.get('min_confidence', 0.5))
         self.filter_noise_check.setChecked(settings.get('filter_noise', True))
         self.noise_silence_threshold_spin.setValue(settings.get('noise_silence_threshold', 0.3))
