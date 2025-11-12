@@ -685,9 +685,9 @@ class SegmentationEngine:
                 # Clear words for next segment
                 current_words = []
 
-        self.logger.info("=" * 60)
+
         self.logger.info("SEGMENTATION RESULTS")
-        self.logger.info("=" * 60)
+
         self.logger.info(f"Total segments created: {len(segments)}")
         if self.params['hybrid_pause_detection'] and self.hybrid_available:
             self.logger.info(f"Potential pauses detected: {stats['potential']}")
@@ -695,7 +695,7 @@ class SegmentationEngine:
                 f"✓ Validated as true pauses: {stats['validated']} ({stats['validated'] / stats['potential'] * 100:.1f}%)")
             self.logger.info(
                 f"✗ Rejected as speech: {stats['rejected']} ({stats['rejected'] / stats['potential'] * 100:.1f}%)")
-        self.logger.info("=" * 60)
+
 
         return segments
     
@@ -732,9 +732,9 @@ class SegmentFilter:
 
     def filter_segments(self, segments: List[SegmentData], audio: AudioSegment) -> List[SegmentData]:
         """Filter segments with single classification per segment"""
-        self.logger.info("=" * 60)
+
         self.logger.info("FILTERING SEGMENTS")
-        self.logger.info("=" * 60)
+
 
         filtered = []
         stats = {
@@ -839,7 +839,7 @@ class SegmentFilter:
             for ex in examples['text']:
                 self.logger.warning(f"   '{ex['text']}'")
 
-        self.logger.info("=" * 60)
+
         return filtered
 
 
@@ -863,9 +863,9 @@ class ExportManager:
     def export_segments(self, audio: AudioSegment, segments: List[SegmentData], 
                        base_name: str, sample_rate: int) -> List[Tuple[str, str, Dict]]:
         """Export segments to files with proper boundary handling"""
-        self.logger.info("=" * 60)
+
         self.logger.info("EXPORTING SEGMENTS")
-        self.logger.info("=" * 60)
+
         
         output_files = []
         skipped_cutoff = 0
