@@ -510,7 +510,7 @@ class TranscriptionManager:
         
         # Load audio and transcribe
         audio = self.whisperx.load_audio(audio_path)
-        result = self.model.transcribe(audio, batch_size=16, language=self.language)
+        result = self.model.transcribe(audio, batch_size=4, language=self.language)
         
         # Try to perform forced alignment (pyannote.audio may fail)
         try:
