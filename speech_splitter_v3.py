@@ -184,6 +184,7 @@ class YAMNetFilter:
         try:
             import tensorflow as tf
             import tensorflow_hub as hub
+            import time
             
             # GPU config
             gpus = tf.config.list_physical_devices('GPU')
@@ -510,7 +511,7 @@ class TranscriptionManager:
         
         # Load audio and transcribe
         audio = self.whisperx.load_audio(audio_path)
-        result = self.model.transcribe(audio, batch_size=4, language=self.language)
+        result = self.model.transcribe(audio, batch_size=8, language=self.language)
         
         # Try to perform forced alignment (pyannote.audio may fail)
         try:
@@ -683,13 +684,19 @@ class SegmentationEngine:
                 
                 # Clear words for next segment
                 current_words = []
-        
-        self.logger.info(f"Segmentation complete: {len(segments)} segments", extra={
-            'potential_pauses': stats['potential'],
-            'validated_pauses': stats['validated'],
-            'rejected_pauses': stats['rejected']
-        })
-        
+
+        self.logger.info("=" * 60)
+        self.logger.info("SEGMENTATION RESULTS")
+        self.logger.info("=" * 60)
+        self.logger.info(f"Total segments created: {len(segments)}")
+        if self.params['hybrid_pause_detection'] and self.hybrid_available:
+            self.logger.info(f"Potential pauses detected: {stats['potential']}")
+            self.logger.info(
+                f"✓ Validated as true pauses: {stats['validated']} ({stats['validated'] / stats['potential'] * 100:.1f}%)")
+            self.logger.info(
+                f"✗ Rejected as speech: {stats['rejected']} ({stats['rejected'] / stats['potential'] * 100:.1f}%)")
+        self.logger.info("=" * 60)
+
         return segments
     
     def _validate_segment_text(self, text: str) -> bool:
@@ -722,49 +729,117 @@ class SegmentFilter:
         self.yamnet_filter = yamnet_filter
         self.logger = logger
         self.filtering_available = yamnet_filter is not None and yamnet_filter.available
-    
+
     def filter_segments(self, segments: List[SegmentData], audio: AudioSegment) -> List[SegmentData]:
         """Filter segments with single classification per segment"""
-        self.logger.info("Filtering segments...")
+        self.logger.info("=" * 60)
+        self.logger.info("FILTERING SEGMENTS")
+        self.logger.info("=" * 60)
+
         filtered = []
-        stats = {'music': 0, 'noise': 0, 'confidence': 0, 'text': 0}
-        
+        stats = {
+            'music': 0,
+            'noise': 0,
+            'confidence': 0,
+            'text': 0,
+            'total': len(segments)
+        }
+
+        # Track examples for each rejection reason
+        examples = {
+            'music': [],
+            'noise': [],
+            'confidence': [],
+            'text': []
+        }
+
         for seg in segments:
             chunk = audio[seg.start_ms:seg.end_ms]
-            
+            rejection_reason = None
+
             # Classify once and cache in segment
-            if self.yamnet_filter and self.filtering_available and (self.params['filter_music'] or self.params['filter_noise']):
+            if self.yamnet_filter and self.filtering_available and (
+                    self.params['filter_music'] or self.params['filter_noise']):
                 classification = self.yamnet_filter.classify_audio(chunk)
                 seg.classification = classification.to_dict()
-                
+
                 # Music filter
                 if self.params['filter_music']:
                     if classification.is_music(self.params['music_threshold'], self.params['mixed_threshold']):
                         stats['music'] += 1
+                        rejection_reason = 'music'
+                        if len(examples['music']) < 3:
+                            examples['music'].append({
+                                'text': seg.text[:50],
+                                'music': classification.music,
+                                'mixed': classification.music_speech_mixed
+                            })
                         continue
-                
+
                 # Noise/silence filter
                 if self.params['filter_noise']:
                     if classification.is_silent(self.params['noise_silence_threshold']):
                         stats['noise'] += 1
+                        rejection_reason = 'noise'
+                        if len(examples['noise']) < 3:
+                            examples['noise'].append({
+                                'text': seg.text[:50],
+                                'silence': classification.silence
+                            })
                         continue
             else:
                 # No filtering available, set default classification
                 seg.classification = AudioClassification(0.0, 1.0, 0.0, 0.0).to_dict()
-            
+
             # Confidence filter
             if seg.confidence < self.params['min_confidence']:
                 stats['confidence'] += 1
+                rejection_reason = 'confidence'
+                if len(examples['confidence']) < 3:
+                    examples['confidence'].append({
+                        'text': seg.text[:50],
+                        'confidence': seg.confidence
+                    })
                 continue
-            
+
             # Text validation
             if len(seg.text.strip()) < 3:
                 stats['text'] += 1
+                rejection_reason = 'text'
+                if len(examples['text']) < 3:
+                    examples['text'].append({
+                        'text': seg.text
+                    })
                 continue
-            
+
             filtered.append(seg)
-        
-        self.logger.info(f"Filtering complete: {len(filtered)}/{len(segments)} segments kept", extra=stats)
+
+        # Detailed logging
+        self.logger.info(f"Input segments: {stats['total']}")
+        self.logger.info(f"Accepted: {len(filtered)} ({len(filtered) / stats['total'] * 100:.1f}%)")
+        self.logger.info("")
+
+        if stats['music'] > 0:
+            self.logger.warning(f"❌ MUSIC: {stats['music']} segments rejected")
+            for ex in examples['music']:
+                self.logger.warning(f"   '{ex['text']}...' (music={ex['music']:.2f}, mixed={ex['mixed']:.2f})")
+
+        if stats['noise'] > 0:
+            self.logger.warning(f"❌ NOISE/SILENCE: {stats['noise']} segments rejected")
+            for ex in examples['noise']:
+                self.logger.warning(f"   '{ex['text']}...' (silence={ex['silence']:.2f})")
+
+        if stats['confidence'] > 0:
+            self.logger.warning(f"❌ LOW CONFIDENCE: {stats['confidence']} segments rejected")
+            for ex in examples['confidence']:
+                self.logger.warning(f"   '{ex['text']}...' (conf={ex['confidence']:.2f})")
+
+        if stats['text'] > 0:
+            self.logger.warning(f"❌ INVALID TEXT: {stats['text']} segments rejected")
+            for ex in examples['text']:
+                self.logger.warning(f"   '{ex['text']}'")
+
+        self.logger.info("=" * 60)
         return filtered
 
 
@@ -788,7 +863,9 @@ class ExportManager:
     def export_segments(self, audio: AudioSegment, segments: List[SegmentData], 
                        base_name: str, sample_rate: int) -> List[Tuple[str, str, Dict]]:
         """Export segments to files with proper boundary handling"""
-        self.logger.info(f"Exporting {len(segments)} segments...")
+        self.logger.info("=" * 60)
+        self.logger.info("EXPORTING SEGMENTS")
+        self.logger.info("=" * 60)
         
         output_files = []
         skipped_cutoff = 0
@@ -841,8 +918,8 @@ class ExportManager:
         
         if skipped_cutoff > 0:
             self.logger.info(f"Skipped {skipped_cutoff} segments due to cutoff detection")
-        
-        self.logger.info(f"Export complete: {len(output_files)} segments")
+        self.logger.info(f"Successfully exported: {len(output_files)} segments")
+
         return output_files
     
     def _get_validated_boundaries(self, audio: AudioSegment, start_ms: int, end_ms: int,
@@ -874,29 +951,42 @@ class ExportManager:
         return validated_start, validated_end
     
     def _check_for_cutoff(self, audio_chunk: AudioSegment, is_start: bool = True) -> bool:
-        """Check if audio is cut off at the beginning or end"""
+        """Improved cutoff detection using RMS gradient"""
         if not self.params.get('check_cutoff', False):
             return False
         
-        boundary_ms = self.params.get('cutoff_boundary_ms', 50)
+        boundary_ms = self.params.get('cutoff_boundary_ms', 75)
         silence_threshold = self.params.get('cutoff_silence_threshold', 0.35)
+        
+        # Need at least 2x boundary for gradient analysis
+        if len(audio_chunk) < boundary_ms * 2:
+            return False
         
         if is_start:
             boundary = audio_chunk[:boundary_ms]
+            comparison = audio_chunk[boundary_ms:boundary_ms*2]
         else:
             boundary = audio_chunk[-boundary_ms:]
+            comparison = audio_chunk[-boundary_ms*2:-boundary_ms]
         
-        if len(boundary) < 10:
-            return False
+        def get_rms(segment):
+            samples = np.array(segment.get_array_of_samples(), dtype=np.float32)
+            return np.sqrt(np.mean(samples ** 2)) / 32768.0
         
-        samples = np.array(boundary.get_array_of_samples(), dtype=np.float32)
-        rms = np.sqrt(np.mean(samples ** 2))
-        normalized_rms = rms / 32768.0
+        boundary_rms = get_rms(boundary)
+        comparison_rms = get_rms(comparison)
         
-        is_cutoff = normalized_rms > silence_threshold
+        # Cutoff detected if:
+        # 1. Boundary has significant energy (not silence)
+        # 2. Energy drops significantly into the segment (sharp gradient)
+        has_energy = boundary_rms > silence_threshold
+        sharp_drop = boundary_rms > comparison_rms * 1.5  # 50% drop
+        
+        is_cutoff = has_energy and sharp_drop
         
         if is_cutoff:
-            self.logger.debug(f"Cutoff detected at {'start' if is_start else 'end'}: RMS={normalized_rms:.3f}")
+            self.logger.debug(f"Cutoff at {'start' if is_start else 'end'}: "
+                             f"boundary={boundary_rms:.3f}, interior={comparison_rms:.3f}")
         
         return is_cutoff
     
@@ -905,7 +995,7 @@ class ExportManager:
                                                       prev_word_end_ms: Optional[int], 
                                                       next_word_start_ms: Optional[int],
                                                       seg_text: str) -> Tuple[int, int, bool]:
-        """Enhanced boundary validation with cutoff detection"""
+        """Enhanced boundary validation with cutoff detection and extension"""
         validated_start, validated_end = self._get_validated_boundaries(
             audio, start_ms, end_ms, prev_word_end_ms, next_word_start_ms
         )
@@ -914,23 +1004,52 @@ class ExportManager:
             return validated_start, validated_end, False
         
         audio_chunk = audio[validated_start:validated_end]
+        cutoff_action = self.params.get('cutoff_action', 'skip')
         
+        # Check START cutoff
         if self._check_for_cutoff(audio_chunk, is_start=True):
             self.logger.debug(f"Start cutoff detected: '{seg_text[:30]}...'")
             
-            extended_start = max(0, validated_start - 500)
-            if prev_word_end_ms is not None:
-                extended_start = max(prev_word_end_ms - 300, extended_start, 0)
-            
-            extended_chunk = audio[extended_start:validated_end]
-            if not self._check_for_cutoff(extended_chunk, is_start=True):
-                self.logger.debug("Extension successful")
-                validated_start = extended_start
-            else:
-                cutoff_action = self.params.get('cutoff_action', 'skip')
-                if cutoff_action == 'skip':
-                    self.logger.warning(f"Skipping segment with cutoff: '{seg_text[:50]}...'")
+            if cutoff_action == 'extend':
+                # Try to extend backwards
+                extension_ms = 500
+                extended_start = max(0, validated_start - extension_ms)
+                if prev_word_end_ms is not None:
+                    extended_start = max(prev_word_end_ms - 300, extended_start, 0)
+                
+                extended_chunk = audio[extended_start:validated_end]
+                if not self._check_for_cutoff(extended_chunk, is_start=True):
+                    self.logger.debug(f"Start extension successful: {validated_start}ms -> {extended_start}ms")
+                    validated_start = extended_start
+                else:
+                    self.logger.warning(f"Start extension failed, skipping: '{seg_text[:50]}...'")
                     return validated_start, validated_end, True
+            elif cutoff_action == 'skip':
+                self.logger.warning(f"Skipping segment with start cutoff: '{seg_text[:50]}...'")
+                return validated_start, validated_end, True
+        
+        # Check END cutoff (THIS WAS MISSING!)
+        if self._check_for_cutoff(audio_chunk, is_start=False):
+            self.logger.debug(f"End cutoff detected: '...{seg_text[-30:]}'")
+            
+            if cutoff_action == 'extend':
+                # Try to extend forwards
+                extension_ms = 500
+                audio_length_ms = len(audio)
+                extended_end = min(audio_length_ms, validated_end + extension_ms)
+                if next_word_start_ms is not None:
+                    extended_end = min(next_word_start_ms + 300, extended_end, audio_length_ms)
+                
+                extended_chunk = audio[validated_start:extended_end]
+                if not self._check_for_cutoff(extended_chunk, is_start=False):
+                    self.logger.debug(f"End extension successful: {validated_end}ms -> {extended_end}ms")
+                    validated_end = extended_end
+                else:
+                    self.logger.warning(f"End extension failed, skipping: '...{seg_text[-50:]}'")
+                    return validated_start, validated_end, True
+            elif cutoff_action == 'skip':
+                self.logger.warning(f"Skipping segment with end cutoff: '...{seg_text[-50:]}'")
+                return validated_start, validated_end, True
         
         return validated_start, validated_end, False
     
@@ -1194,6 +1313,13 @@ def main():
     parser.add_argument('--trim-chunk-ms', type=int, default=10, help="Trim analysis chunk size (ms)")
     parser.add_argument('--trim-pad-ms', type=int, default=50, help="Trim padding (ms)")
     
+    # Cutoff detection
+    parser.add_argument('--check-cutoff', action='store_true', help="Enable cutoff detection")
+    parser.add_argument('--cutoff-boundary-ms', type=int, default=75, help="Cutoff detection boundary (ms)")
+    parser.add_argument('--cutoff-silence-threshold', type=float, default=0.35, help="Cutoff RMS threshold")
+    parser.add_argument('--cutoff-action', default='extend', choices=['skip', 'extend', 'include'],
+                       help="Action for cutoff segments")
+    
     # Actions
     parser.add_argument('--overlength-action', default='rename', choices=['rename', 'skip', 'include'],
                        help="Action for overlength segments")
@@ -1233,6 +1359,10 @@ def main():
             mixed_threshold=args.mixed_threshold,
             word_start_buffer_ms=args.word_start_buffer,
             word_end_buffer_ms=args.word_end_buffer,
+            check_cutoff=args.check_cutoff,
+            cutoff_boundary_ms=args.cutoff_boundary_ms,
+            cutoff_silence_threshold=args.cutoff_silence_threshold,
+            cutoff_action=args.cutoff_action,
             hybrid_pause_detection=args.hybrid_pause_detection,
             pause_speech_threshold=args.pause_speech_threshold,
             overlength_action=args.overlength_action,
