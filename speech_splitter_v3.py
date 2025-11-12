@@ -3,6 +3,7 @@ import json
 import argparse
 import logging
 import hashlib
+import csv
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime
@@ -15,9 +16,10 @@ from pydub import AudioSegment
 import numpy as np
 from tqdm import tqdm
 import torch
+import whisperx
 
 # =============================================================================
-# CONSTANTS (Issue #17: No more magic numbers)
+# CONSTANTS
 # =============================================================================
 
 MIN_PAUSE_DURATION_MS = 50
@@ -27,7 +29,7 @@ MAX_CACHE_SIZE = 1000
 CACHE_CLEANUP_RATIO = 0.25
 
 # =============================================================================
-# DATA CLASSES (Issue #12: Type safety with dataclasses)
+# DATA CLASSES
 # =============================================================================
 
 @dataclass
@@ -126,27 +128,36 @@ def setup_logging(output_dir: Path, log_level: str = "INFO") -> logging.Logger:
 
 
 def check_gpu(logger: logging.Logger) -> bool:
-    """Check GPU availability"""
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        logger.info(f"GPU detected: {gpu_name} ({gpu_memory:.1f} GB)")
-        return True
-    else:
-        logger.warning("No GPU available, using CPU (slower processing)")
+    """Check GPU availability with improved error handling"""
+    try:
+        if torch.cuda.is_available():
+            try:
+                gpu_name = torch.cuda.get_device_name(0)
+                gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                logger.info(f"GPU detected: {gpu_name} ({gpu_memory:.1f} GB)")
+                return True
+            except Exception as e:
+                logger.warning(f"GPU detected but properties unavailable: {e}")
+                return True
+        else:
+            logger.warning("No GPU available, using CPU (slower processing)")
+            return False
+    except Exception as e:
+        logger.error(f"GPU check failed: {e}")
         return False
 
 
 # =============================================================================
-# YAMNET FILTER (Issues #1, #2, #3: Optimized with caching)
+# YAMNET FILTER (Optional)
 # =============================================================================
 
 class YAMNetFilter:
     """
     Optimized YAMNet audio classifier with:
-    - Classification caching (Issue #1)
-    - Pre-computed class indices (Issue #2)
-    - Single classification per segment (Issue #1)
+    - Classification caching
+    - Pre-computed class indices
+    - Single classification per segment
+    - Optional fallback mode
     """
     
     def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu', logger=None):
@@ -155,21 +166,21 @@ class YAMNetFilter:
         self.device = device
         self.logger = logger or logging.getLogger("SpeechSplitter.YAMNetFilter")
         
-        # OPTIMIZATION: Classification cache (Issue #1)
+        # Classification cache
         self._classification_cache = {}
         self._cache_hits = 0
         self._cache_misses = 0
         
-        # OPTIMIZATION: Pre-computed class indices (Issue #2)
+        # Pre-computed class indices
         self.music_indices = None
         self.speech_indices = None
         self.mixed_indices = None
         self.silence_indices = None
         
-        self._load_model()
+        self.available = self._load_model()
     
-    def _load_model(self):
-        """Load YAMNet and pre-compute class indices"""
+    def _load_model(self) -> bool:
+        """Load YAMNet and pre-compute class indices - returns success status"""
         try:
             import tensorflow as tf
             import tensorflow_hub as hub
@@ -189,22 +200,17 @@ class YAMNetFilter:
             
             self.logger.info("Loading YAMNet model...")
             
-            # Clear corrupted cache and reload
+            # Clear corrupted cache if exists
             import shutil
             import tempfile
             
-            # Get TFHub cache directory
             tfhub_cache = os.path.join(tempfile.gettempdir(), 'tfhub_modules')
-            corrupt_model_hash = '9616fd04ec2360621642ef9455b84f4b668e219e'
-            corrupt_path = os.path.join(tfhub_cache, corrupt_model_hash)
-            
-            # Remove corrupted cache if it exists
-            if os.path.exists(corrupt_path):
-                self.logger.info(f"Removing corrupted cache: {corrupt_path}")
+            if os.path.exists(tfhub_cache):
                 try:
-                    shutil.rmtree(corrupt_path)
+                    shutil.rmtree(tfhub_cache)
+                    os.makedirs(tfhub_cache, exist_ok=True)
                 except Exception as e:
-                    self.logger.warning(f"Failed to remove cache: {e}")
+                    self.logger.warning(f"Failed to clear cache: {e}")
             
             # Load model with retry
             max_retries = 2
@@ -212,35 +218,30 @@ class YAMNetFilter:
                 try:
                     self.model = hub.load('https://tfhub.dev/google/yamnet/1')
                     break
-                except ValueError as e:
+                except Exception as e:
                     if attempt < max_retries - 1:
-                        self.logger.warning(f"Attempt {attempt + 1} failed, retrying after clearing cache...")
-                        # Clear entire tfhub cache on retry
-                        if os.path.exists(tfhub_cache):
-                            try:
-                                shutil.rmtree(tfhub_cache)
-                                os.makedirs(tfhub_cache, exist_ok=True)
-                            except Exception as clear_error:
-                                self.logger.warning(f"Failed to clear cache: {clear_error}")
+                        self.logger.warning(f"Attempt {attempt + 1} failed, retrying...")
+                        time.sleep(2)
                     else:
                         raise
             
             class_map_path = self.model.class_map_path().numpy()
             self.class_names = self._load_class_names(class_map_path)
             
-            # OPTIMIZATION: Pre-compute class indices once (Issue #2)
+            # Pre-compute class indices once
             self._precompute_class_indices()
             
-            self.logger.info("YAMNet model loaded successfully")
+            self.logger.info("✓ YAMNet model loaded successfully")
+            return True
             
         except Exception as e:
-            self.logger.error(f"Failed to load YAMNet: {e}", exc_info=True)
-            self.logger.warning("Audio filtering disabled")
+            self.logger.warning(f"YAMNet loading failed: {e}")
+            self.logger.warning("Audio filtering disabled - using timestamp-only mode")
             self.model = None
+            return False
     
     def _load_class_names(self, class_map_csv):
         """Load YAMNet class names"""
-        import csv
         class_names = []
         with open(class_map_csv) as f:
             reader = csv.DictReader(f)
@@ -249,7 +250,7 @@ class YAMNetFilter:
         return class_names
     
     def _precompute_class_indices(self):
-        """OPTIMIZATION: Calculate class indices once instead of per-classification (Issue #2)"""
+        """Calculate class indices once instead of per-classification"""
         self.music_indices = [
             i for i, name in enumerate(self.class_names) 
             if 'music' in name.lower() and 'speech' not in name.lower()
@@ -273,22 +274,19 @@ class YAMNetFilter:
                          f"silence={len(self.silence_indices)}")
     
     def _get_cache_key(self, audio_segment: AudioSegment) -> str:
-        """Generate cache key from audio segment properties"""
-        # Use audio properties + small sample for cache key
-        key_data = f"{len(audio_segment)}_{audio_segment.frame_rate}_{audio_segment.channels}"
-        samples = audio_segment.get_array_of_samples()[:100]
-        key_data += f"_{hash(bytes(samples))}"
+        """Generate stable cache key from audio segment properties"""
+        # Use consistent properties for hashing
+        samples = np.array(audio_segment.get_array_of_samples()[:1000], dtype=np.int16)
+        key_data = f"{len(audio_segment)}_{audio_segment.frame_rate}_{audio_segment.channels}_{samples.tobytes()}"
         return hashlib.md5(key_data.encode()).hexdigest()[:16]
     
     def classify_audio(self, audio_segment: AudioSegment) -> AudioClassification:
-        """
-        Classify audio with caching (Issue #1)
-        Returns AudioClassification dataclass
-        """
-        if self.model is None:
+        """Classify audio with caching - returns safe defaults if model unavailable"""
+        if not self.available or self.model is None:
+            # Return safe defaults that won't filter out speech
             return AudioClassification(music=0.0, speech=1.0, music_speech_mixed=0.0, silence=0.0)
         
-        # OPTIMIZATION: Check cache first (Issue #1)
+        # Check cache first
         cache_key = self._get_cache_key(audio_segment)
         if cache_key in self._classification_cache:
             self._cache_hits += 1
@@ -299,7 +297,6 @@ class YAMNetFilter:
         try:
             import tensorflow as tf
             
-            # OPTIMIZATION: Audio already mono from preprocessing (Issue #3)
             samples = np.array(audio_segment.get_array_of_samples())
             
             # Normalize samples
@@ -311,7 +308,7 @@ class YAMNetFilter:
             scores, _, _ = self.model(samples)
             mean_scores = np.mean(scores.numpy(), axis=0)
             
-            # OPTIMIZATION: Use pre-computed indices (Issue #2)
+            # Use pre-computed indices
             music_prob = float(np.max([mean_scores[i] for i in self.music_indices]) if self.music_indices else 0.0)
             speech_prob = float(np.max([mean_scores[i] for i in self.speech_indices]) if self.speech_indices else 0.0)
             mixed_prob = float(np.max([mean_scores[i] for i in self.mixed_indices]) if self.mixed_indices else 0.0)
@@ -324,11 +321,12 @@ class YAMNetFilter:
                 silence=silence_prob
             )
             
-            # OPTIMIZATION: Cache result (Issue #1)
+            # Cache result
             self._classification_cache[cache_key] = result
             
             # Prevent cache from growing too large
             if len(self._classification_cache) > MAX_CACHE_SIZE:
+                # Remove oldest entries
                 remove_count = int(len(self._classification_cache) * CACHE_CLEANUP_RATIO)
                 for key in list(self._classification_cache.keys())[:remove_count]:
                     del self._classification_cache[key]
@@ -337,6 +335,7 @@ class YAMNetFilter:
             
         except Exception as e:
             self.logger.debug(f"YAMNet classification error: {e}")
+            # Return safe defaults on error
             return AudioClassification(music=0.0, speech=1.0, music_speech_mixed=0.0, silence=0.0)
     
     def get_cache_stats(self) -> Dict[str, float]:
@@ -358,7 +357,7 @@ class YAMNetFilter:
 
 
 # =============================================================================
-# AUDIO PROCESSOR (Issue #11: Separate concerns)
+# AUDIO PROCESSOR
 # =============================================================================
 
 class AudioProcessor:
@@ -366,15 +365,12 @@ class AudioProcessor:
     
     @staticmethod
     def load_and_prepare(audio_path: Path, logger: logging.Logger) -> Tuple[AudioSegment, int]:
-        """
-        Load audio file and convert to mono
-        OPTIMIZATION: Single conversion (Issue #3)
-        """
+        """Load audio file and convert to mono"""
         try:
             audio = AudioSegment.from_file(audio_path)
             original_sr = audio.frame_rate
             
-            # Convert to mono once (Issue #3)
+            # Convert to mono once
             if audio.channels > 1:
                 audio = audio.set_channels(1)
                 logger.debug("Converted to mono")
@@ -390,10 +386,7 @@ class AudioProcessor:
     def trim_silence_vectorized(audio_chunk: AudioSegment, trim_threshold_db: float, 
                                trim_chunk_ms: int, trim_pad_ms: int, 
                                trim_end: bool = True) -> AudioSegment:
-        """
-        OPTIMIZATION: Vectorized silence trimming (Issue #10)
-        Much faster than loop-based approach
-        """
+        """Vectorized silence trimming"""
         if len(audio_chunk) < MIN_TRIM_DURATION_MS:
             return audio_chunk
         
@@ -436,7 +429,7 @@ class AudioProcessor:
 
 
 # =============================================================================
-# TRANSCRIPTION MANAGER (Issue #11: Separate concerns)
+# TRANSCRIPTION MANAGER
 # =============================================================================
 
 class TranscriptionManager:
@@ -447,26 +440,53 @@ class TranscriptionManager:
         self.language = language
         self.device = device
         self.logger = logger
-        self.use_whisperx = True
         
+        # Verify WhisperX is available with detailed error handling
         try:
             import whisperx
             self.whisperx = whisperx
+            self.logger.info(f"✓ WhisperX imported successfully")
+        except ImportError as e:
+            self.logger.error("=" * 60)
+            self.logger.error("WhisperX NOT FOUND")
+            self.logger.error("=" * 60)
+            self.logger.error(f"Import error: {e}")
+            self.logger.error("")
+            self.logger.error("Installation steps:")
+            self.logger.error("1. Activate your virtual environment:")
+            self.logger.error("   call speech_env\\Scripts\\activate.bat")
+            self.logger.error("")
+            self.logger.error("2. Install WhisperX:")
+            self.logger.error("   pip install git+https://github.com/m-bain/whisperx.git")
+            self.logger.error("")
+            self.logger.error("3. If you have dependency conflicts, run:")
+            self.logger.error("   quick_fix.cmd")
+            self.logger.error("=" * 60)
+            raise RuntimeError("WhisperX is required but not installed") from e
+        except Exception as e:
+            self.logger.error(f"Unexpected error importing WhisperX: {e}")
+            self.logger.error(f"Error type: {type(e).__name__}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            raise RuntimeError(f"WhisperX import failed: {e}") from e
+        
+        # Load the model
+        try:
             self.logger.info(f"Loading WhisperX model: {model_name} on {device.upper()}")
-            self.model = whisperx.load_model(model_name, device=device, compute_type="float16" if device == "cuda" else "int8")
-            self.logger.info("WhisperX model loaded")
-        except ImportError:
-            self.logger.warning("WhisperX not installed, falling back to standard Whisper")
-            self.use_whisperx = False
-            self.logger.info(f"Loading Whisper model: {model_name} on {device.upper()}")
-            self.model = whisper.load_model(model_name, device=device)
-            self.logger.info("Whisper model loaded")
+            compute_type = "float16" if device == "cuda" else "int8"
+            self.model = whisperx.load_model(model_name, device=device, compute_type=compute_type)
+            self.logger.info("✓ WhisperX model loaded successfully")
+        except Exception as e:
+            self.logger.error(f"Failed to load WhisperX model '{model_name}': {e}")
+            self.logger.error("Try using a smaller model like 'base' or 'small'")
+            raise
     
     def transcribe(self, audio_path: str, original_audio_path: str = None) -> Dict:
         """Transcribe audio with WhisperX forced alignment"""
         cache_base_path = Path(original_audio_path) if original_audio_path else Path(audio_path)
         cache_file = cache_base_path.parent / f"{cache_base_path.stem}.transcription.json"
         
+        # Try to load from cache
         if cache_file.exists():
             try:
                 self.logger.info(f"Loading cached transcription: {cache_file.name}")
@@ -481,22 +501,39 @@ class TranscriptionManager:
             except Exception as e:
                 self.logger.warning(f"Cache load failed: {e}")
         
-        if self.use_whisperx:
-            return self._transcribe_whisperx(audio_path, cache_file)
-        else:
-            return self._transcribe_whisper(audio_path, cache_file)
+        # Perform transcription with WhisperX
+        return self._transcribe_whisperx(audio_path, cache_file)
     
     def _transcribe_whisperx(self, audio_path: str, cache_file: Path) -> Dict:
         """WhisperX with forced alignment for better timestamps"""
         self.logger.info("Transcribing with WhisperX (forced alignment)")
         
+        # Load audio and transcribe
         audio = self.whisperx.load_audio(audio_path)
         result = self.model.transcribe(audio, batch_size=16, language=self.language)
         
-        self.logger.info("Loading alignment model...")
-        model_a, metadata = self.whisperx.load_align_model(language_code=self.language, device=self.device)
-        result = self.whisperx.align(result["segments"], model_a, metadata, audio, self.device, return_char_alignments=False)
+        # Try to perform forced alignment (pyannote.audio may fail)
+        try:
+            self.logger.info("Loading alignment model...")
+            model_a, metadata = self.whisperx.load_align_model(
+                language_code=self.language, 
+                device=self.device
+            )
+            result = self.whisperx.align(
+                result["segments"], 
+                model_a, 
+                metadata, 
+                audio, 
+                self.device, 
+                return_char_alignments=False
+            )
+            self.logger.info("✓ Alignment completed")
+        except Exception as e:
+            self.logger.warning(f"Alignment failed (continuing without it): {e}")
+            self.logger.warning("Speech splitter will work but timestamps may be less accurate")
+            # Continue without alignment - use segment-level timestamps
         
+        # Extract all words with timestamps
         all_words = []
         for segment in result.get('segments', []):
             if 'words' in segment:
@@ -507,53 +544,36 @@ class TranscriptionManager:
                         'end': word.get('end', 0),
                         'probability': word.get('score', 1.0)
                     })
+            else:
+                # Fallback: use segment timestamps if word-level not available
+                segment_words = segment.get('text', '').split()
+                if segment_words:
+                    seg_start = segment.get('start', 0)
+                    seg_end = segment.get('end', 0)
+                    seg_duration = seg_end - seg_start
+                    word_duration = seg_duration / len(segment_words) if len(segment_words) > 0 else 0
+                    
+                    for i, word_text in enumerate(segment_words):
+                        all_words.append({
+                            'word': word_text,
+                            'start': seg_start + i * word_duration,
+                            'end': seg_start + (i + 1) * word_duration,
+                            'probability': 1.0
+                        })
         
-        self.logger.info(f"WhisperX complete: {len(all_words)} words (aligned)")
+        self.logger.info(f"WhisperX complete: {len(all_words)} words")
         
+        # Prepare transcription data
         transcription_data = {
             'text': ' '.join([w['word'] for w in all_words]),
             'words': all_words,
             'segments': result.get('segments', []),
             'language': self.language,
             'model': f"{self.model_name}-whisperx",
-            'aligned': True
+            'aligned': 'words' in result.get('segments', [{}])[0] if result.get('segments') else False
         }
         
-        try:
-            self.logger.debug(f"Saving transcription cache: {cache_file.name}")
-            with open(cache_file, 'w', encoding='utf-8') as f:
-                json.dump(transcription_data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            self.logger.warning(f"Cache save failed: {e}")
-        
-        return transcription_data
-    
-    def _transcribe_whisper(self, audio_path: str, cache_file: Path) -> Dict:
-        """Fallback to standard Whisper"""
-        self.logger.info("Transcribing with standard Whisper")
-        result = self.model.transcribe(
-            audio_path,
-            language=self.language,
-            word_timestamps=True,
-            verbose=False
-        )
-        
-        all_words = []
-        for segment in result.get('segments', []):
-            if 'words' in segment:
-                all_words.extend(segment['words'])
-        
-        self.logger.info(f"Whisper complete: {len(all_words)} words")
-        
-        transcription_data = {
-            'text': result['text'],
-            'words': all_words,
-            'segments': result.get('segments', []),
-            'language': self.language,
-            'model': self.model_name,
-            'aligned': False
-        }
-        
+        # Save to cache
         try:
             self.logger.debug(f"Saving transcription cache: {cache_file.name}")
             with open(cache_file, 'w', encoding='utf-8') as f:
@@ -565,27 +585,25 @@ class TranscriptionManager:
 
 
 # =============================================================================
-# SEGMENTATION ENGINE (Issue #11: Separate concerns)
+# SEGMENTATION ENGINE
 # =============================================================================
 
 class SegmentationEngine:
-    """Handle pause-based segmentation"""
+    """Handle segmentation by pauses with hybrid detection"""
     
     def __init__(self, params: Dict, yamnet_filter: Optional[YAMNetFilter], logger: logging.Logger):
         self.params = params
         self.yamnet_filter = yamnet_filter
         self.logger = logger
+        self.hybrid_available = yamnet_filter is not None and yamnet_filter.available
     
     def segment_by_pauses(self, words: List[Dict], audio: AudioSegment) -> List[SegmentData]:
-        """
-        Segment audio by pauses with hybrid detection
-        FIXED: Proper word buffer handling (Issue #6)
-        """
+        """Segment audio by pauses with hybrid detection"""
         if not words:
             self.logger.warning("No words found for segmentation")
             return []
         
-        mode = "hybrid" if self.params['hybrid_pause_detection'] and self.yamnet_filter else "timestamp"
+        mode = "hybrid" if self.params['hybrid_pause_detection'] and self.hybrid_available else "timestamp"
         self.logger.info(f"Segmenting by pauses (mode: {mode})")
         
         segments = []
@@ -607,7 +625,7 @@ class SegmentationEngine:
                 if pause_duration >= self.params['pause_threshold']:
                     stats['potential'] += 1
                     
-                    if self.params['hybrid_pause_detection'] and self.yamnet_filter:
+                    if self.params['hybrid_pause_detection'] and self.hybrid_available:
                         # Validate pause with YAMNet
                         gap_start_ms = int(word['end'] * 1000)
                         gap_end_ms = int(next_word['start'] * 1000)
@@ -642,11 +660,10 @@ class SegmentationEngine:
                 last_word = current_words[-1]
                 
                 if 'start' in first_word and 'end' in last_word:
-                    text = ''.join([w.get('word', '') for w in current_words]).strip()
+                    text = ' '.join([w.get('word', '') for w in current_words]).strip()
                     duration = last_word['end'] - first_word['start']
                     
-                    # FIXED: Correct boundary calculation (Issue #6)
-                    # Previous word is the one BEFORE current segment starts
+                    # Calculate segment boundaries
                     segment_start_idx = i - len(current_words) + 1
                     prev_word_end_ms = int(words[segment_start_idx - 1]['end'] * 1000) if segment_start_idx > 0 else None
                     next_word_start_ms = int(words[i + 1]['start'] * 1000) if i + 1 < len(words) else None
@@ -664,7 +681,7 @@ class SegmentationEngine:
                         )
                         segments.append(segment)
                 
-                # CRITICAL FIX: Clear words only after processing (Issue #1 from original bug)
+                # Clear words for next segment
                 current_words = []
         
         self.logger.info(f"Segmentation complete: {len(segments)} segments", extra={
@@ -694,7 +711,7 @@ class SegmentationEngine:
 
 
 # =============================================================================
-# SEGMENT FILTER (Issue #1: Single classification per segment)
+# SEGMENT FILTER
 # =============================================================================
 
 class SegmentFilter:
@@ -704,12 +721,10 @@ class SegmentFilter:
         self.params = params
         self.yamnet_filter = yamnet_filter
         self.logger = logger
+        self.filtering_available = yamnet_filter is not None and yamnet_filter.available
     
     def filter_segments(self, segments: List[SegmentData], audio: AudioSegment) -> List[SegmentData]:
-        """
-        Filter segments with SINGLE classification per segment (Issue #1)
-        This is a major optimization - classify once, check all filters
-        """
+        """Filter segments with single classification per segment"""
         self.logger.info("Filtering segments...")
         filtered = []
         stats = {'music': 0, 'noise': 0, 'confidence': 0, 'text': 0}
@@ -717,8 +732,8 @@ class SegmentFilter:
         for seg in segments:
             chunk = audio[seg.start_ms:seg.end_ms]
             
-            # OPTIMIZATION: Classify once and cache in segment (Issue #1)
-            if self.yamnet_filter and (self.params['filter_music'] or self.params['filter_noise']):
+            # Classify once and cache in segment
+            if self.yamnet_filter and self.filtering_available and (self.params['filter_music'] or self.params['filter_noise']):
                 classification = self.yamnet_filter.classify_audio(chunk)
                 seg.classification = classification.to_dict()
                 
@@ -733,13 +748,16 @@ class SegmentFilter:
                     if classification.is_silent(self.params['noise_silence_threshold']):
                         stats['noise'] += 1
                         continue
+            else:
+                # No filtering available, set default classification
+                seg.classification = AudioClassification(0.0, 1.0, 0.0, 0.0).to_dict()
             
             # Confidence filter
             if seg.confidence < self.params['min_confidence']:
                 stats['confidence'] += 1
                 continue
             
-            # Text validation (already done in segmentation, but double-check)
+            # Text validation
             if len(seg.text.strip()) < 3:
                 stats['text'] += 1
                 continue
@@ -751,7 +769,7 @@ class SegmentFilter:
 
 
 # =============================================================================
-# EXPORT MANAGER (Issue #11: Separate concerns)
+# EXPORT MANAGER
 # =============================================================================
 
 class ExportManager:
@@ -982,14 +1000,11 @@ class ExportManager:
 
 
 # =============================================================================
-# MAIN SPEECH SPLITTER (Issue #11: Simplified orchestration)
+# MAIN SPEECH SPLITTER
 # =============================================================================
 
 class SpeechSplitter:
-    """
-    Main orchestrator for speech splitting pipeline
-    Optimized version with all issues fixed
-    """
+    """Main orchestrator for speech splitting pipeline"""
     
     def __init__(self, **kwargs):
         self.output_dir = Path(kwargs.get('output_dir', 'output'))
@@ -998,7 +1013,7 @@ class SpeechSplitter:
         # Setup logging
         self.logger = setup_logging(self.output_dir, kwargs.get('log_level', 'INFO'))
         
-        # OPTIMIZATION: Simplified parameters (Issue #14)
+        # Parameters
         self.params = {
             'whisper_model': kwargs.get('whisper_model', 'large'),
             'language': kwargs.get('language', 'en'),
@@ -1033,7 +1048,7 @@ class SpeechSplitter:
         
         self.logger.info("Configuration loaded", extra=self.params)
         
-        # Initialize components (Issue #11: Separated concerns)
+        # Initialize transcription manager (WhisperX only)
         self.transcription_manager = TranscriptionManager(
             self.params['whisper_model'],
             self.params['language'],
@@ -1041,7 +1056,7 @@ class SpeechSplitter:
             self.logger
         )
         
-        # OPTIMIZATION: Lazy load YAMNet only if needed (Issue #13)
+        # Initialize YAMNet filter if needed (optional)
         self._yamnet_filter = None
         self._needs_yamnet = any([
             self.params['filter_music'],
@@ -1050,10 +1065,17 @@ class SpeechSplitter:
         ])
         
         if self._needs_yamnet:
+            self.logger.info("Initializing YAMNet filter (optional)...")
             self._yamnet_filter = YAMNetFilter(device=self.device, logger=self.logger)
-            if self.params['hybrid_pause_detection'] and self._yamnet_filter.model:
-                self.logger.info("Hybrid pause detection enabled")
+            if self._yamnet_filter.available:
+                self.logger.info("✓ YAMNet filter ready")
+            else:
+                self.logger.warning("⚠ YAMNet not available - using timestamp-only mode")
+                self._yamnet_filter = None
+        else:
+            self.logger.info("YAMNet filtering disabled")
         
+        # Initialize other components
         self.segmentation_engine = SegmentationEngine(self.params, self._yamnet_filter, self.logger)
         self.segment_filter = SegmentFilter(self.params, self._yamnet_filter, self.logger)
         self.export_manager = ExportManager(self.output_dir, self.params, self.logger)
@@ -1070,10 +1092,10 @@ class SpeechSplitter:
             'path': str(audio_path)
         })
         
-        # Load and prepare audio (OPTIMIZATION: Single mono conversion - Issue #3)
+        # Load and prepare audio
         audio, original_sr = AudioProcessor.load_and_prepare(audio_path, self.logger)
         
-        # Transcribe (with caching)
+        # Transcribe with WhisperX
         import tempfile
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
             audio.export(tmp.name, format='wav')
@@ -1091,14 +1113,14 @@ class SpeechSplitter:
             self.logger.warning("No valid segments found")
             return {'total_segments': 0, 'total_duration': 0, 'avg_duration': 0}
         
-        # Filter segments (OPTIMIZATION: Single classification - Issue #1)
+        # Filter segments
         filtered_segments = self.segment_filter.filter_segments(segments, audio)
         
         # Export segments
         output_files = self.export_manager.export_segments(audio, filtered_segments, base_name, original_sr)
         
-        # Log cache statistics (OPTIMIZATION: Issue #1)
-        if self._yamnet_filter:
+        # Log cache statistics
+        if self._yamnet_filter and self._yamnet_filter.available:
             stats = self._yamnet_filter.get_cache_stats()
             self.logger.info(f"YAMNet Cache: {stats['cache_hits']} hits, "
                            f"{stats['cache_misses']} misses, "
@@ -1126,12 +1148,12 @@ class SpeechSplitter:
 
 
 # =============================================================================
-# CLI (OPTIMIZATION: Removed deprecated params - Issue #4)
+# CLI
 # =============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Speech Splitter v4 - Optimized TTS Data Generator",
+        description="Speech Splitter v3 - WhisperX TTS Data Generator",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
@@ -1153,7 +1175,7 @@ def main():
     parser.add_argument('--max-length', type=float, default=15.0, help="Maximum segment length (seconds)")
     parser.add_argument('--pause-threshold', type=float, default=0.3, help="Pause detection threshold (seconds)")
     parser.add_argument('--hybrid-pause-detection', action='store_true', default=True, 
-                       help="Use YAMNet to validate pauses")
+                       help="Use YAMNet to validate pauses (requires TensorFlow)")
     parser.add_argument('--pause-speech-threshold', type=float, default=0.2, 
                        help="Speech threshold for pause validation")
     
@@ -1189,36 +1211,42 @@ def main():
     handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
     temp_logger.addHandler(handler)
     
-    temp_logger.info("=== Speech Splitter v4 - Optimized ===")
+    temp_logger.info("=== Speech Splitter v3 - WhisperX ===")
     check_gpu(temp_logger)
     temp_logger.handlers.clear()
     
     # Create splitter
-    splitter = SpeechSplitter(
-        whisper_model=args.model,
-        language=args.language,
-        output_dir=args.output_dir,
-        min_segment_length=args.min_length,
-        max_segment_length=args.max_length,
-        export_format=args.format,
-        pause_threshold=args.pause_threshold,
-        min_confidence=args.min_confidence,
-        filter_noise=args.filter_noise,
-        noise_silence_threshold=args.noise_silence_threshold,
-        filter_music=args.filter_music,
-        music_threshold=args.music_threshold,
-        mixed_threshold=args.mixed_threshold,
-        word_start_buffer_ms=args.word_start_buffer,
-        word_end_buffer_ms=args.word_end_buffer,
-        hybrid_pause_detection=args.hybrid_pause_detection,
-        pause_speech_threshold=args.pause_speech_threshold,
-        overlength_action=args.overlength_action,
-        trim_threshold_db=args.trim_threshold_db,
-        trim_chunk_ms=args.trim_chunk_ms,
-        trim_pad_ms=args.trim_pad_ms,
-        device=args.device,
-        log_level=args.log_level
-    )
+    try:
+        splitter = SpeechSplitter(
+            whisper_model=args.model,
+            language=args.language,
+            output_dir=args.output_dir,
+            min_segment_length=args.min_length,
+            max_segment_length=args.max_length,
+            export_format=args.format,
+            pause_threshold=args.pause_threshold,
+            min_confidence=args.min_confidence,
+            filter_noise=args.filter_noise,
+            noise_silence_threshold=args.noise_silence_threshold,
+            filter_music=args.filter_music,
+            music_threshold=args.music_threshold,
+            mixed_threshold=args.mixed_threshold,
+            word_start_buffer_ms=args.word_start_buffer,
+            word_end_buffer_ms=args.word_end_buffer,
+            hybrid_pause_detection=args.hybrid_pause_detection,
+            pause_speech_threshold=args.pause_speech_threshold,
+            overlength_action=args.overlength_action,
+            trim_threshold_db=args.trim_threshold_db,
+            trim_chunk_ms=args.trim_chunk_ms,
+            trim_pad_ms=args.trim_pad_ms,
+            device=args.device,
+            log_level=args.log_level
+        )
+    except RuntimeError as e:
+        print(f"\nERROR: {e}")
+        print("\nPlease install WhisperX:")
+        print("pip install git+https://github.com/m-bain/whisperx.git")
+        return 1
     
     # Process input
     input_path = Path(args.input)
@@ -1235,12 +1263,13 @@ def main():
             splitter.process_file(str(audio_file), speaker_id)
     else:
         splitter.logger.error(f"Invalid input path: {args.input}")
-        return
+        return 1
     
     # Generate metadata
     splitter.generate_metadata()
     splitter.logger.info("=== All processing complete ===")
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main() or 0)

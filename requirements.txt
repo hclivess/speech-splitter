@@ -1,29 +1,30 @@
-# Core dependencies
-whisperx
+# Core PyTorch (install FIRST)
+torch==2.1.2
+torchvision==0.16.2
+torchaudio==2.1.2
 
-# PyTorch - install manually based on CUDA version using setup.cmd
-# For manual installation:
-# CUDA: pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
-# CPU:  pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cpu
+# Core dependencies
+numpy<2.0
+numba>=0.55.0
 
 # Audio processing
+soundfile>=0.12.1
+librosa>=0.10.0
 pydub>=0.25.1
-numpy>=1.23.5,<1.24.0  # TensorFlow compatibility
 
-# Machine Learning (compatible versions to avoid pytree error)
-tensorflow==2.13.0
-tensorflow-hub==0.15.0
+# WhisperX and related
+git+https://github.com/m-bain/whisperx.git
+pyannote.audio==3.1.1
+transformers>=4.36.0
+huggingface-hub>=0.20.0
+faster-whisper>=0.10.0
 
-# GUI
-PySide6>=6.4.0
-
-# Progress
+# Utilities
 tqdm>=4.64.0
+PySide6>=6.5.0
+tinytag>=1.9.0
 
-# Metadata
-tinytag>=1.8.0
-
-# Version compatibility notes:
-# - PyTorch 2.1.0 + TensorFlow 2.13.0 are tested compatible
-# - Avoid PyTorch 2.2+ with TensorFlow 2.12 (causes pytree errors)
-# - NumPy must be <1.24 for TensorFlow compatibility
+# Optional: TensorFlow for YAMNet (may cause conflicts)
+# Uncomment if you need audio filtering
+# tensorflow==2.15.0
+# tensorflow-hub==0.16.1
