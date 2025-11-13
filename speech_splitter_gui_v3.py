@@ -497,7 +497,7 @@ class SpeechSplitterGUI(QMainWindow):
         
         cutoff_layout.addWidget(QLabel("Cutoff Action:"))
         self.cutoff_action_combo = QComboBox()
-        self.cutoff_action_combo.addItems(['skip', 'warn', 'include'])
+        self.cutoff_action_combo.addItems(['skip', 'extend', 'include'])
         self.cutoff_action_combo.setCurrentText('skip')
         self.cutoff_action_combo.setMinimumHeight(32)
         self.cutoff_action_combo.setToolTip("What to do when cutoff detected")
