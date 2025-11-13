@@ -12,6 +12,7 @@ import warnings
 import sys
 warnings.filterwarnings('ignore')
 
+import re
 from pydub import AudioSegment
 import numpy as np
 from tqdm import tqdm
@@ -590,89 +591,73 @@ class TranscriptionManager:
 # =============================================================================
 
 class SegmentationEngine:
-    """Handle segmentation by pauses with hybrid detection"""
-    
+    """Handle segmentation by sentence boundaries (fullstops)"""
+
     def __init__(self, params: Dict, yamnet_filter: Optional[YAMNetFilter], logger: logging.Logger):
         self.params = params
         self.yamnet_filter = yamnet_filter
         self.logger = logger
         self.hybrid_available = yamnet_filter is not None and yamnet_filter.available
-    
-    def segment_by_pauses(self, words: List[Dict], audio: AudioSegment) -> List[SegmentData]:
-        """Segment audio by pauses with hybrid detection"""
+
+        # Sentence ending patterns
+        self.sentence_endings = re.compile(r'[.!?]+\s*$')
+
+    def segment_by_sentences(self, words: List[Dict], audio: AudioSegment) -> List[SegmentData]:
+        """Segment audio by sentence boundaries (fullstops, !, ?)"""
         if not words:
             self.logger.warning("No words found for segmentation")
             return []
-        
-        mode = "hybrid" if self.params['hybrid_pause_detection'] and self.hybrid_available else "timestamp"
-        self.logger.info(f"Segmenting by pauses (mode: {mode})")
-        
+
+        self.logger.info("Segmenting by sentence boundaries (., !, ?)")
+
         segments = []
         current_words = []
-        stats = {'potential': 0, 'validated': 0, 'rejected': 0}
-        
+        stats = {'sentences_found': 0, 'segments_created': 0}
+
         for i, word in enumerate(words):
             if 'start' not in word or 'end' not in word:
                 self.logger.debug(f"Skipping word: missing timestamps")
                 continue
-            
+
             current_words.append(word)
-            
+
             should_split = False
-            if i < len(words) - 1:
-                next_word = words[i + 1]
-                pause_duration = next_word['start'] - word['end']
-                
-                if pause_duration >= self.params['pause_threshold']:
-                    stats['potential'] += 1
-                    
-                    if self.params['hybrid_pause_detection'] and self.hybrid_available:
-                        # Validate pause with YAMNet
-                        gap_start_ms = int(word['end'] * 1000)
-                        gap_end_ms = int(next_word['start'] * 1000)
-                        
-                        if gap_end_ms - gap_start_ms >= MIN_PAUSE_DURATION_MS:
-                            gap_audio = audio[gap_start_ms:gap_end_ms]
-                            classification = self.yamnet_filter.classify_audio(gap_audio)
-                            
-                            # True pause if silent OR no speech detected
-                            is_true_pause = (
-                                classification.is_silent(self.params['noise_silence_threshold']) or
-                                not classification.is_speech(self.params['pause_speech_threshold'])
-                            )
-                            
-                            if is_true_pause:
-                                should_split = True
-                                stats['validated'] += 1
-                            else:
-                                stats['rejected'] += 1
-                        else:
-                            should_split = True  # Very short gap, assume it's a pause
-                    else:
-                        should_split = True
-            
-            # Last word always triggers split
+            word_text = word.get('word', '').strip()
+
+            # Check if word ends with sentence punctuation
+            if self.sentence_endings.search(word_text):
+                should_split = True
+                stats['sentences_found'] += 1
+
+            # Last word always triggers split (even without punctuation)
             if i == len(words) - 1:
                 should_split = True
-            
+
             # Create segment when split is triggered
             if should_split and current_words:
                 first_word = current_words[0]
                 last_word = current_words[-1]
-                
+
                 if 'start' in first_word and 'end' in last_word:
                     text = ' '.join([w.get('word', '') for w in current_words]).strip()
                     duration = last_word['end'] - first_word['start']
-                    
+
                     # Calculate segment boundaries
                     segment_start_idx = i - len(current_words) + 1
-                    prev_word_end_ms = int(words[segment_start_idx - 1]['end'] * 1000) if segment_start_idx > 0 else None
+                    prev_word_end_ms = int(
+                        words[segment_start_idx - 1]['end'] * 1000) if segment_start_idx > 0 else None
                     next_word_start_ms = int(words[i + 1]['start'] * 1000) if i + 1 < len(words) else None
-                    
+
+                    # Include any pause gap after the sentence if there's a next word
+                    end_ms = next_word_start_ms if next_word_start_ms is not None else int(last_word['end'] * 1000)
+
+                    # Duration is speech-only (without pause gap) for filtering
+                    duration = last_word['end'] - first_word['start']
+
                     if self._validate_segment_text(text) and duration >= self.params['min_segment_length']:
                         segment = SegmentData(
                             start_ms=int(first_word['start'] * 1000),
-                            end_ms=int(last_word['end'] * 1000),
+                            end_ms=end_ms,
                             duration=duration,
                             words=current_words.copy(),
                             text=text,
@@ -681,41 +666,33 @@ class SegmentationEngine:
                             next_word_start_ms=next_word_start_ms
                         )
                         segments.append(segment)
-                
+                        stats['segments_created'] += 1
+
                 # Clear words for next segment
                 current_words = []
 
-
         self.logger.info("SEGMENTATION RESULTS")
-
-        self.logger.info(f"Total segments created: {len(segments)}")
-        if self.params['hybrid_pause_detection'] and self.hybrid_available:
-            self.logger.info(f"Potential pauses detected: {stats['potential']}")
-            self.logger.info(
-                f"✓ Validated as true pauses: {stats['validated']} ({stats['validated'] / stats['potential'] * 100:.1f}%)")
-            self.logger.info(
-                f"✗ Rejected as speech: {stats['rejected']} ({stats['rejected'] / stats['potential'] * 100:.1f}%)")
-
+        self.logger.info(f"Sentence boundaries found: {stats['sentences_found']}")
+        self.logger.info(f"Total segments created: {stats['segments_created']}")
 
         return segments
-    
+
     def _validate_segment_text(self, text: str) -> bool:
         """Validate that segment contains meaningful text"""
         if not text or len(text.strip()) < 3:
             return False
-        
+
         text = text.strip().lower()
         invalid_patterns = ['[blank_audio]', '[music]', '[applause]', '[laughter]', '[noise]', '...', 'ummm', 'uhhhh']
-        
+
         for pattern in invalid_patterns:
             if pattern in text and len(text) < 15:
                 return False
-        
+
         if not any(c.isalpha() for c in text):
             return False
-        
-        return len(set(text.replace(' ', ''))) > 1
 
+        return len(set(text.replace(' ', ''))) > 1
 
 # =============================================================================
 # SEGMENT FILTER
@@ -921,17 +898,18 @@ class ExportManager:
         self.logger.info(f"Successfully exported: {len(output_files)} segments")
 
         return output_files
-    
+
     def _get_validated_boundaries(self, audio: AudioSegment, start_ms: int, end_ms: int,
-                                   prev_word_end_ms: Optional[int], 
-                                   next_word_start_ms: Optional[int]) -> Tuple[int, int]:
+                                  prev_word_end_ms: Optional[int],
+                                  next_word_start_ms: Optional[int]) -> Tuple[int, int]:
         """Get validated segment boundaries with buffers"""
         validated_start = start_ms
         validated_end = end_ms
-        
+
+        # Apply start buffer logic (unchanged)
         if self.params['word_start_buffer_ms'] > 0:
             buffer_start = start_ms - self.params['word_start_buffer_ms']
-            
+
             if prev_word_end_ms is not None:
                 gap = start_ms - prev_word_end_ms
                 if gap < 200:
@@ -940,16 +918,24 @@ class ExportManager:
                     validated_start = max(prev_word_end_ms, buffer_start, 0)
             else:
                 validated_start = max(0, buffer_start)
-        
+
+        # ✅ FIXED: Only apply end buffer if segment doesn't already include pause gap
         if next_word_start_ms is not None:
-            max_gap = next_word_start_ms - end_ms
-            actual_buffer = min(self.params['word_end_buffer_ms'], max_gap)
-            validated_end = end_ms + actual_buffer
+            # If end_ms is already at or beyond next_word_start_ms,
+            # the segmentation intentionally included the full pause gap
+            if end_ms >= next_word_start_ms:
+                validated_end = end_ms  # Keep the pause gap
+            else:
+                # Otherwise, add buffer up to next word start
+                max_gap = next_word_start_ms - end_ms
+                actual_buffer = min(self.params['word_end_buffer_ms'], max_gap)
+                validated_end = end_ms + actual_buffer
         elif self.params['word_end_buffer_ms'] > 0:
+            # No next word, just add buffer
             validated_end = end_ms + self.params['word_end_buffer_ms']
-        
+
         return validated_start, validated_end
-    
+
     def _check_for_cutoff(self, audio_chunk: AudioSegment, is_start: bool = True) -> bool:
         """Improved cutoff detection using RMS gradient"""
         if not self.params.get('check_cutoff', False):
@@ -1027,30 +1013,34 @@ class ExportManager:
             elif cutoff_action == 'skip':
                 self.logger.warning(f"Skipping segment with start cutoff: '{seg_text[:50]}...'")
                 return validated_start, validated_end, True
-        
+
         # Check END cutoff (THIS WAS MISSING!)
         if self._check_for_cutoff(audio_chunk, is_start=False):
-            self.logger.debug(f"End cutoff detected: '...{seg_text[-30:]}'")
-            
+            self.logger.debug(f"End cutoff detected: '...{seg.text[-30:]}'")
+
             if cutoff_action == 'extend':
                 # Try to extend forwards
                 extension_ms = 500
                 audio_length_ms = len(audio)
-                extended_end = min(audio_length_ms, validated_end + extension_ms)
+
+                # ✅ FIXED: Never extend beyond next word start
                 if next_word_start_ms is not None:
-                    extended_end = min(next_word_start_ms + 300, extended_end, audio_length_ms)
-                
+                    max_extension = next_word_start_ms - validated_end
+                    extension_ms = min(extension_ms, max_extension)
+
+                extended_end = min(audio_length_ms, validated_end + extension_ms)
+
                 extended_chunk = audio[validated_start:extended_end]
                 if not self._check_for_cutoff(extended_chunk, is_start=False):
                     self.logger.debug(f"End extension successful: {validated_end}ms -> {extended_end}ms")
                     validated_end = extended_end
                 else:
-                    self.logger.warning(f"End extension failed, skipping: '...{seg_text[-50:]}'")
+                    self.logger.warning(f"End extension failed, skipping: '...{seg.text[-50:]}'")
                     return validated_start, validated_end, True
             elif cutoff_action == 'skip':
-                self.logger.warning(f"Skipping segment with end cutoff: '...{seg_text[-50:]}'")
+                self.logger.warning(f"Skipping segment with end cutoff: '...{seg.text[-50:]}'")
                 return validated_start, validated_end, True
-        
+
         return validated_start, validated_end, False
     
     def _get_unique_filename(self, base_path: Path, stem: str, suffix: str) -> Path:
@@ -1226,7 +1216,7 @@ class SpeechSplitter:
             os.unlink(temp_path)
         
         # Segment by pauses
-        segments = self.segmentation_engine.segment_by_pauses(transcription['words'], audio)
+        segments = self.segmentation_engine.segment_by_sentences(transcription['words'], audio)
         
         if not segments:
             self.logger.warning("No valid segments found")
