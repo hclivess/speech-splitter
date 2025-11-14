@@ -108,7 +108,7 @@ class AudioProcessorThread(QThread):
                 except:
                     pass
     
-    def remove_large_gaps(self, audio, silence_thresh=-40, min_silence_len=4000, keep_silence=2000):
+    def remove_large_gaps(self, audio, silence_thresh=-40, min_silence_len=1000, keep_silence=100):
         """
         Remove large silent gaps from audio
         silence_thresh: dBFS threshold for silence
@@ -200,8 +200,8 @@ class MainWindow(QMainWindow):
         
         # Min silence length
         self.min_silence_spin = QSpinBox()
-        self.min_silence_spin.setRange(100, 10000)
-        self.min_silence_spin.setValue(4000)
+        self.min_silence_spin.setRange(100, 5000)
+        self.min_silence_spin.setValue(1000)
         self.min_silence_spin.setSuffix(" ms")
         self.min_silence_spin.setSingleStep(100)
         settings_layout.addRow("Min Silence to Remove:", self.min_silence_spin)

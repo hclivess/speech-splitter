@@ -1,686 +1,307 @@
-#!/usr/bin/env python3
 """
-Speech Splitter - Whisper-only segmentation with perfect audio/text alignment
-No VAD - relies entirely on Whisper word timestamps for accurate boundaries
+Speech Splitter v4 - Main Orchestrator
+Sentence-based audio segmentation for TTS data generation
+
+This is the main entry point that coordinates all modules:
+- Audio processing
+- WhisperX transcription
+- Sentence-based segmentation
+- Quality filtering
+- Export with cutoff detection
 """
 
 import os
-import json
+import sys
 import argparse
-from pathlib import Path
-from typing import List, Dict, Tuple, Optional
 import warnings
+from pathlib import Path
+from typing import Dict, Optional
+
+import torch
+
 warnings.filterwarnings('ignore')
 
-import whisper
-from pydub import AudioSegment
-import numpy as np
-from tqdm import tqdm
-
-
-class YAMNetFilter:
-    """YAMNet-based audio classifier to filter music and music+speech"""
-    
-    def __init__(self):
-        self.model = None
-        self.class_names = None
-        self._load_model()
-    
-    def _load_model(self):
-        """Load YAMNet model from TensorFlow Hub"""
-        try:
-            import tensorflow as tf
-            import tensorflow_hub as hub
-            
-            # Suppress TensorFlow warnings
-            tf.get_logger().setLevel('ERROR')
-            os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-            
-            print("Loading YAMNet model...")
-            self.model = hub.load('https://tfhub.dev/google/yamnet/1')
-            
-            # Load class names
-            class_map_path = self.model.class_map_path().numpy()
-            self.class_names = self._load_class_names(class_map_path)
-            
-            print("✓ YAMNet model loaded")
-            
-        except Exception as e:
-            print(f"⚠ Failed to load YAMNet: {e}")
-            print("⚠ Music filtering will be disabled")
-            self.model = None
-    
-    def _load_class_names(self, class_map_csv):
-        """Load YAMNet class names from CSV"""
-        import csv
-        class_names = []
-        with open(class_map_csv) as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                class_names.append(row['display_name'])
-        return class_names
-    
-    def classify_audio(self, audio_segment: AudioSegment) -> Dict[str, float]:
-        """
-        Classify audio segment and return probabilities for relevant classes
-        
-        Returns:
-            Dict with keys: 'music', 'speech', 'music_speech_mixed'
-        """
-        if self.model is None:
-            return {'music': 0.0, 'speech': 1.0, 'music_speech_mixed': 0.0}
-        
-        try:
-            import tensorflow as tf
-            
-            # Convert AudioSegment to numpy array
-            samples = np.array(audio_segment.get_array_of_samples())
-            
-            # Convert to float32 in range [-1, 1]
-            if audio_segment.sample_width == 2:  # 16-bit
-                samples = samples.astype(np.float32) / 32768.0
-            elif audio_segment.sample_width == 4:  # 32-bit
-                samples = samples.astype(np.float32) / 2147483648.0
-            
-            # Run YAMNet
-            scores, embeddings, spectrogram = self.model(samples)
-            
-            # Average scores across all frames
-            mean_scores = np.mean(scores.numpy(), axis=0)
-            
-            # Find relevant class indices
-            music_classes = [i for i, name in enumerate(self.class_names) 
-                           if 'music' in name.lower() and 'speech' not in name.lower()]
-            speech_classes = [i for i, name in enumerate(self.class_names) 
-                            if 'speech' in name.lower() and 'music' not in name.lower()]
-            mixed_classes = [i for i, name in enumerate(self.class_names) 
-                           if 'music' in name.lower() and 'speech' in name.lower()]
-            
-            # Calculate probabilities
-            music_prob = float(np.max([mean_scores[i] for i in music_classes]) if music_classes else 0.0)
-            speech_prob = float(np.max([mean_scores[i] for i in speech_classes]) if speech_classes else 0.0)
-            mixed_prob = float(np.max([mean_scores[i] for i in mixed_classes]) if mixed_classes else 0.0)
-            
-            return {
-                'music': music_prob,
-                'speech': speech_prob,
-                'music_speech_mixed': mixed_prob
-            }
-            
-        except Exception as e:
-            print(f"⚠ YAMNet classification error: {e}")
-            return {'music': 0.0, 'speech': 1.0, 'music_speech_mixed': 0.0}
-    
-    def is_music_or_mixed(self, audio_segment: AudioSegment, 
-                          music_threshold: float = 0.3,
-                          mixed_threshold: float = 0.2) -> Tuple[bool, Dict]:
-        """
-        Check if audio is music or music+speech mixed
-        
-        Args:
-            audio_segment: Audio to classify
-            music_threshold: Threshold for pure music (default 0.3)
-            mixed_threshold: Threshold for music+speech mixed (default 0.2)
-            
-        Returns:
-            (is_filtered, classification_dict)
-        """
-        classification = self.classify_audio(audio_segment)
-        
-        is_music = classification['music'] > music_threshold
-        is_mixed = classification['music_speech_mixed'] > mixed_threshold
-        
-        return (is_music or is_mixed), classification
+# Import all modules
+from utils import setup_logging, check_gpu
+from audio_processor import AudioProcessor
+from transcription import TranscriptionManager
+from audio_classifier import YAMNetFilter
+from segmentation import SegmentationEngine
+from segment_filter import SegmentFilter
+from export_manager import ExportManager
 
 
 class SpeechSplitter:
-    """
-    Whisper-only Speech Splitter with perfect audio/text alignment
+    """Main orchestrator for speech splitting pipeline"""
     
-    Output Structure:
-        output_dir/
-            speaker1/
-                audio/
-                    speaker1_0001.wav
-                    speaker1_0002.wav
-                transcripts/
-                    speaker1_0001.txt
-                    speaker1_0002.txt
-                speaker1_metadata.json
-                speaker1_manifest.txt
-    """
-    def __init__(
-        self,
-        whisper_model: str = "large",
-        language: str = "cs",
-        output_dir: str = "output",
-        silence_padding_ms: int = 150,
-        min_segment_length: float = 1.0,
-        max_segment_length: float = 15.0,
-        export_format: str = "wav",
-        pause_threshold: float = 0.5,
-        min_confidence: float = 0.5,
-        filter_noise: bool = True,
-        min_rms: float = 0.01,
-        filter_music: bool = True,
-        music_threshold: float = 0.3,
-        mixed_threshold: float = 0.2,
-        word_boundary_buffer_ms: int = 350  # New parameter for word boundary buffer
-    ):
-        """
-        Initialize Speech Splitter with Whisper-only segmentation
-        
-        Args:
-            whisper_model: Whisper model size
-            language: Language code (cs, en, de, etc.)
-            output_dir: Output directory
-            silence_padding_ms: Silence to add after segments
-            min_segment_length: Min segment duration (seconds)
-            max_segment_length: Max segment duration (seconds)
-            export_format: wav or mp3
-            pause_threshold: Pause duration to split segments (seconds, default 0.5)
-            min_confidence: Minimum transcription confidence (0.0-1.0)
-            filter_noise: Enable noise filtering
-            min_rms: Minimum RMS energy level
-            filter_music: Enable YAMNet music filtering
-            music_threshold: YAMNet threshold for music detection
-            mixed_threshold: YAMNet threshold for music+speech detection
-            word_boundary_buffer_ms: Buffer to add at end of segments for complete word capture
-        """
-        self.whisper_model = whisper_model
-        self.language = language
-        self.output_dir = Path(output_dir)
-        self.silence_padding_ms = silence_padding_ms
-        self.min_segment_length = min_segment_length
-        self.max_segment_length = max_segment_length
-        self.export_format = export_format
-        self.pause_threshold = pause_threshold
-        self.min_confidence = min_confidence
-        self.filter_noise = filter_noise
-        self.min_rms = min_rms
-        self.filter_music = filter_music
-        self.music_threshold = music_threshold
-        self.mixed_threshold = mixed_threshold
-        self.word_boundary_buffer_ms = word_boundary_buffer_ms
-        
-        # Create main output directory
+    def __init__(self, **kwargs):
+        self.output_dir = Path(kwargs.get('output_dir', 'output'))
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Load Whisper
-        print(f"Loading Whisper model ({whisper_model})...")
-        self.model = whisper.load_model(whisper_model)
+        # Setup logging
+        self.logger = setup_logging(self.output_dir, kwargs.get('log_level', 'INFO'))
         
-        # Load YAMNet if music filtering enabled
-        if self.filter_music:
-            self.yamnet_filter = YAMNetFilter()
-        else:
-            self.yamnet_filter = None
-            print("⚠ Music filtering disabled")
+        # Parameters
+        self.params = {
+            'whisper_model': kwargs.get('whisper_model', 'large'),
+            'language': kwargs.get('language', 'en'),
+            'batch_size': kwargs.get('batch_size', 6),
+            'min_segment_length': kwargs.get('min_segment_length', 1.0),
+            'max_segment_length': kwargs.get('max_segment_length', 15.0),
+            'export_format': kwargs.get('export_format', 'wav'),
+            'min_confidence': kwargs.get('min_confidence', 0.5),
+            'filter_noise': kwargs.get('filter_noise', False),
+            'noise_silence_threshold': kwargs.get('noise_silence_threshold', 0.3),
+            'filter_music': kwargs.get('filter_music', True),
+            'music_threshold': kwargs.get('music_threshold', 0.3),
+            'mixed_threshold': kwargs.get('mixed_threshold', 0.2),
+            'word_start_buffer_ms': kwargs.get('word_start_buffer_ms', 250),
+            'word_end_buffer_ms': kwargs.get('word_end_buffer_ms', 250),
+            'check_cutoff': kwargs.get('check_cutoff', False),
+            'cutoff_boundary_ms': kwargs.get('cutoff_boundary_ms', 50),
+            'cutoff_silence_threshold': kwargs.get('cutoff_silence_threshold', 0.35),
+            'cutoff_action': kwargs.get('cutoff_action', 'skip'),
+            'overlength_action': kwargs.get('overlength_action', 'rename'),
+            'trim_threshold_db': kwargs.get('trim_threshold_db', -45.0),
+            'trim_chunk_ms': kwargs.get('trim_chunk_ms', 10),
+            'trim_pad_ms': kwargs.get('trim_pad_ms', 50),
+        }
         
-        print("✓ Models loaded\n")
-    
-    def validate_segment_text(self, text: str) -> bool:
-        """Validate if segment text is suitable for output"""
-        if not text or not text.strip():
-            return False
-        if len(text.strip()) < 3:
-            return False
-        # Add more validation if needed
-        return True
-    
-    def transcribe_full_audio(self, audio_path: str) -> Dict:
-        """
-        Transcribe entire audio file with Whisper and get word-level timestamps
-        Returns full transcription with word details
-        """
-        print("Transcribing full audio with Whisper...")
+        # Device selection
+        self.device = kwargs.get('device', None)
+        if self.device is None:
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
-        result = self.model.transcribe(
-            audio_path,
-            language=self.language,
-            word_timestamps=True,
-            verbose=False
+        self.logger.info("Configuration loaded", extra=self.params)
+        
+        # Initialize transcription manager (WhisperX)
+        self.transcription_manager = TranscriptionManager(
+            self.params['whisper_model'],
+            self.params['language'],
+            self.device,
+            self.logger,
+            self.params['batch_size']
         )
         
-        # Extract all words with timestamps
-        all_words = []
-        for segment in result.get('segments', []):
-            if 'words' in segment:
-                all_words.extend(segment['words'])
+        # Initialize YAMNet filter if needed (optional)
+        self._yamnet_filter = None
+        self._needs_yamnet = any([
+            self.params['filter_music'],
+            self.params['filter_noise']
+        ])
         
-        print(f"✓ Transcribed {len(all_words)} words")
-        return {
-            'text': result['text'],
-            'words': all_words,
-            'segments': result.get('segments', [])
-        }
-    
-    def segment_by_pauses(self, words: List[Dict]) -> List[Dict]:
-        """
-        Create segments from words based on natural pauses
-        Uses word timestamps to detect pauses and group words into segments
+        if self._needs_yamnet:
+            self.logger.info("Initializing YAMNet filter (optional)...")
+            self._yamnet_filter = YAMNetFilter(device=self.device, logger=self.logger)
+            if self._yamnet_filter.available:
+                self.logger.info("✓ YAMNet filter ready")
+            else:
+                self.logger.warning("⚠ YAMNet not available - using timestamp-only mode")
+                self._yamnet_filter = None
+        else:
+            self.logger.info("YAMNet filtering disabled")
         
-        Args:
-            words: List of word dicts with 'start', 'end', 'word', 'probability'
-            
-        Returns:
-            List of segment dicts with 'start_ms', 'end_ms', 'words', 'text', 'confidence'
-        """
-        if not words:
-            print("⚠ No words found for segmentation")
-            return []
+        # Initialize other components
+        self.segmentation_engine = SegmentationEngine(self.params, self.logger)
+        self.segment_filter = SegmentFilter(self.params, self._yamnet_filter, self.logger)
+        self.export_manager = ExportManager(self.output_dir, self.params, self.logger)
         
-        print("Segmenting by natural pauses...")
-        
-        segments = []
-        current_segment_words = []
-        
-        for i, word in enumerate(words):
-            # Skip words with missing timestamps
-            if 'start' not in word or 'end' not in word:
-                print(f"⚠ Skipping word with missing timestamps: {word}")
-                continue
-                
-            current_segment_words.append(word)
-            
-            # Decide if we should end the segment
-            should_split = False
-            
-            # Check if next word has a significant pause
-            if i < len(words) - 1:
-                next_word = words[i + 1]
-                if 'start' in next_word and 'end' in word:
-                    pause_duration = next_word['start'] - word['end']
-                    if pause_duration >= self.pause_threshold:
-                        should_split = True
-            
-            # Last word always ends segment
-            if i == len(words) - 1:
-                should_split = True
-            
-            if should_split and current_segment_words:
-                # Create segment
-                first_word = current_segment_words[0]
-                last_word = current_segment_words[-1]
-                
-                # Validate timestamps
-                if 'start' not in first_word or 'end' not in last_word:
-                    print("⚠ Skipping segment with invalid timestamps")
-                    current_segment_words = []
-                    continue
-                
-                # Calculate confidence
-                confidences = [w.get('probability', 1.0) for w in current_segment_words if 'probability' in w]
-                if not confidences:
-                    avg_confidence = 1.0
-                else:
-                    avg_confidence = sum(confidences) / len(confidences)
-                
-                # Build text - words already have spaces
-                segment_text = ''.join([w.get('word', '') for w in current_segment_words]).strip()
-                
-                segment_duration_s = last_word['end'] - first_word['start']
-                
-                # Validate text and length before adding segment
-                if self.validate_segment_text(segment_text) and segment_duration_s >= self.min_segment_length:
-                    segments.append({
-                        'start_ms': int(first_word['start'] * 1000),
-                        'end_ms': int(last_word['end'] * 1000),
-                        'duration': segment_duration_s,
-                        'words': current_segment_words.copy(),
-                        'text': segment_text,
-                        'confidence': avg_confidence
-                    })
-                    print(f"✓ Created segment: {segment_duration_s:.2f}s, '{segment_text[:50]}...'")
-                else:
-                    print(f"⚠ Skipping segment: {segment_duration_s:.2f}s, text valid: {self.validate_segment_text(segment_text)}")
-                
-                # Reset for next segment
-                current_segment_words = []
-        
-        print(f"✓ Created {len(segments)} segments from word timestamps")
-        return segments
-    
-    def is_noisy(self, audio_chunk: AudioSegment) -> bool:
-        """Check if audio chunk is too noisy/low quality using RMS"""
-        if not self.filter_noise:
-            return False
-        
-        samples = np.array(audio_chunk.get_array_of_samples())
-        samples_float = samples.astype(np.float32)
-        
-        # Normalize to [-1, 1] range
-        if audio_chunk.sample_width == 2:  # 16-bit
-            samples_float = samples_float / 32768.0
-        elif audio_chunk.sample_width == 4:  # 32-bit
-            samples_float = samples_float / 2147483648.0
-        
-        # Calculate RMS
-        rms = np.sqrt(np.mean(samples_float**2))
-        
-        is_noisy = rms < self.min_rms
-        if is_noisy:
-            print(f"  ⚠ Noisy segment detected: RMS={rms:.4f} < {self.min_rms:.4f}")
-        
-        return is_noisy
+        self.logger.info("SpeechSplitter ready")
     
     def process_file(self, audio_path: str, speaker_id: Optional[str] = None) -> Dict:
-        """
-        Process audio file: transcribe with Whisper, segment by word timestamps, export
-        
-        Whisper-only approach:
-        1. Transcribe entire audio with Whisper (word timestamps)
-        2. Segment based on natural pauses between words
-        3. YAMNet music filter (optional)
-        4. Noise filter (optional)
-        5. Confidence filter
-        6. Export with perfect audio/text alignment
-        """
+        """Process a single audio file"""
         audio_path = Path(audio_path)
         base_name = speaker_id or audio_path.stem
         
-        print(f"\n{'='*60}")
-        print(f"Processing: {audio_path.name}")
-        print(f"Speaker: {base_name}")
-        print(f"{'='*60}\n")
+        self.logger.info(f"Processing file: {audio_path.name}", extra={
+            'speaker': base_name,
+            'path': str(audio_path)
+        })
         
-        # Setup output directories
-        file_output_dir = self.output_dir / base_name
-        audio_dir = file_output_dir / "audio"
-        text_dir = file_output_dir / "transcripts"
+        # Load and prepare audio
+        audio, original_sr = AudioProcessor.load_and_prepare(audio_path, self.logger)
         
-        audio_dir.mkdir(parents=True, exist_ok=True)
-        text_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Step 1: Load and preprocess audio
-        print("Loading audio...")
-        try:
-            audio = AudioSegment.from_file(audio_path)
-        except Exception as e:
-            print(f"✗ Error loading audio: {e}")
-            return {
-                'total_segments': 0,
-                'total_duration': 0,
-                'avg_duration': 0,
-                'metadata_file': None,
-                'manifest_file': None
-            }
-        
-        # Convert to mono and 16kHz for Whisper
-        if audio.channels > 1:
-            audio = audio.set_channels(1)
-        if audio.frame_rate != 16000:
-            audio = audio.set_frame_rate(16000)
-        
-        print(f"✓ Loaded: {len(audio)/1000:.1f}s, {audio.frame_rate}Hz, {audio.channels} channel(s)\n")
-        
-        # Step 2: Transcribe entire audio with Whisper
-        # Export audio to temp file for Whisper
+        # Transcribe with WhisperX
         import tempfile
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
             audio.export(tmp.name, format='wav')
-            temp_audio_path = tmp.name
+            temp_path = tmp.name
         
         try:
-            transcription_result = self.transcribe_full_audio(temp_audio_path)
+            transcription = self.transcription_manager.transcribe(temp_path, str(audio_path))
         finally:
-            os.unlink(temp_audio_path)
+            os.unlink(temp_path)
         
-        # Debug information
-        print(f"Transcription result keys: {list(transcription_result.keys())}")
-        print(f"Number of words: {len(transcription_result.get('words', []))}")
-        if transcription_result.get('words'):
-            print(f"Sample words: {transcription_result.get('words', [])[:3]}")
-        
-        # Step 3: Segment by word timestamps
-        segments = self.segment_by_pauses(transcription_result['words'])
+        # Segment by sentences
+        segments = self.segmentation_engine.segment_by_sentences(transcription['words'], audio)
         
         if not segments:
-            print("⚠ No segments created")
-            return {
-                'total_segments': 0,
-                'total_duration': 0,
-                'avg_duration': 0,
-                'metadata_file': None,
-                'manifest_file': None
-            }
+            self.logger.warning("No valid segments found")
+            return {'total_segments': 0, 'total_duration': 0, 'avg_duration': 0}
         
-        # Step 4: Filter segments
-        print(f"\nFiltering {len(segments)} segments...")
-        filtered_segments = []
-        filtered_music = 0
-        filtered_noise = 0
-        filtered_confidence = 0
-        filtered_text = 0
+        # Filter segments
+        filtered_segments = self.segment_filter.filter_segments(segments, audio)
         
-        for seg in tqdm(segments, desc="Filtering"):
-            # Extract audio chunk for filtering
-            chunk = audio[seg['start_ms']:seg['end_ms']]
-            
-            # Music filter
-            if self.yamnet_filter and self.yamnet_filter.model:
-                is_filtered, classification = self.yamnet_filter.is_music_or_mixed(
-                    chunk,
-                    self.music_threshold,
-                    self.mixed_threshold
-                )
-                if is_filtered:
-                    filtered_music += 1
-                    print(f"  ⚠ Filtered music segment: {seg['duration']:.2f}s")
-                    continue
-            
-            # Noise filter
-            if self.is_noisy(chunk):
-                filtered_noise += 1
-                continue
-            
-            # Confidence filter
-            if seg['confidence'] < self.min_confidence:
-                filtered_confidence += 1
-                print(f"  ⚠ Filtered low confidence segment: {seg['confidence']:.3f} < {self.min_confidence:.3f}")
-                continue
-            
-            # Text validation (double-check)
-            if not self.validate_segment_text(seg['text']):
-                filtered_text += 1
-                print(f"  ⚠ Filtered invalid text segment: '{seg['text']}'")
-                continue
-            
-            filtered_segments.append(seg)
+        # Export segments
+        output_files = self.export_manager.export_segments(audio, filtered_segments, base_name, original_sr)
         
-        print(f"\n✓ Kept {len(filtered_segments)} segments")
-        if filtered_music > 0:
-            print(f"⚠ Filtered {filtered_music} segments (music/mixed)")
-        if filtered_noise > 0:
-            print(f"⚠ Filtered {filtered_noise} segments (noisy, RMS < {self.min_rms:.3f})")
-        if filtered_confidence > 0:
-            print(f"⚠ Filtered {filtered_confidence} segments (low confidence < {self.min_confidence:.2f})")
-        if filtered_text > 0:
-            print(f"⚠ Filtered {filtered_text} segments (invalid text)")
+        # Log cache statistics
+        if self._yamnet_filter and self._yamnet_filter.available:
+            stats = self._yamnet_filter.get_cache_stats()
+            self.logger.info(f"YAMNet Cache: {stats['cache_hits']} hits, "
+                           f"{stats['cache_misses']} misses, "
+                           f"{stats['hit_rate']:.1f}% hit rate")
         
-        # Step 5: Export audio and text files
-        output_files = self.export_segments(audio, filtered_segments, base_name, audio_dir, text_dir)
-        
-        # Generate metadata
-        metadata = {
-            'source_file': str(audio_path.name),
-            'speaker_id': speaker_id,
-            'language': self.language,
-            'total_segments': len(output_files),
-            'segments': [
-                {
-                    'audio': Path(audio).name,
-                    'transcript': Path(transcript).name,
-                    **meta
-                }
-                for audio, transcript, meta in output_files
-            ]
-        }
-        
-        metadata_path = file_output_dir / f"{base_name}_metadata.json"
-        with open(metadata_path, 'w', encoding='utf-8') as f:
-            json.dump(metadata, f, ensure_ascii=False, indent=2)
-        
-        # Generate manifest
-        manifest_path = file_output_dir / f"{base_name}_manifest.txt"
-        with open(manifest_path, 'w', encoding='utf-8') as f:
-            for audio_file, transcript_file, _ in output_files:
-                f.write(f"{Path(audio_file).name}|{Path(transcript_file).name}\n")
-        
-        # Print summary
+        # Summary
         total_duration = sum(m['duration'] for _, _, m in output_files)
         avg_duration = total_duration / len(output_files) if output_files else 0
         
-        print(f"\n{'='*60}")
-        print(f"SUMMARY")
-        print(f"{'='*60}")
-        print(f"Segments: {len(output_files)}")
-        print(f"Duration: {total_duration:.2f}s")
-        print(f"Average: {avg_duration:.2f}s per segment")
-        print(f"Output: {file_output_dir}")
-        print(f"{'='*60}\n")
+        self.logger.info("File processing complete", extra={
+            'segments': len(output_files),
+            'duration': total_duration,
+            'avg_duration': avg_duration
+        })
         
         return {
             'total_segments': len(output_files),
             'total_duration': total_duration,
-            'avg_duration': avg_duration,
-            'metadata_file': str(metadata_path),
-            'manifest_file': str(manifest_path)
+            'avg_duration': avg_duration
         }
+    
+    def generate_metadata(self):
+        """Generate metadata for all exported segments"""
+        self.export_manager.generate_metadata(self.params['language'])
 
-    def export_segments(
-            self,
-            audio: AudioSegment,
-            segments: List[Dict],
-            base_name: str,
-            audio_dir: Path,
-            text_dir: Path
-    ) -> List[Tuple[str, str, Dict]]:
-        """Export audio chunks and transcripts to per-file directories"""
-        print(f"Exporting {len(segments)} segments...")
 
-        silence = AudioSegment.silent(duration=self.silence_padding_ms)
-        output_files = []
-
-        for idx, seg in enumerate(tqdm(segments, desc="Exporting"), 1):
-            # Final text validation
-            if not self.validate_segment_text(seg['text']):
-                print(f"⚠ Skipping segment {idx} due to invalid text")
-                continue
-
-            chunk_name = f"{base_name}_{idx:04d}"
-
-            # Extract audio using Whisper word timestamps with buffer for complete word capture
-            start_ms = int(seg['start_ms'])
-            end_ms = int(seg['end_ms'])
-
-            # Add buffer to ensure complete word capture at the end
-            buffered_end_ms = min(end_ms + self.word_boundary_buffer_ms, len(audio))
-            audio_chunk = audio[start_ms:buffered_end_ms]
-
-            # Add configured silence padding at the end
-            audio_chunk = audio_chunk + silence
-
-            # NEW: Re-transcribe the filtered audio segment to get accurate text
-            final_text = seg['text'].strip()  # Default to original text
-
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
-                temp_chunk_path = tmp.name
-                # Export the exact same audio chunk that will be saved - no conversion needed
-                audio_chunk.export(temp_chunk_path, format='wav')
-
-            try:
-                # Re-transcribe this specific segment to get text matching the actual audio
-                retranscription = self.model.transcribe(
-                    temp_chunk_path,
-                    language=self.language,
-                    word_timestamps=False,
-                    verbose=False
-                )
-                retranscribed_text = retranscription['text'].strip()
-
-                # Only use re-transcribed text if it's valid
-                if self.validate_segment_text(retranscribed_text):
-                    final_text = retranscribed_text
-                    print(f"  ℹ Re-transcribed segment {idx}: '{seg['text'][:30]}...' → '{final_text[:30]}...'")
-                else:
-                    print(f"  ℹ Using original transcription for segment {idx} (re-transcription invalid)")
-            except Exception as e:
-                print(f"  ⚠ Re-transcription failed for segment {idx}: {e}")
-            finally:
-                # Clean up temp file
-                os.unlink(temp_chunk_path)
-
-            # Export audio (this is the unchanged, original audio chunk)
-            audio_file = audio_dir / f"{chunk_name}.{self.export_format}"
-            audio_chunk.export(
-                audio_file,
-                format=self.export_format,
-                parameters=["-ar", "22050"]
-            )
-
-            # Export transcript with the final text (either re-transcribed or original)
-            transcript_file = text_dir / f"{chunk_name}.txt"
-            with open(transcript_file, 'w', encoding='utf-8') as f:
-                f.write(final_text)
-
-            metadata = {
-                'duration': seg['duration'],
-                'text_length': len(final_text)
-            }
-
-            output_files.append((str(audio_file), str(transcript_file), metadata))
-            print(f"  ✓ Exported: {chunk_name} ({seg['duration']:.2f}s)")
-
-        print(f"✓ Exported {len(output_files)} segments")
-        return output_files
-
+# =============================================================================
+# CLI
+# =============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Speech Splitter - Whisper-only with perfect alignment"
+        description="Speech Splitter v4 - Sentence-Based TTS Data Generator",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument('input', help='Input audio file')
-    parser.add_argument('--model', default='large', help='Whisper model size')
-    parser.add_argument('--language', default='cs', help='Language code')
-    parser.add_argument('--output-dir', default='output', help='Output directory')
-    parser.add_argument('--speaker-id', help='Speaker ID')
-    parser.add_argument('--silence-padding', type=int, default=150, help='Silence padding (ms)')
-    parser.add_argument('--min-length', type=float, default=1.0, help='Min segment length (s)')
-    parser.add_argument('--max-length', type=float, default=15.0, help='Max segment length (s)')
-    parser.add_argument('--format', default='wav', choices=['wav', 'mp3'], help='Output format')
-    parser.add_argument('--pause-threshold', type=float, default=0.5, help='Pause threshold for segmentation (s)')
-    parser.add_argument('--min-confidence', type=float, default=0.5, help='Min transcription confidence (0.0-1.0)')
-    parser.add_argument('--filter-noise', action='store_true', help='Enable noise filtering')
-    parser.add_argument('--min-rms', type=float, default=0.01, help='Min RMS energy (default 0.01)')
-    parser.add_argument('--filter-music', action='store_true', default=True, help='Enable YAMNet music filtering')
-    parser.add_argument('--music-threshold', type=float, default=0.3, help='Music detection threshold (default 0.3)')
-    parser.add_argument('--mixed-threshold', type=float, default=0.2, help='Music+speech detection threshold (default 0.2)')
-    parser.add_argument('--word-buffer', type=int, default=350, help='Word boundary buffer (ms, default 350)')
+    
+    # Required
+    parser.add_argument('input', help="Input audio file or directory")
+    
+    # Model settings
+    parser.add_argument('--model', default='large', help="Whisper model size")
+    parser.add_argument('--language', default='cs', help="Language code")
+    parser.add_argument('--batch-size', type=int, default=6, help="Transcription batch size")
+    parser.add_argument('--device', default=None, choices=['cuda', 'cpu'], help="Force device")
+    
+    # Output settings
+    parser.add_argument('--output-dir', default='output', help="Output directory")
+    parser.add_argument('--speaker-id', help="Speaker ID for naming")
+    parser.add_argument('--format', default='wav', choices=['wav', 'mp3'], help="Output format")
+    
+    # Segmentation
+    parser.add_argument('--min-length', type=float, default=1.0, help="Minimum segment length (seconds)")
+    parser.add_argument('--max-length', type=float, default=15.0, help="Maximum segment length (seconds)")
+    
+    # Quality filtering
+    parser.add_argument('--min-confidence', type=float, default=0.5, help="Minimum confidence score")
+    parser.add_argument('--filter-music', action='store_true', default=True, help="Filter music segments")
+    parser.add_argument('--music-threshold', type=float, default=0.3, help="Music detection threshold")
+    parser.add_argument('--mixed-threshold', type=float, default=0.2, help="Mixed audio threshold")
+    parser.add_argument('--filter-noise', action='store_true', help="Filter noisy/silent segments")
+    parser.add_argument('--noise-silence-threshold', type=float, default=0.3, help="Silence threshold")
+    
+    # Audio processing
+    parser.add_argument('--word-start-buffer', type=int, default=250, help="Start buffer (ms)")
+    parser.add_argument('--word-end-buffer', type=int, default=250, help="End buffer (ms)")
+    parser.add_argument('--trim-threshold-db', type=float, default=-45.0, help="Silence trim threshold (dB)")
+    parser.add_argument('--trim-chunk-ms', type=int, default=10, help="Trim analysis chunk size (ms)")
+    parser.add_argument('--trim-pad-ms', type=int, default=50, help="Trim padding (ms)")
+    
+    # Cutoff detection
+    parser.add_argument('--check-cutoff', action='store_true', help="Enable cutoff detection")
+    parser.add_argument('--cutoff-boundary-ms', type=int, default=75, help="Cutoff detection boundary (ms)")
+    parser.add_argument('--cutoff-silence-threshold', type=float, default=0.35, help="Cutoff RMS threshold")
+    parser.add_argument('--cutoff-action', default='extend', choices=['skip', 'extend', 'include'],
+                       help="Action for cutoff segments")
+    
+    # Actions
+    parser.add_argument('--overlength-action', default='rename', choices=['rename', 'skip', 'include'],
+                       help="Action for overlength segments")
+    
+    # Logging
+    parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+                       help="Logging level")
     
     args = parser.parse_args()
     
-    splitter = SpeechSplitter(
-        whisper_model=args.model,
-        language=args.language,
-        output_dir=args.output_dir,
-        silence_padding_ms=args.silence_padding,
-        min_segment_length=args.min_length,
-        max_segment_length=args.max_length,
-        export_format=args.format,
-        pause_threshold=args.pause_threshold,
-        min_confidence=args.min_confidence,
-        filter_noise=args.filter_noise,
-        min_rms=args.min_rms,
-        filter_music=args.filter_music,
-        music_threshold=args.music_threshold,
-        mixed_threshold=args.mixed_threshold,
-        word_boundary_buffer_ms=args.word_buffer
-    )
+    # GPU check
+    import logging
+    temp_logger = logging.getLogger("Startup")
+    temp_logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+    temp_logger.addHandler(handler)
     
-    splitter.process_file(args.input, args.speaker_id)
+    temp_logger.info("=== Speech Splitter v4 - Sentence-Based ===")
+    check_gpu(temp_logger)
+    temp_logger.handlers.clear()
+    
+    # Create splitter
+    try:
+        splitter = SpeechSplitter(
+            whisper_model=args.model,
+            language=args.language,
+            batch_size=args.batch_size,
+            output_dir=args.output_dir,
+            min_segment_length=args.min_length,
+            max_segment_length=args.max_length,
+            export_format=args.format,
+            min_confidence=args.min_confidence,
+            filter_noise=args.filter_noise,
+            noise_silence_threshold=args.noise_silence_threshold,
+            filter_music=args.filter_music,
+            music_threshold=args.music_threshold,
+            mixed_threshold=args.mixed_threshold,
+            word_start_buffer_ms=args.word_start_buffer,
+            word_end_buffer_ms=args.word_end_buffer,
+            check_cutoff=args.check_cutoff,
+            cutoff_boundary_ms=args.cutoff_boundary_ms,
+            cutoff_silence_threshold=args.cutoff_silence_threshold,
+            cutoff_action=args.cutoff_action,
+            overlength_action=args.overlength_action,
+            trim_threshold_db=args.trim_threshold_db,
+            trim_chunk_ms=args.trim_chunk_ms,
+            trim_pad_ms=args.trim_pad_ms,
+            device=args.device,
+            log_level=args.log_level
+        )
+    except RuntimeError as e:
+        print(f"\nERROR: {e}")
+        print("\nPlease install WhisperX:")
+        print("pip install git+https://github.com/m-bain/whisperx.git")
+        return 1
+    
+    # Process input
+    input_path = Path(args.input)
+    if input_path.is_file():
+        splitter.process_file(str(input_path), args.speaker_id)
+    elif input_path.is_dir():
+        audio_files = []
+        for ext in ['*.wav', '*.mp3', '*.flac', '*.m4a', '*.ogg']:
+            audio_files.extend(input_path.glob(ext))
+        
+        splitter.logger.info(f"Processing directory: {len(audio_files)} files")
+        for audio_file in sorted(audio_files):
+            speaker_id = args.speaker_id or audio_file.stem
+            splitter.process_file(str(audio_file), speaker_id)
+    else:
+        splitter.logger.error(f"Invalid input path: {args.input}")
+        return 1
+    
+    # Generate metadata
+    splitter.generate_metadata()
+    splitter.logger.info("=== All processing complete ===")
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main() or 0)
