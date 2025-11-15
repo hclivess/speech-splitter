@@ -5,7 +5,6 @@ Handles: Model loading, transcription, alignment, caching
 
 import os
 import json
-import hashlib
 import logging
 from pathlib import Path
 from typing import Dict, Optional
@@ -28,10 +27,6 @@ class TranscriptionManager:
         except ImportError:
             raise RuntimeError("WhisperX not found. Install: pip install git+https://github.com/m-bain/whisperx.git")
         
-        # Cache directory
-        self.cache_dir = Path.home() / '.cache' / 'speech_splitter_transcriptions'
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        
         # Load model
         self.logger.info(f"Loading WhisperX model: {model_name}")
         self.model = whisperx.load_model(
@@ -42,22 +37,16 @@ class TranscriptionManager:
         )
         self.logger.info("✓ WhisperX model loaded")
     
-    def _get_cache_key(self, audio_path: str) -> str:
-        """Generate cache key from file content"""
-        with open(audio_path, 'rb') as f:
-            file_hash = hashlib.md5(f.read()).hexdigest()
-        return f"{self.model_name}_{self.language}_{file_hash}"
-    
     def transcribe(self, audio_path: str, original_path: str) -> Dict:
-        """Transcribe audio with caching"""
-        cache_key = self._get_cache_key(audio_path)
-        cache_file = self.cache_dir / f"{cache_key}.json"
+        """Transcribe audio with caching - saves as <filename>.transcription.json alongside source"""
+        # Cache alongside source file with clear name
+        source_cache = Path(original_path).with_suffix('.transcription.json')
         
-        # Check cache
-        if cache_file.exists():
-            self.logger.info("Loading transcription from cache")
+        # Check for cache
+        if source_cache.exists():
+            self.logger.info(f"Loading cached transcription: {source_cache.name}")
             try:
-                with open(cache_file, encoding='utf-8') as f:
+                with open(source_cache, encoding='utf-8') as f:
                     return json.load(f)
             except Exception as e:
                 self.logger.warning(f"Cache read failed: {e}, re-transcribing")
@@ -130,10 +119,11 @@ class TranscriptionManager:
             'aligned': 'words' in result.get('segments', [{}])[0] if result.get('segments') else False
         }
         
-        # Save to cache
+        # Save cache alongside source file
         try:
-            self.logger.debug(f"Saving transcription cache: {cache_file.name}")
-            with open(cache_file, 'w', encoding='utf-8') as f:
+            source_cache = Path(original_path).with_suffix('.transcription.json')
+            self.logger.info(f"Saving transcription: {source_cache.name}")
+            with open(source_cache, 'w', encoding='utf-8') as f:
                 json.dump(transcription_data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             self.logger.warning(f"Cache save failed: {e}")

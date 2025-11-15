@@ -250,8 +250,8 @@ class SpeechSplitterGUI(QMainWindow):
         
         model_layout.addWidget(QLabel("Whisper Model:"), 0, 0)
         self.model_combo = QComboBox()
-        self.model_combo.addItems(['tiny', 'base', 'small', 'medium', 'large', 'turbo'])
-        self.model_combo.setCurrentText('large')
+        self.model_combo.addItems(['tiny', 'base', 'small', 'medium', 'large', 'large-v2', 'large-v3', 'turbo'])
+        self.model_combo.setCurrentText('large-v2')
         model_layout.addWidget(self.model_combo, 0, 1)
         
         model_layout.addWidget(QLabel("Language:"), 1, 0)
