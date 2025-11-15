@@ -67,7 +67,7 @@ class ExportManager:
             # Check if trimming removed too much (might indicate the segment was mostly silence)
             trim_ratio = len(trimmed_chunk) / len(audio_chunk) if len(audio_chunk) > 0 else 1.0
             if trim_ratio < 0.3:
-                self.logger.debug(f"Segment {idx} heavily trimmed ({trim_ratio:.1%}), might be mostly silence")
+                self.logger.info(f"Segment {idx} heavily trimmed ({trim_ratio:.1%}), might be mostly silence")
             
             # NOW check for cutoffs on the TRIMMED audio
             if self.params.get('check_cutoff', False):
@@ -144,7 +144,7 @@ class ExportManager:
             # Handle overlength segments
             suffix = ""
             if duration > self.params['max_segment_length']:
-                self.logger.debug(f"Segment {idx} overlength: {duration:.2f}s")
+                self.logger.info(f"Segment {idx} overlength: {duration:.2f}s")
                 if self.params['overlength_action'] == 'skip':
                     continue
                 suffix = "_LONG"
@@ -242,10 +242,10 @@ class ExportManager:
             cutoff_info = self._check_for_cutoff_detailed(extended_trimmed, is_start=is_start)
             
             if not cutoff_info['has_cutoff']:
-                self.logger.debug(f"    Extension {actual_extension}ms resolved cutoff")
+                self.logger.info(f"    Extension {actual_extension}ms resolved cutoff")
                 return extended_trimmed
             else:
-                self.logger.debug(
+                self.logger.info(
                     f"    Extension {actual_extension}ms still has cutoff "
                     f"(RMS: {cutoff_info['max_rms']:.3f})"
                 )
@@ -327,7 +327,7 @@ class ExportManager:
             }
             
         except Exception as e:
-            self.logger.debug(f"Cutoff check error: {e}")
+            self.logger.info(f"Cutoff check error: {e}")
             return {'has_cutoff': False, 'max_rms': 0.0, 'windows_over_threshold': 0, 'total_windows': 0}
     
     def _get_validated_boundaries(

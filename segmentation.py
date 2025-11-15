@@ -35,7 +35,7 @@ class SegmentationEngine:
 
         for i, word in enumerate(words):
             if 'start' not in word or 'end' not in word:
-                self.logger.debug(f"Skipping word: missing timestamps")
+                self.logger.info(f"Skipping word: missing timestamps")
                 continue
 
             current_words.append(word)

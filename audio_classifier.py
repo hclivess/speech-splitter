@@ -57,7 +57,7 @@ class YAMNetFilter:
                 try:
                     for gpu in gpus:
                         tf.config.experimental.set_memory_growth(gpu, True)
-                    self.logger.debug("TensorFlow GPU memory growth enabled")
+                    self.logger.info("TensorFlow GPU memory growth enabled")
                 except RuntimeError as e:
                     self.logger.warning(f"GPU config error: {e}")
             
@@ -131,7 +131,7 @@ class YAMNetFilter:
             if 'silence' in name.lower() or 'quiet' in name.lower()
         ]
         
-        self.logger.debug(f"Class indices: music={len(self.music_indices)}, "
+        self.logger.info(f"Class indices: music={len(self.music_indices)}, "
                          f"speech={len(self.speech_indices)}, "
                          f"mixed={len(self.mixed_indices)}, "
                          f"silence={len(self.silence_indices)}")
@@ -195,7 +195,7 @@ class YAMNetFilter:
             return result
             
         except Exception as e:
-            self.logger.debug(f"YAMNet classification error: {e}")
+            self.logger.info(f"YAMNet classification error: {e}")
             # Return safe defaults on error
             return AudioClassification(music=0.0, speech=1.0, music_speech_mixed=0.0, silence=0.0)
     

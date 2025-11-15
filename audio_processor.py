@@ -25,7 +25,7 @@ class AudioProcessor:
             # Convert to mono once
             if audio.channels > 1:
                 audio = audio.set_channels(1)
-                logger.debug("Converted to mono")
+                logger.info("Converted to mono")
             
             logger.info(f"Audio loaded: {len(audio)/1000:.1f}s, {audio.frame_rate}Hz")
             return audio, original_sr
