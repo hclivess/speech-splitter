@@ -43,6 +43,7 @@ class ExportManager:
         
         output_files = []
         skipped_cutoff = 0
+        export_counter = 1  # Track actual export numbering
         
         for idx, seg in enumerate(segments, 1):
             # Get validated boundaries (without cutoff check yet)
@@ -141,17 +142,23 @@ class ExportManager:
             duration = len(trimmed_chunk) / 1000.0
             
             # Handle overlength segments
+            suffix = ""
             if duration > self.params['max_segment_length']:
                 self.logger.debug(f"Segment {idx} overlength: {duration:.2f}s")
                 if self.params['overlength_action'] == 'skip':
                     continue
                 suffix = "_LONG"
-            else:
-                suffix = ""
             
-            chunk_name = f"{base_name}_{idx:04d}{suffix}"
-            audio_file = self._get_unique_filename(self.audio_dir, chunk_name, f".{self.params['export_format']}")
-            transcript_file = self._get_unique_filename(self.text_dir, chunk_name, ".txt")
+            # Use export_counter for sequential numbering
+            chunk_name = f"{base_name}_{export_counter:04d}{suffix}"
+            audio_file = self.audio_dir / f"{chunk_name}.{self.params['export_format']}"
+            transcript_file = self.text_dir / f"{chunk_name}.txt"
+            
+            # Ensure files don't exist (shouldn't happen with sequential counter)
+            if audio_file.exists() or transcript_file.exists():
+                self.logger.warning(f"File collision detected for {chunk_name}, using fallback naming")
+                audio_file = self._get_unique_filename(self.audio_dir, chunk_name, f".{self.params['export_format']}")
+                transcript_file = self._get_unique_filename(self.text_dir, chunk_name, ".txt")
             
             # Export files
             trimmed_chunk.export(
@@ -169,6 +176,7 @@ class ExportManager:
             }
             
             output_files.append((str(audio_file), str(transcript_file), metadata))
+            export_counter += 1  # Increment only on successful export
         
         # Log cutoff statistics
         if self.params.get('check_cutoff', False):
@@ -361,7 +369,7 @@ class ExportManager:
         """Generate metadata files for the exported segments"""
         self.logger.info("Generating metadata...")
         
-        audio_files = list(self.audio_dir.glob(f"*.{self.params['export_format']}"))
+        audio_files = sorted(self.audio_dir.glob(f"*.{self.params['export_format']}"))
         if not audio_files:
             self.logger.warning("No audio files found")
             return
