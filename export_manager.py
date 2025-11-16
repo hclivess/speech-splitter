@@ -1,6 +1,11 @@
 """
 Export manager for segment export and metadata generation
 Handles: File export, cutoff detection, metadata creation
+
+IMPROVED VERSION:
+- More aggressive end-trimming to remove fragments
+- Better fragment detection after silence
+- Enhanced cutoff detection for artifacts
 """
 
 import json
@@ -32,7 +37,8 @@ class ExportManager:
             'start_cutoffs_detected': 0,
             'end_cutoffs_detected': 0,
             'extensions_successful': 0,
-            'extensions_failed': 0
+            'extensions_failed': 0,
+            'fragments_removed': 0  # NEW: Track fragment removal
         }
     
     def export_segments(self, audio: AudioSegment, segments: List[SegmentData], 
@@ -55,14 +61,8 @@ class ExportManager:
             # Extract audio chunk
             audio_chunk = audio[start_ms:end_ms]
             
-            # Trim silence (with end trimming enabled)
-            trimmed_chunk = AudioProcessor.trim_silence_vectorized(
-                audio_chunk,
-                self.params['trim_threshold_db'],
-                self.params['trim_chunk_ms'],
-                self.params['trim_pad_ms'],
-                trim_end=True
-            )
+            # IMPROVED: More aggressive trimming with fragment detection
+            trimmed_chunk = self._trim_and_remove_fragments(audio_chunk)
             
             # Check if trimming removed too much (might indicate the segment was mostly silence)
             trim_ratio = len(trimmed_chunk) / len(audio_chunk) if len(audio_chunk) > 0 else 1.0
@@ -184,50 +184,172 @@ class ExportManager:
             self.logger.info("CUTOFF DETECTION STATISTICS:")
             self.logger.info(f"  Start cutoffs detected: {self.cutoff_stats['start_cutoffs_detected']}")
             self.logger.info(f"  End cutoffs detected: {self.cutoff_stats['end_cutoffs_detected']}")
-            self.logger.info(f"  Extensions successful: {self.cutoff_stats['extensions_successful']}")
-            self.logger.info(f"  Extensions failed: {self.cutoff_stats['extensions_failed']}")
-            self.logger.info(f"  Total segments skipped: {skipped_cutoff}")
+            if self.params.get('cutoff_action') == 'extend':
+                self.logger.info(f"  Extensions successful: {self.cutoff_stats['extensions_successful']}")
+                self.logger.info(f"  Extensions failed: {self.cutoff_stats['extensions_failed']}")
+            self.logger.info(f"  Segments skipped due to cutoffs: {skipped_cutoff}")
             self.logger.info("="*70)
         
-        if skipped_cutoff > 0:
-            self.logger.warning(f"⚠️  Cutoff detection: {skipped_cutoff} segments skipped")
+        if self.cutoff_stats['fragments_removed'] > 0:
+            self.logger.info(f"  Fragments removed from segment ends: {self.cutoff_stats['fragments_removed']}")
         
-        self.logger.info(f"✓ Exported {len(output_files)} segments")
-        
+        self.logger.info(f"Exported {len(output_files)} segments")
         return output_files
     
-    def _try_extend_segment(
-        self, 
-        audio: AudioSegment, 
-        start_ms: int, 
-        end_ms: int, 
-        seg: SegmentData,
-        is_start: bool,
-        max_extension_ms: int = 1000
-    ) -> Optional[AudioSegment]:
+    def _trim_and_remove_fragments(self, audio_chunk: AudioSegment) -> AudioSegment:
         """
-        Try to extend segment with progressively larger extensions until cutoff is resolved.
-        Returns extended and trimmed audio, or None if extension fails.
-        """
-        # Try extensions: 200ms, 500ms, 800ms, 1000ms
-        extension_steps = [200, 500, 800, max_extension_ms]
+        IMPROVED: Aggressive trimming with fragment detection
         
-        for extension_ms in extension_steps:
+        This function:
+        1. Trims silence from both start and end
+        2. Detects and removes isolated fragments after silence
+        3. Returns clean audio
+        """
+        # Step 1: Standard silence trimming (both ends)
+        trimmed = AudioProcessor.trim_silence_vectorized(
+            audio_chunk,
+            self.params['trim_threshold_db'],
+            self.params['trim_chunk_ms'],
+            self.params['trim_pad_ms'],
+            trim_end=True  # Always trim the end
+        )
+        
+        # Step 2: Fragment detection and removal at the end
+        fragment_removed = self._detect_and_remove_end_fragment(trimmed)
+        
+        if fragment_removed is not None and len(fragment_removed) < len(trimmed):
+            self.cutoff_stats['fragments_removed'] += 1
+            return fragment_removed
+        
+        return trimmed
+    
+    def _detect_and_remove_end_fragment(self, audio_chunk: AudioSegment, 
+                                       silence_threshold_db: float = -40.0,
+                                       min_silence_duration_ms: int = 200,
+                                       max_fragment_duration_ms: int = 300) -> Optional[AudioSegment]:
+        """
+        Detect and remove word fragments that appear after a silence gap at the end.
+        
+        Algorithm:
+        1. Scan from the end backward
+        2. Find any speech (above threshold)
+        3. Continue backward to find silence gap
+        4. If silence gap is significant (>200ms) and fragment is small (<300ms), remove it
+        
+        Returns: Trimmed audio without fragment, or None if no fragment detected
+        """
+        if len(audio_chunk) < min_silence_duration_ms + 100:
+            return None
+        
+        try:
+            # Convert to numpy for analysis
+            samples = np.array(audio_chunk.get_array_of_samples())
+            frame_rate = audio_chunk.frame_rate
+            
+            # Calculate RMS in small windows (10ms chunks)
+            window_ms = 10
+            window_samples = int(frame_rate * window_ms / 1000)
+            
+            if window_samples == 0:
+                return None
+            
+            # Calculate RMS for each window
+            num_windows = len(samples) // window_samples
+            if num_windows < 10:
+                return None
+            
+            rms_values = []
+            for i in range(num_windows):
+                start = i * window_samples
+                end = start + window_samples
+                window = samples[start:end]
+                rms = np.sqrt(np.mean(window**2))
+                
+                # Convert to dB
+                max_amplitude = 2**(audio_chunk.sample_width * 8 - 1)
+                with np.errstate(divide='ignore'):
+                    db = 20 * np.log10(rms / max_amplitude + 1e-10)
+                rms_values.append(db)
+            
+            # Scan from end backward
+            is_speech = [db > silence_threshold_db for db in rms_values]
+            
+            # Find last speech region
+            last_speech_idx = None
+            for i in range(len(is_speech) - 1, -1, -1):
+                if is_speech[i]:
+                    last_speech_idx = i
+                    break
+            
+            if last_speech_idx is None or last_speech_idx < 10:
+                return None
+            
+            # Find the start of this speech region (go backward from last_speech_idx)
+            fragment_start_idx = last_speech_idx
+            for i in range(last_speech_idx, -1, -1):
+                if is_speech[i]:
+                    fragment_start_idx = i
+                else:
+                    break
+            
+            # Calculate fragment duration
+            fragment_duration_ms = (last_speech_idx - fragment_start_idx + 1) * window_ms
+            
+            # Find silence gap before fragment
+            silence_end_idx = fragment_start_idx
+            silence_start_idx = None
+            
+            for i in range(fragment_start_idx - 1, -1, -1):
+                if not is_speech[i]:
+                    silence_start_idx = i
+                else:
+                    break
+            
+            if silence_start_idx is None:
+                return None
+            
+            silence_duration_ms = (silence_end_idx - silence_start_idx) * window_ms
+            
+            # Decision: Remove if significant silence before small fragment
+            if (silence_duration_ms >= min_silence_duration_ms and 
+                fragment_duration_ms <= max_fragment_duration_ms):
+                
+                # Cut at the start of the silence gap
+                cut_point_ms = silence_start_idx * window_ms
+                
+                if cut_point_ms > 0 and cut_point_ms < len(audio_chunk):
+                    return audio_chunk[:cut_point_ms]
+            
+            return None
+            
+        except Exception as e:
+            self.logger.debug(f"Fragment detection error: {e}")
+            return None
+    
+    def _try_extend_segment(self, audio: AudioSegment, start_ms: int, end_ms: int, 
+                           seg: SegmentData, is_start: bool, max_extension_ms: int = 1000) -> Optional[AudioSegment]:
+        """Try to extend segment boundaries to resolve cutoffs"""
+        extensions = [100, 250, 500, 750, 1000]
+        
+        for extension in extensions:
+            if extension > max_extension_ms:
+                break
+            
+            # Calculate new boundaries
             if is_start:
-                # Extend backwards
-                max_extension = start_ms - (seg.prev_word_end_ms or 0)
-                actual_extension = min(extension_ms, max_extension)
-                new_start = max(0, start_ms - actual_extension)
-                
-                extended_chunk = audio[new_start:end_ms]
+                new_start = max(0, start_ms - extension)
+                new_end = end_ms
+                actual_extension = start_ms - new_start
             else:
-                # Extend forwards
-                audio_length_ms = len(audio)
-                max_extension = (seg.next_word_start_ms or audio_length_ms) - end_ms
-                actual_extension = min(extension_ms, max_extension)
-                new_end = min(audio_length_ms, end_ms + actual_extension)
-                
-                extended_chunk = audio[start_ms:new_end]
+                new_start = start_ms
+                new_end = min(len(audio), end_ms + extension)
+                actual_extension = new_end - end_ms
+            
+            if actual_extension < 10:  # No meaningful extension possible
+                continue
+            
+            # Extract extended chunk
+            extended_chunk = audio[new_start:new_end]
             
             # Trim the extended chunk
             extended_trimmed = AudioProcessor.trim_silence_vectorized(
@@ -350,9 +472,8 @@ class ExportManager:
         if prev_word_end_ms is not None:
             validated_start = max(validated_start, prev_word_end_ms)
         
-        # Prevent overlap with next word
-        if next_word_start_ms is not None:
-            validated_end = min(validated_end, next_word_start_ms)
+        # IMPROVED: Don't extend to next word (prevents including fragments)
+        # The segmentation already ends at the last word, so we just add a small buffer
         
         return validated_start, validated_end
     
@@ -410,7 +531,7 @@ class ExportManager:
         
         # Save HuggingFace metadata.csv
         with open(self.output_dir / "metadata.csv", 'w', encoding='utf-8') as f:
-            f.write("file_name,text\n")
+            f.write("file_name,transcription\n")
             for seg in segments:
                 text = (self.text_dir / seg['transcript']).read_text(encoding='utf-8').strip().replace('"', '""')
                 f.write(f'"{seg["audio"]}","{text}"\n')

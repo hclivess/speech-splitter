@@ -1,6 +1,11 @@
 """
 Segmentation engine for splitting audio by sentence boundaries
 Uses punctuation (., !, ?) to detect natural speech breaks
+
+IMPROVED VERSION:
+- Does NOT include pause gaps to next words (prevents fragment inclusion)
+- Uses word-end boundaries instead of next-word-start boundaries
+- More conservative segmentation to avoid artifacts
 """
 
 import re
@@ -22,7 +27,12 @@ class SegmentationEngine:
         self.sentence_endings = re.compile(r'[.!?]+\s*$')
 
     def segment_by_sentences(self, words: List[Dict], audio: AudioSegment) -> List[SegmentData]:
-        """Segment audio by sentence boundaries (fullstops, !, ?)"""
+        """
+        Segment audio by sentence boundaries (fullstops, !, ?)
+        
+        IMPROVED: Segments end at the last word's END time, not at the next word's START time.
+        This prevents including fragments that appear after silence gaps.
+        """
         if not words:
             self.logger.warning("No words found for segmentation")
             return []
@@ -67,11 +77,9 @@ class SegmentationEngine:
                         words[segment_start_idx - 1]['end'] * 1000) if segment_start_idx > 0 else None
                     next_word_start_ms = int(words[i + 1]['start'] * 1000) if i + 1 < len(words) else None
 
-                    # Include any pause gap after the sentence if there's a next word
-                    end_ms = next_word_start_ms if next_word_start_ms is not None else int(last_word['end'] * 1000)
-
-                    # Duration is speech-only (without pause gap) for filtering
-                    duration = last_word['end'] - first_word['start']
+                    # IMPROVED: End at last word's END, not next word's START
+                    # This prevents including fragments after silence gaps
+                    end_ms = int(last_word['end'] * 1000)
 
                     if self._validate_segment_text(text) and duration >= self.params['min_segment_length']:
                         segment = SegmentData(
@@ -82,7 +90,7 @@ class SegmentationEngine:
                             text=text,
                             confidence=sum(w.get('probability', 1.0) for w in current_words) / len(current_words),
                             prev_word_end_ms=prev_word_end_ms,
-                            next_word_start_ms=next_word_start_ms
+                            next_word_start_ms=next_word_start_ms  # Keep for reference but don't use for end_ms
                         )
                         segments.append(segment)
                         stats['segments_created'] += 1
