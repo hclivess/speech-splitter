@@ -47,6 +47,17 @@ class ExportManager:
 
         self.logger.info("EXPORTING SEGMENTS")
         
+        # Log cutoff detection status
+        if self.params.get('check_cutoff', False):
+            self.logger.info(
+                f"Cutoff detection ENABLED: "
+                f"boundary={self.params.get('cutoff_boundary_ms', 75)}ms, "
+                f"threshold={self.params.get('cutoff_silence_threshold', 0.35):.2f}, "
+                f"action={self.params.get('cutoff_action', 'skip')}"
+            )
+        else:
+            self.logger.info("Cutoff detection DISABLED")
+        
         output_files = []
         skipped_cutoff = 0
         export_counter = 1  # Track actual export numbering
@@ -61,18 +72,11 @@ class ExportManager:
             # Extract audio chunk
             audio_chunk = audio[start_ms:end_ms]
             
-            # IMPROVED: More aggressive trimming with fragment detection
-            trimmed_chunk = self._trim_and_remove_fragments(audio_chunk)
-            
-            # Check if trimming removed too much (might indicate the segment was mostly silence)
-            trim_ratio = len(trimmed_chunk) / len(audio_chunk) if len(audio_chunk) > 0 else 1.0
-            if trim_ratio < 0.3:
-                self.logger.info(f"Segment {idx} heavily trimmed ({trim_ratio:.1%}), might be mostly silence")
-            
-            # NOW check for cutoffs on the TRIMMED audio
+            # CHECK FOR CUTOFFS FIRST (before trimming removes them!)
+            cutoff_detected = False
             if self.params.get('check_cutoff', False):
-                cutoff_info_start = self._check_for_cutoff_detailed(trimmed_chunk, is_start=True)
-                cutoff_info_end = self._check_for_cutoff_detailed(trimmed_chunk, is_start=False)
+                cutoff_info_start = self._check_for_cutoff_detailed(audio_chunk, is_start=True)
+                cutoff_info_end = self._check_for_cutoff_detailed(audio_chunk, is_start=False)
                 
                 has_start_cutoff = cutoff_info_start['has_cutoff']
                 has_end_cutoff = cutoff_info_end['has_cutoff']
@@ -87,27 +91,15 @@ class ExportManager:
                         f"[RMS: {cutoff_info_start['max_rms']:.3f}, "
                         f"Windows: {cutoff_info_start['windows_over_threshold']}/{cutoff_info_start['total_windows']}]"
                     )
+                    cutoff_detected = True
                     
-                    if cutoff_action == 'extend':
-                        # Try extending with progressively larger extensions
-                        extended_chunk = self._try_extend_segment(
-                            audio, start_ms, end_ms, seg, 
-                            is_start=True, max_extension_ms=1000
-                        )
-                        
-                        if extended_chunk is not None:
-                            self.cutoff_stats['extensions_successful'] += 1
-                            self.logger.info(f"  ✓ Start extension successful")
-                            trimmed_chunk = extended_chunk
-                        else:
-                            self.cutoff_stats['extensions_failed'] += 1
-                            self.logger.error(f"  ✗ Start extension failed, SKIPPING segment")
-                            skipped_cutoff += 1
-                            continue
-                    elif cutoff_action == 'skip':
+                    if cutoff_action == 'skip':
                         self.logger.error(f"  ✗ SKIPPING segment with start cutoff")
                         skipped_cutoff += 1
                         continue
+                    elif cutoff_action == 'rename':
+                        self.logger.info(f"  → Will rename with _CUTOFF suffix")
+                    # else: 'include' - do nothing, export normally
                 
                 # Handle end cutoff
                 if has_end_cutoff:
@@ -117,37 +109,34 @@ class ExportManager:
                         f"[RMS: {cutoff_info_end['max_rms']:.3f}, "
                         f"Windows: {cutoff_info_end['windows_over_threshold']}/{cutoff_info_end['total_windows']}]"
                     )
+                    cutoff_detected = True
                     
-                    if cutoff_action == 'extend':
-                        # Try extending with progressively larger extensions
-                        extended_chunk = self._try_extend_segment(
-                            audio, start_ms, end_ms, seg, 
-                            is_start=False, max_extension_ms=1000
-                        )
-                        
-                        if extended_chunk is not None:
-                            self.cutoff_stats['extensions_successful'] += 1
-                            self.logger.info(f"  ✓ End extension successful")
-                            trimmed_chunk = extended_chunk
-                        else:
-                            self.cutoff_stats['extensions_failed'] += 1
-                            self.logger.error(f"  ✗ End extension failed, SKIPPING segment")
-                            skipped_cutoff += 1
-                            continue
-                    elif cutoff_action == 'skip':
+                    if cutoff_action == 'skip':
                         self.logger.error(f"  ✗ SKIPPING segment with end cutoff")
                         skipped_cutoff += 1
                         continue
+                    elif cutoff_action == 'rename':
+                        self.logger.info(f"  → Will rename with _CUTOFF suffix")
+                    # else: 'include' - do nothing, export normally
             
+            # NOW do the trimming (after cutoff detection)
+            # IMPROVED: More aggressive trimming with fragment detection
+            trimmed_chunk = self._trim_and_remove_fragments(audio_chunk)
             duration = len(trimmed_chunk) / 1000.0
             
-            # Handle overlength segments
+            # Build filename suffix
             suffix = ""
+            
+            # Add cutoff suffix if detected and action is rename
+            if cutoff_detected and self.params.get('cutoff_action', 'skip') == 'rename':
+                suffix += "_CUTOFF"
+            
+            # Handle overlength segments
             if duration > self.params['max_segment_length']:
                 self.logger.info(f"Segment {idx} overlength: {duration:.2f}s")
                 if self.params['overlength_action'] == 'skip':
                     continue
-                suffix = "_LONG"
+                suffix += "_LONG"
             
             # Use export_counter for sequential numbering
             chunk_name = f"{base_name}_{export_counter:04d}{suffix}"
@@ -382,8 +371,8 @@ class ExportManager:
         if not self.params.get('check_cutoff', False):
             return {'has_cutoff': False, 'max_rms': 0.0, 'windows_over_threshold': 0, 'total_windows': 0}
         
-        boundary_ms = self.params.get('cutoff_boundary_ms', 50)
-        threshold = self.params.get('cutoff_silence_threshold', 0.35)
+        boundary_ms = self.params.get('cutoff_boundary_ms', 75)
+        threshold = self.params.get('cutoff_silence_threshold', 0.15)
         
         # Need sufficient audio for analysis
         if len(audio_chunk) < boundary_ms:
@@ -431,15 +420,27 @@ class ExportManager:
                 return {'has_cutoff': False, 'max_rms': 0.0, 'windows_over_threshold': 0, 'total_windows': 0}
             
             max_rms = max(rms_values)
+            avg_rms = sum(rms_values) / len(rms_values)
             total_windows = len(rms_values)
             
             # Cutoff detected if:
             # 1. At least 40% of windows are over threshold, OR
-            # 2. Any single window has RMS > threshold * 1.5 (very loud)
+            # 2. Any single window has RMS > threshold * 1.5 (very loud), OR
+            # 3. Average RMS across boundary > threshold * 0.8
             has_cutoff = (
                 (windows_over_threshold >= total_windows * 0.4) or
-                (max_rms > threshold * 1.5)
+                (max_rms > threshold * 1.5) or
+                (avg_rms > threshold * 0.8)
             )
+            
+            # Debug logging when close to threshold
+            if max_rms > threshold * 0.5 or avg_rms > threshold * 0.5:
+                position = "START" if is_start else "END"
+                self.logger.debug(
+                    f"{position} analysis: max_rms={max_rms:.3f}, avg_rms={avg_rms:.3f}, "
+                    f"threshold={threshold:.3f}, windows_over={windows_over_threshold}/{total_windows}, "
+                    f"detected={has_cutoff}"
+                )
             
             return {
                 'has_cutoff': has_cutoff,

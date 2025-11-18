@@ -268,6 +268,13 @@ class SpeechSplitterGUI(QMainWindow):
         self.batch_size_spin.setToolTip("Higher = faster but more VRAM. Lower if you get OOM errors.")
         model_layout.addWidget(self.batch_size_spin, 2, 1)
         
+        model_layout.addWidget(QLabel("Device:"), 3, 0)
+        self.device_combo = QComboBox()
+        self.device_combo.addItems(['auto', 'cuda', 'cpu'])
+        self.device_combo.setCurrentText('auto')
+        self.device_combo.setToolTip("auto = use GPU if available, cuda = force GPU, cpu = force CPU")
+        model_layout.addWidget(self.device_combo, 3, 1)
+        
         model_group.setLayout(model_layout)
         layout.addWidget(model_group)
         
@@ -406,14 +413,16 @@ class SpeechSplitterGUI(QMainWindow):
         cutoff_layout.addWidget(QLabel("  RMS Threshold:"), 2, 0)
         self.cutoff_silence_threshold_spin = QDoubleSpinBox()
         self.cutoff_silence_threshold_spin.setRange(0.0, 1.0)
-        self.cutoff_silence_threshold_spin.setValue(0.35)
+        self.cutoff_silence_threshold_spin.setValue(0.15)
         self.cutoff_silence_threshold_spin.setSingleStep(0.05)
+        self.cutoff_silence_threshold_spin.setToolTip("Lower = more sensitive. Audio at segment boundaries above this RMS level indicates a cutoff.")
         cutoff_layout.addWidget(self.cutoff_silence_threshold_spin, 2, 1)
         
         cutoff_layout.addWidget(QLabel("  Action:"), 3, 0)
         self.cutoff_action_combo = QComboBox()
-        self.cutoff_action_combo.addItems(['skip', 'extend', 'include'])
-        self.cutoff_action_combo.setCurrentText('extend')
+        self.cutoff_action_combo.addItems(['include', 'skip', 'rename'])
+        self.cutoff_action_combo.setCurrentText('skip')
+        self.cutoff_action_combo.setToolTip("include = export normally, skip = don't export, rename = add _CUTOFF suffix")
         cutoff_layout.addWidget(self.cutoff_action_combo, 3, 1)
         
         cutoff_group.setLayout(cutoff_layout)
@@ -651,10 +660,12 @@ class SpeechSplitterGUI(QMainWindow):
         QMessageBox.critical(self, "Error", f"Processing failed:\n\n{error_msg}")
     
     def get_settings(self):
+        device = self.device_combo.currentText()
         return {
             'whisper_model': self.model_combo.currentText(),
             'language': self.language_combo.currentText(),
             'batch_size': self.batch_size_spin.value(),
+            'device': None if device == 'auto' else device,
             'output_dir': self.output_input.text(),
             'speaker_id': self.speaker_input.text() or None,
             'min_segment_length': self.min_length_spin.value(),
@@ -709,6 +720,7 @@ class SpeechSplitterGUI(QMainWindow):
         self.model_combo.setCurrentText('large')
         self.language_combo.setCurrentText('cs')
         self.batch_size_spin.setValue(6)
+        self.device_combo.setCurrentText('auto')
         self.min_length_spin.setValue(1.0)
         self.max_length_spin.setValue(15.0)
         
@@ -725,8 +737,8 @@ class SpeechSplitterGUI(QMainWindow):
         self.word_end_buffer_spin.setValue(250)
         self.check_cutoff_check.setChecked(False)
         self.cutoff_boundary_spin.setValue(75)
-        self.cutoff_silence_threshold_spin.setValue(0.35)
-        self.cutoff_action_combo.setCurrentText('extend')
+        self.cutoff_silence_threshold_spin.setValue(0.15)
+        self.cutoff_action_combo.setCurrentText('skip')
         self.overlength_action_combo.setCurrentText('rename')
         
         # Output
@@ -766,6 +778,8 @@ class SpeechSplitterGUI(QMainWindow):
         self.model_combo.setCurrentText(settings.get('whisper_model', 'large'))
         self.language_combo.setCurrentText(settings.get('language', 'cs'))
         self.batch_size_spin.setValue(settings.get('batch_size', 6))
+        device = settings.get('device', None)
+        self.device_combo.setCurrentText('auto' if device is None else device)
         self.output_input.setText(settings.get('output_dir', 'output'))
         self.speaker_input.setText(settings.get('speaker_id', ''))
         self.min_length_spin.setValue(settings.get('min_segment_length', 1.0))
@@ -781,8 +795,8 @@ class SpeechSplitterGUI(QMainWindow):
         self.word_end_buffer_spin.setValue(settings.get('word_end_buffer_ms', 250))
         self.check_cutoff_check.setChecked(settings.get('check_cutoff', False))
         self.cutoff_boundary_spin.setValue(settings.get('cutoff_boundary_ms', 75))
-        self.cutoff_silence_threshold_spin.setValue(settings.get('cutoff_silence_threshold', 0.35))
-        self.cutoff_action_combo.setCurrentText(settings.get('cutoff_action', 'extend'))
+        self.cutoff_silence_threshold_spin.setValue(settings.get('cutoff_silence_threshold', 0.15))
+        self.cutoff_action_combo.setCurrentText(settings.get('cutoff_action', 'skip'))
         self.overlength_action_combo.setCurrentText(settings.get('overlength_action', 'rename'))
         self.trim_silence_check.setChecked(settings.get('trim_silence', True))
         self.trim_threshold_spin.setValue(settings.get('trim_threshold_db', -45.0))

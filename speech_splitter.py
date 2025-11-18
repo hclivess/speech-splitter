@@ -219,9 +219,9 @@ def main():
     # Cutoff detection
     parser.add_argument('--check-cutoff', action='store_true', help="Enable cutoff detection")
     parser.add_argument('--cutoff-boundary-ms', type=int, default=75, help="Cutoff detection boundary (ms)")
-    parser.add_argument('--cutoff-silence-threshold', type=float, default=0.35, help="Cutoff RMS threshold")
-    parser.add_argument('--cutoff-action', default='extend', choices=['skip', 'extend', 'include'],
-                       help="Action for cutoff segments")
+    parser.add_argument('--cutoff-silence-threshold', type=float, default=0.15, help="Cutoff RMS threshold (lower = more sensitive)")
+    parser.add_argument('--cutoff-action', default='skip', choices=['include', 'skip', 'rename'],
+                       help="Action for cutoff segments: include=export normally, skip=don't export, rename=add _CUTOFF suffix")
     
     # Actions
     parser.add_argument('--overlength-action', default='rename', choices=['rename', 'skip', 'include'],
