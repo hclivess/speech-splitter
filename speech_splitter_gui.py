@@ -404,26 +404,12 @@ class SpeechSplitterGUI(QMainWindow):
         self.check_cutoff_check.setChecked(False)
         cutoff_layout.addWidget(self.check_cutoff_check, 0, 0, 1, 2)
         
-        cutoff_layout.addWidget(QLabel("  Boundary (ms):"), 1, 0)
-        self.cutoff_boundary_spin = QSpinBox()
-        self.cutoff_boundary_spin.setRange(10, 200)
-        self.cutoff_boundary_spin.setValue(75)
-        cutoff_layout.addWidget(self.cutoff_boundary_spin, 1, 1)
-        
-        cutoff_layout.addWidget(QLabel("  RMS Threshold:"), 2, 0)
-        self.cutoff_silence_threshold_spin = QDoubleSpinBox()
-        self.cutoff_silence_threshold_spin.setRange(0.0, 1.0)
-        self.cutoff_silence_threshold_spin.setValue(0.15)
-        self.cutoff_silence_threshold_spin.setSingleStep(0.05)
-        self.cutoff_silence_threshold_spin.setToolTip("Lower = more sensitive. Audio at segment boundaries above this RMS level indicates a cutoff.")
-        cutoff_layout.addWidget(self.cutoff_silence_threshold_spin, 2, 1)
-        
-        cutoff_layout.addWidget(QLabel("  Action:"), 3, 0)
+        cutoff_layout.addWidget(QLabel("  Action:"), 1, 0)
         self.cutoff_action_combo = QComboBox()
         self.cutoff_action_combo.addItems(['include', 'skip', 'rename'])
         self.cutoff_action_combo.setCurrentText('skip')
         self.cutoff_action_combo.setToolTip("include = export normally, skip = don't export, rename = add _CUTOFF suffix")
-        cutoff_layout.addWidget(self.cutoff_action_combo, 3, 1)
+        cutoff_layout.addWidget(self.cutoff_action_combo, 1, 1)
         
         cutoff_group.setLayout(cutoff_layout)
         layout.addWidget(cutoff_group)
@@ -680,8 +666,6 @@ class SpeechSplitterGUI(QMainWindow):
             'word_start_buffer_ms': self.word_start_buffer_spin.value(),
             'word_end_buffer_ms': self.word_end_buffer_spin.value(),
             'check_cutoff': self.check_cutoff_check.isChecked(),
-            'cutoff_boundary_ms': self.cutoff_boundary_spin.value(),
-            'cutoff_silence_threshold': self.cutoff_silence_threshold_spin.value(),
             'cutoff_action': self.cutoff_action_combo.currentText(),
             'overlength_action': self.overlength_action_combo.currentText(),
             'trim_threshold_db': self.trim_threshold_spin.value(),
@@ -736,8 +720,6 @@ class SpeechSplitterGUI(QMainWindow):
         self.word_start_buffer_spin.setValue(250)
         self.word_end_buffer_spin.setValue(250)
         self.check_cutoff_check.setChecked(False)
-        self.cutoff_boundary_spin.setValue(75)
-        self.cutoff_silence_threshold_spin.setValue(0.15)
         self.cutoff_action_combo.setCurrentText('skip')
         self.overlength_action_combo.setCurrentText('rename')
         
@@ -794,8 +776,6 @@ class SpeechSplitterGUI(QMainWindow):
         self.word_start_buffer_spin.setValue(settings.get('word_start_buffer_ms', 250))
         self.word_end_buffer_spin.setValue(settings.get('word_end_buffer_ms', 250))
         self.check_cutoff_check.setChecked(settings.get('check_cutoff', False))
-        self.cutoff_boundary_spin.setValue(settings.get('cutoff_boundary_ms', 75))
-        self.cutoff_silence_threshold_spin.setValue(settings.get('cutoff_silence_threshold', 0.15))
         self.cutoff_action_combo.setCurrentText(settings.get('cutoff_action', 'skip'))
         self.overlength_action_combo.setCurrentText(settings.get('overlength_action', 'rename'))
         self.trim_silence_check.setChecked(settings.get('trim_silence', True))
