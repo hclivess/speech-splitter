@@ -546,13 +546,13 @@ class SpeechSplitterGUI(QMainWindow):
             if file not in self.selected_files:
                 self.selected_files.append(file)
                 self.file_list.addItem(Path(file).name)
-    
+
     def add_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder with Audio Files")
         if folder:
             folder_path = Path(folder)
             for ext in ['*.wav', '*.mp3', '*.flac', '*.m4a', '*.ogg']:
-                for file in folder_path.glob(ext):
+                for file in folder_path.rglob(ext):  # <-- Use rglob instead of glob
                     file_str = str(file)
                     if file_str not in self.selected_files:
                         self.selected_files.append(file_str)
@@ -577,7 +577,7 @@ class SpeechSplitterGUI(QMainWindow):
                     self.file_list.addItem(path.name)
             elif path.is_dir():
                 for ext in ['*.wav', '*.mp3', '*.flac', '*.m4a', '*.ogg']:
-                    for file in path.glob(ext):
+                    for file in path.rglob(ext):
                         file_str = str(file)
                         if file_str not in self.selected_files:
                             self.selected_files.append(file_str)
