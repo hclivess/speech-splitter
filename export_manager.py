@@ -362,96 +362,88 @@ class ExportManager:
                 )
         
         return None
-    
+
     def _check_for_cutoff_detailed(self, audio_chunk: AudioSegment, is_start: bool = True) -> Dict:
         """
-        Enhanced cutoff detection with detailed diagnostics.
-        Returns dict with: has_cutoff, max_rms, windows_over_threshold, total_windows
+        ALTERNATIVE METHOD: Detect cutoffs by analyzing the waveform shape.
+
+        A cutoff shows as:
+        - Sudden jump from zero to high amplitude (start cutoff)
+        - Sudden jump from high amplitude to zero (end cutoff)
+        - No gradual fade-in/fade-out
+
+        This method looks at the first/last few milliseconds and checks
+        if the envelope rises/falls too abruptly.
         """
         if not self.params.get('check_cutoff', False):
-            return {'has_cutoff': False, 'max_rms': 0.0, 'windows_over_threshold': 0, 'total_windows': 0}
-        
-        boundary_ms = self.params.get('cutoff_boundary_ms', 75)
-        threshold = self.params.get('cutoff_silence_threshold', 0.15)
-        
-        # Need sufficient audio for analysis
-        if len(audio_chunk) < boundary_ms:
-            return {'has_cutoff': False, 'max_rms': 0.0, 'windows_over_threshold': 0, 'total_windows': 0}
-        
+            return {'has_cutoff': False}
+
+        if len(audio_chunk) < 50:
+            return {'has_cutoff': False}
+
         try:
-            # Analyze multiple small windows within the boundary
-            window_count = 5  # Increased from 3 for finer analysis
-            window_ms = boundary_ms // window_count
-            
-            if window_ms < 10:  # Minimum window size
-                window_ms = 10
-                window_count = boundary_ms // window_ms
-            
-            rms_values = []
-            windows_over_threshold = 0
-            
-            for i in range(window_count):
+            samples = np.array(audio_chunk.get_array_of_samples(), dtype=np.float64)
+            frame_rate = audio_chunk.frame_rate
+            max_amplitude = 2 ** (audio_chunk.sample_width * 8 - 1)
+
+            # Analyze first/last 10ms
+            analysis_ms = 10
+            analysis_samples = int(frame_rate * analysis_ms / 1000)
+            analysis_samples = max(50, min(analysis_samples, len(samples) // 10))
+
+            if is_start:
+                window = samples[:analysis_samples]
+            else:
+                window = samples[-analysis_samples:]
+
+            # Calculate envelope (absolute values)
+            envelope = np.abs(window)
+
+            # Smooth the envelope
+            if len(envelope) > 10:
+                kernel_size = min(5, len(envelope) // 5)
+                if kernel_size > 1:
+                    kernel = np.ones(kernel_size) / kernel_size
+                    envelope = np.convolve(envelope, kernel, mode='same')
+
+            # Check the gradient (rate of change)
+            if len(envelope) > 5:
+                # For start: should gradually increase if natural
+                # For end: should gradually decrease if natural
+
+                gradient = np.gradient(envelope)
+
                 if is_start:
-                    window_start = i * window_ms
-                    window_end = min(window_start + window_ms, len(audio_chunk))
+                    # Look for sudden jump at the beginning
+                    # Natural speech: slow rise
+                    # Cutoff: immediate high amplitude
+                    first_samples = envelope[:min(20, len(envelope) // 4)]
+                    max_at_start = np.max(first_samples) / max_amplitude
+
+                    # Check if starts too loud too fast
+                    has_cutoff = max_at_start > 0.3  # More than 30% amplitude immediately
                 else:
-                    window_end = len(audio_chunk) - (i * window_ms)
-                    window_start = max(0, window_end - window_ms)
-                
-                if window_end - window_start < 5:  # Skip if window too small
-                    continue
-                
-                boundary = audio_chunk[window_start:window_end]
-                
-                # Calculate RMS
-                samples = np.array(boundary.get_array_of_samples())
-                rms = np.sqrt(np.mean(samples**2))
-                
-                # Normalize RMS
-                max_amplitude = 2**(boundary.sample_width * 8 - 1)
-                normalized_rms = rms / max_amplitude
-                
-                rms_values.append(normalized_rms)
-                
-                if normalized_rms > threshold:
-                    windows_over_threshold += 1
-            
-            if not rms_values:
-                return {'has_cutoff': False, 'max_rms': 0.0, 'windows_over_threshold': 0, 'total_windows': 0}
-            
-            max_rms = max(rms_values)
-            avg_rms = sum(rms_values) / len(rms_values)
-            total_windows = len(rms_values)
-            
-            # Cutoff detected if:
-            # 1. At least 40% of windows are over threshold, OR
-            # 2. Any single window has RMS > threshold * 1.5 (very loud), OR
-            # 3. Average RMS across boundary > threshold * 0.8
-            has_cutoff = (
-                (windows_over_threshold >= total_windows * 0.4) or
-                (max_rms > threshold * 1.5) or
-                (avg_rms > threshold * 0.8)
-            )
-            
-            # Debug logging when close to threshold
-            if max_rms > threshold * 0.5 or avg_rms > threshold * 0.5:
-                position = "START" if is_start else "END"
-                self.logger.debug(
-                    f"{position} analysis: max_rms={max_rms:.3f}, avg_rms={avg_rms:.3f}, "
-                    f"threshold={threshold:.3f}, windows_over={windows_over_threshold}/{total_windows}, "
-                    f"detected={has_cutoff}"
-                )
-            
+                    # Look for sudden drop at the end
+                    # Natural speech: gradual decay
+                    # Cutoff: stays loud until abrupt end
+                    last_samples = envelope[-min(20, len(envelope) // 4):]
+                    max_at_end = np.max(last_samples) / max_amplitude
+
+                    # Check if ends too loud
+                    has_cutoff = max_at_end > 0.3
+            else:
+                has_cutoff = False
+
             return {
                 'has_cutoff': has_cutoff,
-                'max_rms': max_rms,
-                'windows_over_threshold': windows_over_threshold,
-                'total_windows': total_windows
+                'max_rms': np.max(envelope) / max_amplitude,
+                'windows_over_threshold': 1 if has_cutoff else 0,
+                'total_windows': 1
             }
-            
+
         except Exception as e:
-            self.logger.info(f"Cutoff check error: {e}")
-            return {'has_cutoff': False, 'max_rms': 0.0, 'windows_over_threshold': 0, 'total_windows': 0}
+            self.logger.warning(f"Alternative cutoff check error: {e}")
+            return {'has_cutoff': False}
     
     def _get_validated_boundaries(
         self,
