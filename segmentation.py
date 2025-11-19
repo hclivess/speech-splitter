@@ -26,7 +26,7 @@ class SegmentationEngine:
 
         # Sentence ending patterns - excludes numbers followed by period
         # Requires at least one letter before the punctuation
-        self.sentence_endings = re.compile(r'[a-zA-Z][.!?]+\s*$')
+        self.sentence_endings = re.compile(r'[a-zA-Z][.!?]+(?=\s*[A-Z]|$)')
 
     def segment_by_sentences(self, words: List[Dict], audio: AudioSegment) -> List[SegmentData]:
         """
