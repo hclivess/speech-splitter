@@ -6,6 +6,7 @@ IMPROVED VERSION:
 - Does NOT include pause gaps to next words (prevents fragment inclusion)
 - Uses word-end boundaries instead of next-word-start boundaries
 - More conservative segmentation to avoid artifacts
+- Avoids splitting on numbers followed by periods (e.g., "4.")
 """
 
 import re
@@ -23,15 +24,17 @@ class SegmentationEngine:
         self.params = params
         self.logger = logger
 
-        # Sentence ending patterns
-        self.sentence_endings = re.compile(r'[.!?]+\s*$')
+        # Sentence ending patterns - excludes numbers followed by period
+        # Requires at least one letter before the punctuation
+        self.sentence_endings = re.compile(r'[a-zA-Z][.!?]+\s*$')
 
     def segment_by_sentences(self, words: List[Dict], audio: AudioSegment) -> List[SegmentData]:
         """
         Segment audio by sentence boundaries (fullstops, !, ?)
-        
+
         IMPROVED: Segments end at the last word's END time, not at the next word's START time.
         This prevents including fragments that appear after silence gaps.
+        Also avoids splitting on numbers like "4."
         """
         if not words:
             self.logger.warning("No words found for segmentation")
@@ -53,7 +56,7 @@ class SegmentationEngine:
             should_split = False
             word_text = word.get('word', '').strip()
 
-            # Check if word ends with sentence punctuation
+            # Check if word ends with sentence punctuation (but not just a number with period)
             if self.sentence_endings.search(word_text):
                 should_split = True
                 stats['sentences_found'] += 1
