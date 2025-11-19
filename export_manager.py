@@ -363,23 +363,17 @@ class ExportManager:
         
         return None
 
-    def _check_for_cutoff_detailed(self, audio_chunk: AudioSegment, is_start: bool = True) -> Dict:
-        """
-        ALTERNATIVE METHOD: Detect cutoffs by analyzing the waveform shape.
+    def _check_for_cutoff_detailed(self, audio_chunk: AudioSegment, is_start: bool = True,
+                                   sensitivity: float = 0.1) -> Dict:
 
-        A cutoff shows as:
-        - Sudden jump from zero to high amplitude (start cutoff)
-        - Sudden jump from high amplitude to zero (end cutoff)
-        - No gradual fade-in/fade-out
-
-        This method looks at the first/last few milliseconds and checks
-        if the envelope rises/falls too abruptly.
-        """
         if not self.params.get('check_cutoff', False):
             return {'has_cutoff': False}
 
         if len(audio_chunk) < 50:
             return {'has_cutoff': False}
+
+        # Clamp sensitivity to valid range
+        sensitivity = max(0.0, min(1.0, sensitivity))
 
         try:
             samples = np.array(audio_chunk.get_array_of_samples(), dtype=np.float64)
@@ -421,7 +415,7 @@ class ExportManager:
                     max_at_start = np.max(first_samples) / max_amplitude
 
                     # Check if starts too loud too fast
-                    has_cutoff = max_at_start > 0.3  # More than 30% amplitude immediately
+                    has_cutoff = max_at_start > sensitivity
                 else:
                     # Look for sudden drop at the end
                     # Natural speech: gradual decay
@@ -430,7 +424,7 @@ class ExportManager:
                     max_at_end = np.max(last_samples) / max_amplitude
 
                     # Check if ends too loud
-                    has_cutoff = max_at_end > 0.3
+                    has_cutoff = max_at_end > sensitivity
             else:
                 has_cutoff = False
 
