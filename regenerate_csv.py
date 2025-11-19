@@ -3,7 +3,9 @@
 Regenerate metadata.csv from scratch by scanning for all existing audio files 
 and automatically retrieving transcriptions from corresponding .txt files.
 
-Audio file: base_dir/speaker_name/audio/file_name.wav
+This version processes ALL subdirectories in the base directory, treating each as a speaker.
+
+Audio file: base_dir/speaker_name/audio/file_name.wav or .mp3
 Transcription file: base_dir/speaker_name/transcripts/file_name.txt
 
 Optional: Rename files to hash-based names (first 8 chars of SHA256).
@@ -26,13 +28,14 @@ def compute_file_hash(file_path: Path) -> str:
     return sha256_hash.hexdigest()[:8]
 
 
-def regenerate_metadata_csv(base_dir: str, speaker_name: str):
+def regenerate_metadata_csv(base_dir: str, speaker_name: str, global_rename: bool = None):
     """
     Regenerate metadata.csv by scanning for audio files and reading transcripts.
     
     Args:
         base_dir: Base output directory
         speaker_name: Speaker folder name
+        global_rename: If None, ask user. If True/False, use that value.
     """
     
     base_path = Path(base_dir) / speaker_name
@@ -44,9 +47,8 @@ def regenerate_metadata_csv(base_dir: str, speaker_name: str):
     MISSING_TRANSCRIPT_PLACEHOLDER = "!!! MISSING TRANSCRIPT FILE !!!"
     
     print("="*70)
-    print("METADATA.CSV AUTOMATED REGENERATION TOOL")
+    print(f"PROCESSING SPEAKER: {speaker_name}")
     print("="*70)
-    print(f"\nSpeaker: {speaker_name}")
     print(f"Metadata (will be created/overwritten): {metadata_path}")
     print(f"Audio dir: {audio_dir}")
     print(f"Transcripts dir: {transcripts_dir}")
@@ -54,34 +56,38 @@ def regenerate_metadata_csv(base_dir: str, speaker_name: str):
     # Check if directories exist
     if not audio_dir.exists():
         print(f"\n❌ ERROR: audio directory not found at: {audio_dir}")
+        print(f"   Skipping this speaker.\n")
         return False
     
     if not transcripts_dir.exists():
-        print(f"\n❌ WARNING: transcripts directory not found at: {transcripts_dir}")
+        print(f"\n⚠️ WARNING: transcripts directory not found at: {transcripts_dir}")
         print(f"           Using '{MISSING_TRANSCRIPT_PLACEHOLDER}' for all entries.")
         
-    # Find all .wav files
+    # Find all audio files (.wav and .mp3)
     print(f"\n🔍 Scanning for audio files in {audio_dir}...")
-    audio_files = sorted(list(audio_dir.glob("*.wav")))
+    audio_files = sorted(list(audio_dir.glob("*.wav")) + list(audio_dir.glob("*.mp3")))
     
     if not audio_files:
-        print(f"\n❌ ERROR: No .wav files found in the audio directory.")
+        print(f"\n❌ ERROR: No .wav or .mp3 files found in the audio directory.")
+        print(f"   Skipping this speaker.\n")
         return False
         
-    print(f"   ✓ Found {len(audio_files)} .wav files.")
+    print(f"   ✓ Found {len(audio_files)} audio files (.wav/.mp3).")
 
-    # Ask about renaming
-    print("\n" + "="*70)
-    print("FILE RENAMING OPTION")
-    print("="*70)
-    print("Would you like to rename all files to hash-based names?")
-    print("  - Files will be renamed using first 8 chars of SHA256 hash")
-    print("  - Both .wav and .txt files will be renamed to match")
-    print("  - A mapping file will be created: filename_mapping.csv")
-    print("  - Example: old_recording_123.wav → a3f9b2c1.wav")
-    
-    rename_response = input("\nRename files? (yes/no): ").strip().lower()
-    should_rename = rename_response in ['yes', 'y']
+    # Ask about renaming (only if not already decided globally)
+    should_rename = global_rename
+    if should_rename is None:
+        print("\n" + "="*70)
+        print("FILE RENAMING OPTION")
+        print("="*70)
+        print("Would you like to rename all files to hash-based names?")
+        print("  - Files will be renamed using first 8 chars of SHA256 hash")
+        print("  - Both audio and .txt files will be renamed to match")
+        print("  - A mapping file will be created: filename_mapping.csv")
+        print("  - Example: old_recording_123.wav → a3f9b2c1.wav")
+        
+        rename_response = input("\nRename files? (yes/no): ").strip().lower()
+        should_rename = rename_response in ['yes', 'y']
     
     rename_mapping = {}
     
@@ -99,7 +105,8 @@ def regenerate_metadata_csv(base_dir: str, speaker_name: str):
                 print(f"   This is extremely rare. Please report this issue.")
                 return False
             hash_to_files[file_hash] = f_wav.name
-            rename_mapping[f_wav.name] = f"{file_hash}.wav"
+            # Preserve original extension
+            rename_mapping[f_wav.name] = f"{file_hash}{f_wav.suffix}"
         
         print(f"   ✓ No hash collisions detected.")
         print(f"\nPreview of renaming (first 5):")
@@ -107,12 +114,6 @@ def regenerate_metadata_csv(base_dir: str, speaker_name: str):
             print(f"   {old_name} → {new_name}")
         if len(rename_mapping) > 5:
             print(f"   ... and {len(rename_mapping) - 5} more")
-        
-        confirm_rename = input(f"\n⚠️ Proceed with renaming? (yes/no): ").strip().lower()
-        if confirm_rename not in ['yes', 'y']:
-            print("\n❌ Renaming cancelled. Proceeding without renaming.")
-            should_rename = False
-            rename_mapping = {}
 
     # Prepare data for new CSV
     new_data = []
@@ -150,11 +151,10 @@ def regenerate_metadata_csv(base_dir: str, speaker_name: str):
 
     # Report missing files
     if missing_count > 0:
-        print(f"   ❌ WARNING: {missing_count} corresponding .txt files were not found or could not be read.")
+        print(f"   ⚠️ WARNING: {missing_count} corresponding .txt files were not found or could not be read.")
         print(f"              These entries will use the placeholder: '{MISSING_TRANSCRIPT_PLACEHOLDER}'")
     else:
         print("   ✓ All transcriptions found and loaded.")
-
 
     # Confirm regeneration
     print(f"\n⚠️  This will:")
@@ -169,9 +169,9 @@ def regenerate_metadata_csv(base_dir: str, speaker_name: str):
         backup_num = 5 if should_rename else 3
         print(f"   {backup_num}. Create backup of existing CSV: {backup_path.name}")
     
-    response = input(f"\n⚠️ Proceed with {'renaming and ' if should_rename else ''}regeneration? (yes/no): ").strip().lower()
+    response = input(f"\n⚠️ Proceed with {'renaming and ' if should_rename else ''}regeneration for {speaker_name}? (yes/no): ").strip().lower()
     if response not in ['yes', 'y']:
-        print("\n❌ Operation cancelled.")
+        print("\n❌ Operation cancelled for this speaker.")
         return False
     
     # Perform file renaming if requested
@@ -226,7 +226,7 @@ def regenerate_metadata_csv(base_dir: str, speaker_name: str):
     
     # Summary
     print(f"\n{'='*70}")
-    print("AUTOMATED REGENERATION COMPLETE")
+    print(f"COMPLETED: {speaker_name}")
     print("="*70)
     print(f"Files scanned: {len(audio_files)}")
     print(f"Entries generated: {len(df_new)}")
@@ -242,30 +242,91 @@ def regenerate_metadata_csv(base_dir: str, speaker_name: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Regenerate metadata.csv from scratch by scanning for all existing audio files and reading corresponding .txt transcripts"
+        description="Regenerate metadata.csv for ALL speakers by scanning subdirectories in base-dir"
     )
     parser.add_argument(
         '--base-dir',
         required=True,
-        help='Base output directory (e.g., C:/ChatterboxTraining/output)'
-    )
-    parser.add_argument(
-        '--speaker',
-        required=True,
-        help='Speaker folder name (e.g., "00 Prolog")'
+        help='Base output directory (e.g., C:/Users/trans/PycharmProjects/speech-splitter/output)'
     )
     
     args = parser.parse_args()
     
-    success = regenerate_metadata_csv(
-        base_dir=args.base_dir,
-        speaker_name=args.speaker
-    )
+    base_path = Path(args.base_dir)
     
-    if success:
-        print("✓ CSV regenerated. Check for '!!! MISSING TRANSCRIPT FILE !!!' placeholders.")
+    if not base_path.exists():
+        print(f"❌ ERROR: Base directory does not exist: {base_path}")
+        return
+    
+    # Find all subdirectories (each is a speaker)
+    speaker_dirs = [d for d in base_path.iterdir() if d.is_dir()]
+    
+    if not speaker_dirs:
+        print(f"❌ ERROR: No subdirectories found in: {base_path}")
+        print(f"   Each subdirectory should represent a speaker.")
+        return
+    
+    print("="*70)
+    print("MULTI-SPEAKER METADATA REGENERATION")
+    print("="*70)
+    print(f"Base directory: {base_path}")
+    print(f"Found {len(speaker_dirs)} speaker directories:")
+    for d in speaker_dirs:
+        print(f"  - {d.name}")
+    print("="*70)
+    
+    # Ask once about renaming for all speakers
+    print("\nFILE RENAMING OPTION (applies to ALL speakers)")
+    print("Would you like to rename files to hash-based names for all speakers?")
+    print("  - If 'yes': All speakers will have files renamed")
+    print("  - If 'no': No speakers will have files renamed")
+    print("  - If 'ask': You'll be asked for each speaker individually")
+    
+    rename_choice = input("\nRename files? (yes/no/ask): ").strip().lower()
+    
+    if rename_choice in ['yes', 'y']:
+        global_rename = True
+    elif rename_choice in ['ask', 'a']:
+        global_rename = None  # Ask for each speaker
     else:
-        print("✗ Regeneration failed")
+        global_rename = False
+    
+    print("\n")
+    
+    # Process each speaker
+    success_count = 0
+    failed_speakers = []
+    
+    for speaker_dir in speaker_dirs:
+        speaker_name = speaker_dir.name
+        
+        success = regenerate_metadata_csv(
+            base_dir=str(base_path),
+            speaker_name=speaker_name,
+            global_rename=global_rename
+        )
+        
+        if success:
+            success_count += 1
+        else:
+            failed_speakers.append(speaker_name)
+        
+        print("\n")
+    
+    # Final summary
+    print("="*70)
+    print("FINAL SUMMARY")
+    print("="*70)
+    print(f"Total speakers processed: {len(speaker_dirs)}")
+    print(f"Successfully completed: {success_count}")
+    print(f"Failed or skipped: {len(failed_speakers)}")
+    
+    if failed_speakers:
+        print(f"\nFailed/skipped speakers:")
+        for speaker in failed_speakers:
+            print(f"  - {speaker}")
+    
+    print("="*70)
 
 
 if __name__ == "__main__":

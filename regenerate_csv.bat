@@ -32,8 +32,7 @@ echo.
 
 REM Run regeneration script
 python regenerate_csv.py ^
-  --base-dir "%BASE_DIR%" ^
-  --speaker "%SPEAKER_NAME%"
+  --base-dir "%BASE_DIR%"
 
 if errorlevel 1 (
     echo.
