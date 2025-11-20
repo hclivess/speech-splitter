@@ -58,6 +58,8 @@ class SpeechSplitter:
             'word_start_buffer_ms': kwargs.get('word_start_buffer_ms', 250),
             'word_end_buffer_ms': kwargs.get('word_end_buffer_ms', 250),
             'check_cutoff': kwargs.get('check_cutoff', False),
+            'cutoff_check_mode': kwargs.get('cutoff_check_mode', 'both'),
+            'cutoff_sensitivity': kwargs.get('cutoff_sensitivity', 0.35),
             'cutoff_boundary_ms': kwargs.get('cutoff_boundary_ms', 50),
             'cutoff_silence_threshold': kwargs.get('cutoff_silence_threshold', 0.35),
             'cutoff_action': kwargs.get('cutoff_action', 'skip'),
@@ -185,7 +187,17 @@ def main():
     
     # Required
     parser.add_argument('input', help="Input audio file or directory")
-    
+
+    # Cutoff detection
+    parser.add_argument('--check-cutoff', action='store_true', help="Enable cutoff detection")
+    parser.add_argument('--cutoff-check-mode', default='both',
+                        choices=['both', 'start', 'end', 'none'],
+                        help="Which boundaries to check: both, start, end, or none")
+    parser.add_argument('--cutoff-sensitivity', type=float, default=0.35,
+                        help="Cutoff detection sensitivity (0.0-1.0, lower = more sensitive)")
+    parser.add_argument('--cutoff-action', default='skip',
+                        choices=['include', 'skip', 'rename'],
+                        help="Action for cutoff segments")
     # Model settings
     parser.add_argument('--model', default='large', help="Whisper model size")
     parser.add_argument('--language', default='cs', help="Language code")
@@ -264,6 +276,8 @@ def main():
             word_start_buffer_ms=args.word_start_buffer,
             word_end_buffer_ms=args.word_end_buffer,
             check_cutoff=args.check_cutoff,
+            cutoff_check_mode=args.cutoff_check_mode,
+            cutoff_sensitivity=args.cutoff_sensitivity,
             cutoff_boundary_ms=args.cutoff_boundary_ms,
             cutoff_silence_threshold=args.cutoff_silence_threshold,
             cutoff_action=args.cutoff_action,

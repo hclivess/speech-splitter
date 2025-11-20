@@ -20,7 +20,8 @@ MIN_BUFFER_DURATION_MS = 20
 MIN_TRIM_DURATION_MS = 200
 MAX_CACHE_SIZE = 1000
 CACHE_CLEANUP_RATIO = 0.25
-
+DEFAULT_CUTOFF_SENSITIVITY = 0.35
+CUTOFF_CHECK_OPTIONS = ['both', 'start', 'end', 'none']
 
 # =============================================================================
 # DATA CLASSES

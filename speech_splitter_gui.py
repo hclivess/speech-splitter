@@ -117,6 +117,9 @@ class ProcessingThread(QThread):
 class SpeechSplitterGUI(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.check_cutoff_check = None
+        self.cutoff_sensitivity_spin = None
+        self.cutoff_check_mode_combo = None
         self.processing_thread = None
         self.selected_files = []
         self.init_ui()
@@ -370,63 +373,84 @@ class SpeechSplitterGUI(QMainWindow):
         
         layout.addStretch()
         return widget
-    
+
     def create_advanced_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        
+
         # Word buffers
         buffer_group = QGroupBox("Word Boundaries")
         buffer_layout = QGridLayout()
-        
+
         buffer_layout.addWidget(QLabel("Start Buffer (ms):"), 0, 0)
         self.word_start_buffer_spin = QSpinBox()
         self.word_start_buffer_spin.setRange(0, 2000)
         self.word_start_buffer_spin.setValue(250)
         self.word_start_buffer_spin.setSingleStep(50)
         buffer_layout.addWidget(self.word_start_buffer_spin, 0, 1)
-        
+
         buffer_layout.addWidget(QLabel("End Buffer (ms):"), 1, 0)
         self.word_end_buffer_spin = QSpinBox()
         self.word_end_buffer_spin.setRange(0, 2000)
         self.word_end_buffer_spin.setValue(250)
         self.word_end_buffer_spin.setSingleStep(50)
         buffer_layout.addWidget(self.word_end_buffer_spin, 1, 1)
-        
+
         buffer_group.setLayout(buffer_layout)
         layout.addWidget(buffer_group)
-        
-        # Cutoff detection
+
+        # Cutoff detection - UPDATED
         cutoff_group = QGroupBox("Cutoff Detection")
         cutoff_layout = QGridLayout()
-        
+
         self.check_cutoff_check = QCheckBox("Enable Cutoff Detection")
         self.check_cutoff_check.setChecked(False)
+        #self.cutoff_check_mode_combo.setCurrentText('both')
+        #self.cutoff_sensitivity_spin.setValue(0.35)
         cutoff_layout.addWidget(self.check_cutoff_check, 0, 0, 1, 2)
-        
-        cutoff_layout.addWidget(QLabel("  Action:"), 1, 0)
+
+        # NEW: Check mode selector
+        cutoff_layout.addWidget(QLabel("  Check:"), 1, 0)
+        self.cutoff_check_mode_combo = QComboBox()
+        self.cutoff_check_mode_combo.addItems(['both', 'start', 'end', 'none'])
+        self.cutoff_check_mode_combo.setCurrentText('both')
+        self.cutoff_check_mode_combo.setToolTip("Which boundaries to check for cutoffs")
+        cutoff_layout.addWidget(self.cutoff_check_mode_combo, 1, 1)
+
+        # NEW: Sensitivity slider
+        cutoff_layout.addWidget(QLabel("  Sensitivity:"), 2, 0)
+        self.cutoff_sensitivity_spin = QDoubleSpinBox()
+        self.cutoff_sensitivity_spin.setRange(0.0, 1.0)
+        self.cutoff_sensitivity_spin.setValue(0.35)
+        self.cutoff_sensitivity_spin.setSingleStep(0.05)
+        self.cutoff_sensitivity_spin.setToolTip(
+            "Lower = more sensitive (detects more cutoffs)\nHigher = less sensitive")
+        cutoff_layout.addWidget(self.cutoff_sensitivity_spin, 2, 1)
+
+        cutoff_layout.addWidget(QLabel("  Action:"), 3, 0)
         self.cutoff_action_combo = QComboBox()
         self.cutoff_action_combo.addItems(['include', 'skip', 'rename'])
         self.cutoff_action_combo.setCurrentText('skip')
-        self.cutoff_action_combo.setToolTip("include = export normally, skip = don't export, rename = add _CUTOFF suffix")
-        cutoff_layout.addWidget(self.cutoff_action_combo, 1, 1)
-        
+        self.cutoff_action_combo.setToolTip(
+            "include = export normally\nskip = don't export\nrename = add _CUTOFF suffix")
+        cutoff_layout.addWidget(self.cutoff_action_combo, 3, 1)
+
         cutoff_group.setLayout(cutoff_layout)
         layout.addWidget(cutoff_group)
-        
+
         # Overlength action
         overlength_group = QGroupBox("Overlength Segments")
         overlength_layout = QGridLayout()
-        
+
         overlength_layout.addWidget(QLabel("Action:"), 0, 0)
         self.overlength_action_combo = QComboBox()
         self.overlength_action_combo.addItems(['rename', 'skip', 'include'])
         self.overlength_action_combo.setCurrentText('rename')
         overlength_layout.addWidget(self.overlength_action_combo, 0, 1)
-        
+
         overlength_group.setLayout(overlength_layout)
         layout.addWidget(overlength_group)
-        
+
         layout.addStretch()
         return widget
     
@@ -666,6 +690,8 @@ class SpeechSplitterGUI(QMainWindow):
             'word_start_buffer_ms': self.word_start_buffer_spin.value(),
             'word_end_buffer_ms': self.word_end_buffer_spin.value(),
             'check_cutoff': self.check_cutoff_check.isChecked(),
+            'cutoff_check_mode': self.cutoff_check_mode_combo.currentText(),
+            'cutoff_sensitivity': self.cutoff_sensitivity_spin.value(),
             'cutoff_action': self.cutoff_action_combo.currentText(),
             'overlength_action': self.overlength_action_combo.currentText(),
             'trim_threshold_db': self.trim_threshold_spin.value(),
@@ -776,6 +802,8 @@ class SpeechSplitterGUI(QMainWindow):
         self.word_start_buffer_spin.setValue(settings.get('word_start_buffer_ms', 250))
         self.word_end_buffer_spin.setValue(settings.get('word_end_buffer_ms', 250))
         self.check_cutoff_check.setChecked(settings.get('check_cutoff', False))
+        self.cutoff_check_mode_combo.setCurrentText(settings.get('cutoff_check_mode', 'both'))
+        self.cutoff_sensitivity_spin.setValue(settings.get('cutoff_sensitivity', 0.35))
         self.cutoff_action_combo.setCurrentText(settings.get('cutoff_action', 'skip'))
         self.overlength_action_combo.setCurrentText(settings.get('overlength_action', 'rename'))
         self.trim_silence_check.setChecked(settings.get('trim_silence', True))
