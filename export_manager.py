@@ -364,7 +364,7 @@ class ExportManager:
         return None
 
     def _check_for_cutoff_detailed(self, audio_chunk: AudioSegment, is_start: bool = True,
-                                   sensitivity: float = 0.1) -> Dict:
+                                   sensitivity: float = 0.3) -> Dict:
 
         if not self.params.get('check_cutoff', False):
             return {'has_cutoff': False}
