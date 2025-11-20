@@ -313,7 +313,36 @@ class SpeechSplitterGUI(QMainWindow):
     def create_quality_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        
+
+        # NEW: Edge segment removal
+        edge_group = QGroupBox("Edge Segment Removal")
+        edge_layout = QGridLayout()
+
+        self.skip_edge_segments_check = QCheckBox("Skip First && Last Segments Per File")
+        self.skip_edge_segments_check.setChecked(False)
+        self.skip_edge_segments_check.setToolTip(
+            "Removes N segments from start and end of each file to eliminate edge artifacts"
+        )
+        edge_layout.addWidget(self.skip_edge_segments_check, 0, 0, 1, 2)
+
+        edge_layout.addWidget(QLabel("  Segments to Skip:"), 1, 0)
+        self.skip_segments_count_spin = QSpinBox()
+        self.skip_segments_count_spin.setRange(1, 10)
+        self.skip_segments_count_spin.setValue(1)
+        self.skip_segments_count_spin.setToolTip(
+            "Number of segments to remove from start AND end (e.g., 1 removes first + last)")
+        edge_layout.addWidget(self.skip_segments_count_spin, 1, 1)
+
+        info_label = QLabel(
+            "ℹ️ Removes N segments from start and N from end. Useful for removing intro/outro noise or cutoff artifacts"
+        )
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("color: #7f8c8d; font-style: italic; font-size: 11px; padding: 5px;")
+        edge_layout.addWidget(info_label, 2, 0, 1, 2)
+
+        edge_group.setLayout(edge_layout)
+        layout.addWidget(edge_group)
+
         # Confidence filter
         conf_group = QGroupBox("Transcription Quality")
         conf_layout = QGridLayout()
@@ -691,6 +720,8 @@ class SpeechSplitterGUI(QMainWindow):
         device = self.device_combo.currentText()
         return {
             'whisper_model': self.model_combo.currentText(),
+            'skip_edge_segments': self.skip_edge_segments_check.isChecked(),
+            'skip_segments_count': self.skip_segments_count_spin.value(),
             'language': self.language_combo.currentText(),
             'batch_size': self.batch_size_spin.value(),
             'device': None if device == 'auto' else device,
@@ -755,6 +786,8 @@ class SpeechSplitterGUI(QMainWindow):
         self.max_length_spin.setValue(15.0)
 
         # Quality
+        self.skip_edge_segments_check.setChecked(False)
+        self.skip_segments_count_spin.setValue(1)
         self.noise_threshold_spin.setValue(0.3)
         self.filter_silence_check.setChecked(False)
         self.min_confidence_spin.setValue(0.5)
@@ -837,6 +870,9 @@ class SpeechSplitterGUI(QMainWindow):
         self.noise_threshold_spin.setValue(settings.get('noise_threshold', 0.3))
         self.filter_silence_check.setChecked(settings.get('filter_silence', False))
         self.noise_silence_threshold_spin.setValue(settings.get('noise_silence_threshold', 0.3))
+
+        self.skip_edge_segments_check.setChecked(settings.get('skip_edge_segments', False))
+        self.skip_segments_count_spin.setValue(settings.get('skip_segments_count', 1))
     
     def save_settings(self):
         settings = self.get_settings()

@@ -43,6 +43,8 @@ class SpeechSplitter:
         
         # Parameters
         self.params = {
+            'skip_edge_segments': kwargs.get('skip_edge_segments', False),
+            'skip_segments_count': kwargs.get('skip_segments_count', 1),
             'whisper_model': kwargs.get('whisper_model', 'large'),
             'language': kwargs.get('language', 'en'),
             'batch_size': kwargs.get('batch_size', 6),
@@ -144,7 +146,11 @@ class SpeechSplitter:
             return {'total_segments': 0, 'total_duration': 0, 'avg_duration': 0}
         
         # Filter segments
-        filtered_segments = self.segment_filter.filter_segments(segments, audio)
+        filtered_segments = self.segment_filter.filter_segments(
+            segments, audio,
+            skip_edge_segments=self.params['skip_edge_segments'],
+            skip_segments_count=self.params['skip_segments_count']
+        )
         
         # Export segments
         output_files = self.export_manager.export_segments(audio, filtered_segments, base_name, original_sr)
@@ -186,7 +192,12 @@ def main():
         description="Speech Splitter v4 - Sentence-Based TTS Data Generator",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    
+
+    parser.add_argument('--skip-edge-segments', action='store_true',
+                        help="Skip first and last N segments from each file")
+    parser.add_argument('--skip-segments-count', type=int, default=1,
+                        help="Number of segments to skip from start and end (default: 1)")
+
     # Required
     parser.add_argument('input', help="Input audio file or directory")
 
@@ -291,6 +302,8 @@ def main():
             trim_chunk_ms=args.trim_chunk_ms,
             trim_pad_ms=args.trim_pad_ms,
             device=args.device,
+            skip_edge_segments=args.skip_edge_segments,
+            skip_segments_count=args.skip_segments_count,
             log_level=args.log_level
         )
     except RuntimeError as e:

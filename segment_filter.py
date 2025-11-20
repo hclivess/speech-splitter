@@ -19,10 +19,13 @@ class SegmentFilter:
         self.logger = logger
         self.filtering_available = yamnet_filter is not None and yamnet_filter.available
 
-    def filter_segments(self, segments: List[SegmentData], audio: AudioSegment) -> List[SegmentData]:
+    def filter_segments(self, segments: List[SegmentData], audio: AudioSegment,
+                        skip_edge_segments: bool = False, skip_segments_count: int = 1) -> List[SegmentData]:
         """Filter segments with single classification per segment"""
 
         self.logger.info("FILTERING SEGMENTS")
+        if skip_edge_segments:
+            self.logger.info(f"  Edge segment removal ENABLED (skip {skip_segments_count} from each end)")
 
         filtered = []
         stats = {
@@ -30,6 +33,7 @@ class SegmentFilter:
             'noise': 0,
             'confidence': 0,
             'text': 0,
+            'edge_skipped': 0,
             'total': len(segments)
         }
 
@@ -38,10 +42,33 @@ class SegmentFilter:
             'music': [],
             'noise': [],
             'confidence': [],
-            'text': []
+            'text': [],
+            'edge_skipped': []
         }
 
-        for seg in segments:
+        # Mark edge segments
+        edge_indices = set()
+        if skip_edge_segments and len(segments) > 2 * skip_segments_count:
+            # Skip N segments from start
+            for i in range(skip_segments_count):
+                edge_indices.add(i)
+            # Skip N segments from end
+            for i in range(len(segments) - skip_segments_count, len(segments)):
+                edge_indices.add(i)
+
+        for idx, seg in enumerate(segments):
+            # Check if this is an edge segment
+            if idx in edge_indices:
+                stats['edge_skipped'] += 1
+                position = 'START' if idx < skip_segments_count else 'END'
+                if len(examples['edge_skipped']) < 4:  # Show up to 4 examples
+                    examples['edge_skipped'].append({
+                        'text': seg.text[:50],
+                        'position': position,
+                        'index': idx
+                    })
+                continue
+
             chunk = audio[seg.start_ms:seg.end_ms]
             rejection_reason = None
 
@@ -117,6 +144,12 @@ class SegmentFilter:
         self.logger.info(f"Input segments: {stats['total']}")
         self.logger.info(f"Accepted: {len(filtered)} ({len(filtered) / stats['total'] * 100:.1f}%)")
         self.logger.info("")
+
+        if stats['edge_skipped'] > 0:
+            self.logger.info(f"❌ EDGE SEGMENTS: {stats['edge_skipped']} segments removed "
+                             f"({skip_segments_count} from each end)")
+            for ex in examples['edge_skipped']:
+                self.logger.info(f"   [{ex['position']}] #{ex['index']} '{ex['text']}...'")
 
         if stats['music'] > 0:
             self.logger.warning(f"❌ MUSIC: {stats['music']} segments rejected")
