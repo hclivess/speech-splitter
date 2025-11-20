@@ -343,6 +343,20 @@ class SpeechSplitterGUI(QMainWindow):
         edge_group.setLayout(edge_layout)
         layout.addWidget(edge_group)
 
+        deepfilter_group = QGroupBox("Speech Enhancement (Optional)")
+        deepfilter_layout = QVBoxLayout()
+
+        self.deepfilternet_check = QCheckBox("Enable DeepFilterNet Speech Isolation")
+        self.deepfilternet_check.setChecked(False)
+        self.deepfilternet_check.setToolTip(
+            "Isolate speech and reduce background noise using DeepFilterNet. "
+            "Adds processing time but improves quality."
+        )
+        deepfilter_layout.addWidget(self.deepfilternet_check)
+
+        deepfilter_group.setLayout(deepfilter_layout)
+        layout.addWidget(deepfilter_group)
+
         # Confidence filter
         conf_group = QGroupBox("Transcription Quality")
         conf_layout = QGridLayout()
@@ -719,6 +733,7 @@ class SpeechSplitterGUI(QMainWindow):
     def get_settings(self):
         device = self.device_combo.currentText()
         return {
+            'use_deepfilternet': self.deepfilternet_check.isChecked(),
             'whisper_model': self.model_combo.currentText(),
             'skip_edge_segments': self.skip_edge_segments_check.isChecked(),
             'skip_segments_count': self.skip_segments_count_spin.value(),
@@ -796,7 +811,8 @@ class SpeechSplitterGUI(QMainWindow):
         self.filter_music_check.setChecked(True)
         self.music_threshold_spin.setValue(0.3)
         self.mixed_threshold_spin.setValue(0.2)
-        
+        self.deepfilternet_check.setChecked(False)
+
         # Advanced
         self.word_start_buffer_spin.setValue(250)
         self.word_end_buffer_spin.setValue(250)
@@ -838,6 +854,7 @@ class SpeechSplitterGUI(QMainWindow):
                 QMessageBox.critical(self, "Error", f"Failed to load settings:\n{e}")
     
     def apply_settings(self, settings: dict):
+        self.deepfilternet_check.setChecked(settings.get('use_deepfilternet', False))
         self.model_combo.setCurrentText(settings.get('whisper_model', 'large'))
         self.language_combo.setCurrentText(settings.get('language', 'cs'))
         self.batch_size_spin.setValue(settings.get('batch_size', 6))

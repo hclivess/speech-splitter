@@ -8,13 +8,66 @@ import numpy as np
 from pathlib import Path
 from typing import Tuple
 from pydub import AudioSegment
+from df.enhance import enhance, init_df
 
 from utils import MIN_TRIM_DURATION_MS
 
 
 class AudioProcessor:
     """Handle audio loading, conversion, and trimming"""
-    
+
+    @staticmethod
+    def enhance_speech_deepfilternet(audio_chunk: AudioSegment, logger: logging.Logger,
+                                     device: str = 'cpu') -> AudioSegment:
+        """Apply DeepFilterNet speech enhancement"""
+        try:
+            import torch
+            import numpy as np
+            from df.enhance import enhance, init_df
+
+            # Force CPU if CUDA not available
+            if device == 'cuda' and not torch.cuda.is_available():
+                logger.warning("CUDA not available, falling back to CPU for DeepFilterNet")
+                device = 'cpu'
+
+            # Initialize model (lazy load)
+            if not hasattr(enhance_speech_deepfilternet, 'model'):
+                logger.info(f"Loading DeepFilterNet model on {device}...")
+                #model, state, df = init_df(device=device)
+                model, state, df = init_df(device='cpu')
+
+                enhance_speech_deepfilternet.model = model
+                enhance_speech_deepfilternet.state = state
+                enhance_speech_deepfilternet.df = df
+                logger.info("✓ DeepFilterNet loaded")
+
+            # Move to device
+            enhance_speech_deepfilternet.model = enhance_speech_deepfilternet.model.to(device)
+
+            # Convert to numpy
+            samples = np.array(audio_chunk.get_array_of_samples(), dtype=np.float32)
+            samples = samples / 32768.0
+
+            # Enhance
+            with torch.no_grad():
+                enhanced, _ = enhance(
+                    enhance_speech_deepfilternet.model,
+                    torch.from_numpy(samples).to(device)
+                )
+            enhanced = enhanced.cpu().numpy()
+
+            # Convert back
+            enhanced = (enhanced * 32768).astype(np.int16)
+            return AudioSegment(
+                enhanced.tobytes(),
+                frame_rate=audio_chunk.frame_rate,
+                sample_width=2,
+                channels=1
+            )
+        except Exception as e:
+            logger.warning(f"DeepFilterNet enhancement failed: {e}")
+            return audio_chunk
+
     @staticmethod
     def load_and_prepare(audio_path: Path, logger: logging.Logger) -> Tuple[AudioSegment, int]:
         """Load audio file and convert to mono"""

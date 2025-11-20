@@ -1,30 +1,25 @@
-# Core PyTorch (install FIRST)
-torch==2.1.2
-torchvision==0.16.2
-torchaudio==2.1.2
+# --- GUI Framework ---
+PySide6>=6.4.0
 
-# Core dependencies
-numpy<2.0
-numba>=0.55.0
-
-# Audio processing
-soundfile>=0.12.1
-librosa>=0.10.0
+# --- Audio Processing & Math ---
+numpy>=1.21.0
 pydub>=0.25.1
 
-# WhisperX and related
+# --- Machine Learning Frameworks (Torch) ---
+# Note: If you have a GPU, ensure you install the CUDA-enabled version of torch first.
+# See https://pytorch.org/get-started/locally/
+torch>=2.0.0
+torchaudio>=2.0.0
+
+# --- Machine Learning Frameworks (TensorFlow) ---
+# Required for the YAMNet Audio Classifier (Music/Noise detection)
+tensorflow>=2.10.0
+tensorflow-hub>=0.12.0
+
+# --- Speech Enhancement ---
+# Required for the DeepFilterNet speech isolation feature
+DeepFilterNet>=0.5.6
+
+# --- Transcription Engine ---
+# WhisperX is best installed directly from source to get the latest fixes
 git+https://github.com/m-bain/whisperx.git
-pyannote.audio==3.1.1
-transformers>=4.36.0
-huggingface-hub>=0.20.0
-faster-whisper>=0.10.0
-
-# Utilities
-tqdm>=4.64.0
-PySide6>=6.5.0
-tinytag>=1.9.0
-
-# Optional: TensorFlow for YAMNet (may cause conflicts)
-# Uncomment if you need audio filtering
-# tensorflow==2.15.0
-# tensorflow-hub==0.16.1

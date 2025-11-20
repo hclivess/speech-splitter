@@ -43,6 +43,7 @@ class SpeechSplitter:
         
         # Parameters
         self.params = {
+            'use_deepfilternet': kwargs.get('use_deepfilternet', False),
             'skip_edge_segments': kwargs.get('skip_edge_segments', False),
             'skip_segments_count': kwargs.get('skip_segments_count', 1),
             'whisper_model': kwargs.get('whisper_model', 'large'),
@@ -126,7 +127,12 @@ class SpeechSplitter:
         
         # Load and prepare audio
         audio, original_sr = AudioProcessor.load_and_prepare(audio_path, self.logger)
-        
+
+        if self.params['use_deepfilternet']:
+            self.logger.info("Applying DeepFilterNet speech enhancement...")
+            audio = AudioProcessor.enhance_speech_deepfilternet(audio, self.logger, device=self.device)
+            self.logger.info("✓ Speech enhancement complete")
+
         # Transcribe with WhisperX
         import tempfile
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
