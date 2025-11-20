@@ -72,7 +72,6 @@ class ExportManager:
             # Extract audio chunk
             audio_chunk = audio[start_ms:end_ms]
             
-            # CHECK FOR CUTOFFS FIRST (before trimming removes them!)
             cutoff_detected = False
             if self.params.get('check_cutoff', False):
                 cutoff_info_start = self._check_for_cutoff_detailed(audio_chunk, is_start=True)
