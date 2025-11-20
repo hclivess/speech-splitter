@@ -2,24 +2,13 @@
 PySide6>=6.4.0
 
 # --- Audio Processing & Math ---
-numpy>=1.21.0
+numpy==1.26.4  # FIXED: Cap NumPy to a 1.x version to avoid compatibility errors
 pydub>=0.25.1
 
-# --- Machine Learning Frameworks (Torch) ---
-# Note: If you have a GPU, ensure you install the CUDA-enabled version of torch first.
-# See https://pytorch.org/get-started/locally/
-torch>=2.0.0
-torchaudio>=2.0.0
-
-# --- Machine Learning Frameworks (TensorFlow) ---
-# Required for the YAMNet Audio Classifier (Music/Noise detection)
+# --- AI & Machine Learning (Auxiliary) ---
 tensorflow>=2.10.0
 tensorflow-hub>=0.12.0
 
 # --- Speech Enhancement ---
-# Required for the DeepFilterNet speech isolation feature
+# If this fails due to Rust/Cargo errors, you can remove this line
 DeepFilterNet>=0.5.6
-
-# --- Transcription Engine ---
-# WhisperX is best installed directly from source to get the latest fixes
-git+https://github.com/m-bain/whisperx.git

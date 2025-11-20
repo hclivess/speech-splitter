@@ -1,118 +1,59 @@
 @echo off
-title Speech Splitter - GPU Setup
-setlocal enabledelayedexpansion
+setlocal
 
-echo ========================================
-echo Speech Splitter - Clean GPU Installation
-echo ========================================
+echo ===================================================
+echo      Speech Splitter v4 - Setup Wizard
+echo ===================================================
 echo.
-echo CUDA 12.7 - RTX 3060 Laptop
-echo.
-set /p "continue=Continue? (y/n): "
-if /i "!continue!" neq "y" exit /b 0
 
-REM Check Python
-python --version >nul 2>&1
-if %errorlevel% neq 0 (
-    echo ERROR: Python not found
+:: 1. Check for Python 3.10
+python --version | find "3.10" >nul
+if errorlevel 1 (
+    echo [ERROR] You are currently running:
+    python --version
+    echo.
+    echo Please install Python 3.10 to use this software.
+    echo Newer versions ^(3.11, 3.12, 3.13^) are NOT compatible with the required audio libraries.
+    echo.
     pause
-    exit /b 1
+    exit /b
 )
 
-REM Check Git
-git --version >nul 2>&1
-if %errorlevel% neq 0 (
-    echo ERROR: Git not found
-    pause
-    exit /b 1
+:: 2. Create/Activate Virtual Environment
+if not exist "speech_env" (
+    echo [INFO] Creating virtual environment 'speech_env'...
+    python -m venv speech_env
 )
+call speech_env\Scripts\activate
 
-REM Remove old environment
-if exist speech_env (
-    echo Removing old environment...
-    rmdir /s /q speech_env
-)
-
-REM Create fresh environment
-echo Creating virtual environment...
-python -m venv speech_env
-if %errorlevel% neq 0 (
-    echo ERROR: Failed to create virtual environment
-    pause
-    exit /b 1
-)
-
-call speech_env\Scripts\activate.bat
-
-REM Upgrade pip
-echo Upgrading pip...
+:: 3. Upgrade basic tools
+echo [INFO] Upgrading pip...
 python -m pip install --upgrade pip setuptools wheel
 
-REM Install core dependencies FIRST (before PyTorch)
+:: 4. Install PyTorch with CUDA 11.8 (CRITICAL STEP)
 echo.
-echo Installing core dependencies...
-pip install numpy numba soundfile librosa pydub tqdm PySide6 tinytag
+echo [INFO] Installing PyTorch 2.0.1 (GPU Version)...
+echo This may take a while...
+pip install torch==2.1.0+cu118 torchaudio==2.1.0+cu118 --index-url https://download.pytorch.org/whl/cu118
 
-REM Install transformers
-echo Installing transformers...
-pip install transformers huggingface-hub
-
-REM Install faster-whisper
-echo Installing faster-whisper...
-pip install faster-whisper
-
-REM Install pyannote.audio
-echo Installing pyannote.audio...
-pip install pyannote.audio
-
-REM Install WhisperX (this will install CPU torch)
+:: 5. Install WhisperX
 echo.
-echo ========================================
-echo Installing WhisperX...
-echo ========================================
+echo [INFO] Installing WhisperX...
 pip install git+https://github.com/m-bain/whisperx.git
 
-if %errorlevel% neq 0 (
-    echo ERROR: WhisperX installation failed
-    pause
-    exit /b 1
-)
-
-REM NOW force reinstall PyTorch with CUDA (AFTER WhisperX)
+:: 6. Install remaining dependencies
 echo.
-echo ========================================
-echo FORCING PyTorch CUDA installation...
-echo ========================================
-pip uninstall -y torch torchvision torchaudio
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 --force-reinstall
-
-if %errorlevel% neq 0 (
-    echo ERROR: PyTorch CUDA installation failed
-    pause
-    exit /b 1
-)
-
-REM Final test
-echo.
-echo ========================================
-echo Final Tests...
-echo ========================================
-python -c "import torch; print('CUDA:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NONE')"
-python -c "import whisperx; print('WhisperX: OK')"
-
-if %errorlevel% neq 0 (
-    echo ERROR: Import test failed
-    pause
-    exit /b 1
-)
+echo [INFO] Installing GUI and other requirements...
+pip install -r requirements.txt
 
 echo.
-echo ========================================
-echo Installation Complete
-echo ========================================
+echo ===================================================
+echo [SUCCESS] Setup Complete!
 echo.
-echo To use:
-echo   call speech_env\Scripts\activate.bat
-echo   python speech_splitter_v3.py your_audio.wav
+echo To start the app, verify GPU access with this command:
+echo speech_env\Scripts\python -c "import torch; print('GPU Available:', torch.cuda.is_available())"
 echo.
+echo Then run the GUI:
+echo speech_env\Scripts\python speech_splitter_gui.py
+echo ===================================================
 pause
