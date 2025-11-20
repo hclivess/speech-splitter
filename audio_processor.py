@@ -33,8 +33,8 @@ class AudioProcessor:
             # Initialize model (lazy load)
             if not hasattr(enhance_speech_deepfilternet, 'model'):
                 logger.info(f"Loading DeepFilterNet model on {device}...")
-                #model, state, df = init_df(device=device)
-                model, state, df = init_df(device='cpu')
+                model, state, df = init_df(device=device)
+                #model, state, df = init_df(device='cpu')
 
                 enhance_speech_deepfilternet.model = model
                 enhance_speech_deepfilternet.state = state
