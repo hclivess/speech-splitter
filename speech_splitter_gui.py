@@ -353,21 +353,39 @@ class SpeechSplitterGUI(QMainWindow):
         music_layout.addWidget(self.mixed_threshold_spin, 2, 1)
         
         audio_layout.addLayout(music_layout)
-        
-        # Noise/silence filter
+
+        # NEW: Noise filter
         noise_layout = QGridLayout()
-        self.filter_noise_check = QCheckBox("Filter Noise/Silence")
+        self.filter_noise_check = QCheckBox("Filter Noise")
         self.filter_noise_check.setChecked(False)
         noise_layout.addWidget(self.filter_noise_check, 0, 0, 1, 2)
-        
-        noise_layout.addWidget(QLabel("  Silence Threshold:"), 1, 0)
+
+        noise_layout.addWidget(QLabel("  Noise Threshold:"), 1, 0)
+        self.noise_threshold_spin = QDoubleSpinBox()
+        self.noise_threshold_spin.setRange(0.0, 1.0)
+        self.noise_threshold_spin.setValue(0.3)
+        self.noise_threshold_spin.setSingleStep(0.05)
+        self.noise_threshold_spin.setToolTip(
+            "Higher threshold = only filter obvious noise. Lower = filter more aggressive.")
+        noise_layout.addWidget(self.noise_threshold_spin, 1, 1)
+
+        audio_layout.addLayout(noise_layout)
+
+        # NEW: Silence filter (separate from noise now)
+        silence_layout = QGridLayout()
+        self.filter_silence_check = QCheckBox("Filter Silence")
+        self.filter_silence_check.setChecked(False)
+        silence_layout.addWidget(self.filter_silence_check, 0, 0, 1, 2)
+
+        silence_layout.addWidget(QLabel("  Silence Threshold:"), 1, 0)
         self.noise_silence_threshold_spin = QDoubleSpinBox()
         self.noise_silence_threshold_spin.setRange(0.0, 1.0)
         self.noise_silence_threshold_spin.setValue(0.3)
         self.noise_silence_threshold_spin.setSingleStep(0.05)
-        noise_layout.addWidget(self.noise_silence_threshold_spin, 1, 1)
-        
-        audio_layout.addLayout(noise_layout)
+        silence_layout.addWidget(self.noise_silence_threshold_spin, 1, 1)
+
+        audio_layout.addLayout(silence_layout)
+
         audio_group.setLayout(audio_layout)
         layout.addWidget(audio_group)
         
@@ -683,6 +701,8 @@ class SpeechSplitterGUI(QMainWindow):
             'export_format': self.format_combo.currentText(),
             'min_confidence': self.min_confidence_spin.value(),
             'filter_noise': self.filter_noise_check.isChecked(),
+            'noise_threshold': self.noise_threshold_spin.value(),
+            'filter_silence': self.filter_silence_check.isChecked(),
             'noise_silence_threshold': self.noise_silence_threshold_spin.value(),
             'filter_music': self.filter_music_check.isChecked(),
             'music_threshold': self.music_threshold_spin.value(),
@@ -733,8 +753,10 @@ class SpeechSplitterGUI(QMainWindow):
         self.device_combo.setCurrentText('auto')
         self.min_length_spin.setValue(1.0)
         self.max_length_spin.setValue(15.0)
-        
+
         # Quality
+        self.noise_threshold_spin.setValue(0.3)
+        self.filter_silence_check.setChecked(False)
         self.min_confidence_spin.setValue(0.5)
         self.filter_noise_check.setChecked(False)
         self.noise_silence_threshold_spin.setValue(0.3)
@@ -810,6 +832,11 @@ class SpeechSplitterGUI(QMainWindow):
         self.trim_threshold_spin.setValue(settings.get('trim_threshold_db', -45.0))
         self.trim_chunk_spin.setValue(settings.get('trim_chunk_ms', 10))
         self.trim_pad_spin.setValue(settings.get('trim_pad_ms', 50))
+
+        self.filter_noise_check.setChecked(settings.get('filter_noise', False))
+        self.noise_threshold_spin.setValue(settings.get('noise_threshold', 0.3))
+        self.filter_silence_check.setChecked(settings.get('filter_silence', False))
+        self.noise_silence_threshold_spin.setValue(settings.get('noise_silence_threshold', 0.3))
     
     def save_settings(self):
         settings = self.get_settings()

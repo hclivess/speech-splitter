@@ -64,7 +64,18 @@ class SegmentFilter:
                             })
                         continue
 
-                # Noise/silence filter
+                if self.params['filter_noise']:
+                    if classification.is_noise(self.params['noise_threshold']):
+                        stats['noise'] += 1
+                        rejection_reason = 'noise'
+                        if len(examples['noise']) < 3:
+                            examples['noise'].append({
+                                'text': seg.text[:50],
+                                'noise': classification.noise
+                            })
+                        continue
+
+                # Silence filter
                 if self.params['filter_noise']:
                     if classification.is_silent(self.params['noise_silence_threshold']):
                         stats['noise'] += 1
@@ -115,7 +126,10 @@ class SegmentFilter:
         if stats['noise'] > 0:
             self.logger.warning(f"❌ NOISE/SILENCE: {stats['noise']} segments rejected")
             for ex in examples['noise']:
-                self.logger.warning(f"   '{ex['text']}...' (silence={ex['silence']:.2f})")
+                if 'noise' in ex:
+                    self.logger.warning(f"   '{ex['text']}...' (noise={ex['noise']:.2f})")
+                else:
+                    self.logger.warning(f"   '{ex['text']}...' (silence={ex['silence']:.2f})")
 
         if stats['confidence'] > 0:
             self.logger.warning(f"❌ LOW CONFIDENCE: {stats['confidence']} segments rejected")

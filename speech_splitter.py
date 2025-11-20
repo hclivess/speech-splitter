@@ -52,6 +52,8 @@ class SpeechSplitter:
             'min_confidence': kwargs.get('min_confidence', 0.5),
             'filter_noise': kwargs.get('filter_noise', False),
             'noise_silence_threshold': kwargs.get('noise_silence_threshold', 0.3),
+            'noise_threshold': kwargs.get('noise_threshold', 0.3),  # NEW
+            'filter_silence': kwargs.get('filter_silence', False),  # NEW - rename from filter_noise
             'filter_music': kwargs.get('filter_music', True),
             'music_threshold': kwargs.get('music_threshold', 0.3),
             'mixed_threshold': kwargs.get('mixed_threshold', 0.2),
@@ -214,13 +216,14 @@ def main():
     parser.add_argument('--max-length', type=float, default=15.0, help="Maximum segment length (seconds)")
     
     # Quality filtering
-    parser.add_argument('--min-confidence', type=float, default=0.5, help="Minimum confidence score")
     parser.add_argument('--filter-music', action='store_true', default=True, help="Filter music segments")
     parser.add_argument('--music-threshold', type=float, default=0.3, help="Music detection threshold")
     parser.add_argument('--mixed-threshold', type=float, default=0.2, help="Mixed audio threshold")
-    parser.add_argument('--filter-noise', action='store_true', help="Filter noisy/silent segments")
+    parser.add_argument('--filter-noise', action='store_true', help="Filter background noise")
+    parser.add_argument('--noise-threshold', type=float, default=0.3, help="Noise detection threshold")
+    parser.add_argument('--filter-silence', action='store_true', help="Filter silent/quiet segments")
     parser.add_argument('--noise-silence-threshold', type=float, default=0.3, help="Silence threshold")
-    
+
     # Audio processing
     parser.add_argument('--word-start-buffer', type=int, default=250, help="Start buffer (ms)")
     parser.add_argument('--word-end-buffer', type=int, default=250, help="End buffer (ms)")
@@ -260,6 +263,10 @@ def main():
     # Create splitter
     try:
         splitter = SpeechSplitter(
+            filter_noise=args.filter_noise,
+            noise_threshold=args.noise_threshold,
+            filter_silence=args.filter_silence,
+            noise_silence_threshold=args.noise_silence_threshold,
             whisper_model=args.model,
             language=args.language,
             batch_size=args.batch_size,
@@ -268,8 +275,6 @@ def main():
             max_segment_length=args.max_length,
             export_format=args.format,
             min_confidence=args.min_confidence,
-            filter_noise=args.filter_noise,
-            noise_silence_threshold=args.noise_silence_threshold,
             filter_music=args.filter_music,
             music_threshold=args.music_threshold,
             mixed_threshold=args.mixed_threshold,

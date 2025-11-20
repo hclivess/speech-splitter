@@ -111,30 +111,37 @@ class YAMNetFilter:
             for row in reader:
                 class_names.append(row['display_name'])
         return class_names
-    
+
     def _precompute_class_indices(self):
         """Calculate class indices once instead of per-classification"""
         self.music_indices = [
-            i for i, name in enumerate(self.class_names) 
+            i for i, name in enumerate(self.class_names)
             if 'music' in name.lower() and 'speech' not in name.lower()
         ]
         self.speech_indices = [
-            i for i, name in enumerate(self.class_names) 
+            i for i, name in enumerate(self.class_names)
             if 'speech' in name.lower() and 'music' not in name.lower()
         ]
         self.mixed_indices = [
-            i for i, name in enumerate(self.class_names) 
+            i for i, name in enumerate(self.class_names)
             if 'music' in name.lower() and 'speech' in name.lower()
         ]
         self.silence_indices = [
-            i for i, name in enumerate(self.class_names) 
+            i for i, name in enumerate(self.class_names)
             if 'silence' in name.lower() or 'quiet' in name.lower()
         ]
-        
+        # NEW: Noise indices - various noise categories
+        self.noise_indices = [
+            i for i, name in enumerate(self.class_names)
+            if any(term in name.lower() for term in
+                   ['noise', 'hum', 'buzz', 'static', 'white noise', 'pink noise', 'brown noise'])
+        ]
+
         self.logger.info(f"Class indices: music={len(self.music_indices)}, "
                          f"speech={len(self.speech_indices)}, "
                          f"mixed={len(self.mixed_indices)}, "
-                         f"silence={len(self.silence_indices)}")
+                         f"silence={len(self.silence_indices)}, "
+                         f"noise={len(self.noise_indices)}")
     
     def _get_cache_key(self, audio_segment: AudioSegment) -> str:
         """Generate stable cache key from audio segment properties"""
@@ -146,7 +153,7 @@ class YAMNetFilter:
         """Classify audio with caching - returns safe defaults if model unavailable"""
         if not self.available or self.model is None:
             # Return safe defaults that won't filter out speech
-            return AudioClassification(music=0.0, speech=1.0, music_speech_mixed=0.0, silence=0.0)
+            return AudioClassification(music=0.0, speech=1.0, music_speech_mixed=0.0, silence=0.0, noise=0.0)
         
         # Check cache first
         cache_key = self._get_cache_key(audio_segment)
@@ -175,12 +182,14 @@ class YAMNetFilter:
             speech_prob = float(np.max([mean_scores[i] for i in self.speech_indices]) if self.speech_indices else 0.0)
             mixed_prob = float(np.max([mean_scores[i] for i in self.mixed_indices]) if self.mixed_indices else 0.0)
             silence_prob = float(np.max([mean_scores[i] for i in self.silence_indices]) if self.silence_indices else 0.0)
-            
+            noise_prob = float(np.max([mean_scores[i] for i in self.noise_indices]) if self.noise_indices else 0.0)
+
             result = AudioClassification(
                 music=music_prob,
                 speech=speech_prob,
                 music_speech_mixed=mixed_prob,
-                silence=silence_prob
+                silence=silence_prob,
+                noise=noise_prob
             )
             
             # Cache result
@@ -197,7 +206,7 @@ class YAMNetFilter:
         except Exception as e:
             self.logger.info(f"YAMNet classification error: {e}")
             # Return safe defaults on error
-            return AudioClassification(music=0.0, speech=1.0, music_speech_mixed=0.0, silence=0.0)
+            return AudioClassification(music=0.0, speech=1.0, music_speech_mixed=0.0, silence=0.0, noise=0.0)
     
     def get_cache_stats(self) -> Dict[str, float]:
         """Get cache performance statistics"""

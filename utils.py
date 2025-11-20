@@ -51,12 +51,16 @@ class AudioClassification:
     speech: float
     music_speech_mixed: float
     silence: float
-    
+    noise: float
+
     def is_music(self, music_threshold: float, mixed_threshold: float) -> bool:
         return self.music > music_threshold or self.music_speech_mixed > mixed_threshold
     
     def is_silent(self, silence_threshold: float) -> bool:
         return self.silence > silence_threshold
+
+    def is_noise(self, noise_threshold: float) -> bool:
+        return self.noise > noise_threshold
     
     def is_speech(self, speech_threshold: float) -> bool:
         return self.speech > speech_threshold
