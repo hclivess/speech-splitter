@@ -8,8 +8,6 @@ import numpy as np
 from pathlib import Path
 from typing import Tuple
 from pydub import AudioSegment
-from df.enhance import enhance, init_df
-
 from utils import MIN_TRIM_DURATION_MS
 
 
@@ -25,47 +23,66 @@ class AudioProcessor:
             import numpy as np
             from df.enhance import enhance, init_df
 
+            # Use a local reference to the function object for caching model/state
+            df_func = AudioProcessor.enhance_speech_deepfilternet
+
             # Force CPU if CUDA not available
             if device == 'cuda' and not torch.cuda.is_available():
                 logger.warning("CUDA not available, falling back to CPU for DeepFilterNet")
                 device = 'cpu'
 
             # Initialize model (lazy load)
-            if not hasattr(enhance_speech_deepfilternet, 'model'):
+            if not hasattr(df_func, 'model'):
                 logger.info(f"Loading DeepFilterNet model on {device}...")
-                model, state, df = init_df(device=device)
-                #model, state, df = init_df(device='cpu')
 
-                enhance_speech_deepfilternet.model = model
-                enhance_speech_deepfilternet.state = state
-                enhance_speech_deepfilternet.df = df
+                # Load model, state, and df parameters
+                model, state, df = init_df()
+
+                # Store references
+                df_func.model = model
+                df_func.state = state
+                df_func.df = df
                 logger.info("✓ DeepFilterNet loaded")
 
-            # Move to device
-            enhance_speech_deepfilternet.model = enhance_speech_deepfilternet.model.to(device)
+            # Ensure model is on the correct device
+            df_func.model = df_func.model.to(device)
 
-            # Convert to numpy
+            # Convert AudioSegment samples to numpy float32
             samples = np.array(audio_chunk.get_array_of_samples(), dtype=np.float32)
             samples = samples / 32768.0
 
             # Enhance
             with torch.no_grad():
-                enhanced, _ = enhance(
-                    enhance_speech_deepfilternet.model,
-                    torch.from_numpy(samples).to(device)
-                )
-            enhanced = enhanced.cpu().numpy()
+                # CRITICAL FIX: Keep input on CPU.
+                # DeepFilterNet requires CPU input to compute features (ERB/Spectrogram) via numpy.
+                # Also added .unsqueeze(0) to create [1, Time] shape.
+                audio_tensor = torch.from_numpy(samples).unsqueeze(0)
 
-            # Convert back
+                # CRITICAL FIX: Pass 'state' as the second argument
+                enhanced = enhance(
+                    df_func.model,
+                    df_func.state,
+                    audio_tensor
+                )
+
+            # Move result to CPU, convert to numpy, and flatten back to 1D array
+            enhanced = enhanced.cpu().numpy().flatten()
+
+            # Convert back to int16 PCM
             enhanced = (enhanced * 32768).astype(np.int16)
+
             return AudioSegment(
                 enhanced.tobytes(),
                 frame_rate=audio_chunk.frame_rate,
                 sample_width=2,
                 channels=1
             )
+
         except Exception as e:
             logger.warning(f"DeepFilterNet enhancement failed: {e}")
+            # Print full traceback to console to help debug future issues
+            import traceback
+            traceback.print_exc()
             return audio_chunk
 
     @staticmethod

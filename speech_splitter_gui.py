@@ -151,11 +151,7 @@ class SpeechSplitterGUI(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
-        
-        # Header
-        header = self.create_header()
-        main_layout.addWidget(header)
-        
+
         # Main content splitter
         content_splitter = QSplitter(Qt.Horizontal)
         
@@ -200,22 +196,7 @@ class SpeechSplitterGUI(QMainWindow):
         
         # Set initial splitter sizes
         content_splitter.setSizes([400, 800])
-    
-    def create_header(self):
-        header = QWidget()
-        layout = QVBoxLayout(header)
-        
-        title = QLabel("Speech Splitter v4")
-        title.setFont(QFont("Arial", 24, QFont.Bold))
-        title.setStyleSheet("color: #2c3e50; margin: 10px;")
-        layout.addWidget(title)
-        
-        subtitle = QLabel("Sentence-Based TTS Data Generator • Powered by WhisperX")
-        subtitle.setStyleSheet("color: #7f8c8d; font-size: 12px; margin-left: 10px; margin-bottom: 10px;")
-        layout.addWidget(subtitle)
-        
-        return header
-    
+
     def create_settings_panel(self):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
