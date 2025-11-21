@@ -17,53 +17,119 @@ class AudioProcessor:
     @staticmethod
     def enhance_speech_deepfilternet(audio_chunk: AudioSegment, logger: logging.Logger,
                                      device: str = 'cpu') -> AudioSegment:
-        """Apply DeepFilterNet speech enhancement"""
+        """Apply DeepFilterNet speech enhancement - CPU ONLY"""
         try:
             import torch
             import numpy as np
-            from df.enhance import enhance, init_df
+            import sys
+            import os
+
+            # FORCE CPU MODE - ignore device parameter
+            if device != 'cpu':
+                logger.warning("DeepFilterNet device parameter is ignored - CPU mode only")
+            device = 'cpu'
 
             # Use a local reference to the function object for caching model/state
             df_func = AudioProcessor.enhance_speech_deepfilternet
 
-            # Force CPU if CUDA not available
-            if device == 'cuda' and not torch.cuda.is_available():
-                logger.warning("CUDA not available, falling back to CPU for DeepFilterNet")
-                device = 'cpu'
+            # Check if torch already has CUDA initialized
+            if torch.cuda.is_available() and torch.cuda.is_initialized():
+                logger.warning("CUDA was previously initialized. DeepFilterNet may have device issues.")
 
-            # Initialize model (lazy load)
+            # Set CUDA_VISIBLE_DEVICES to hide CUDA
+            old_cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+            os.environ['CUDA_VISIBLE_DEVICES'] = ''
+
+            # Initialize model (lazy load once)
             if not hasattr(df_func, 'model'):
-                logger.info(f"Loading DeepFilterNet model on {device}...")
+                logger.info(f"Loading DeepFilterNet model on CPU...")
+
+                # CRITICAL: Import and patch df.utils and df.config FIRST
+                import df.utils as df_utils
+                import df.config as df_config
+
+                # Patch get_device()
+                def forced_cpu_device():
+                    return torch.device('cpu')
+
+                df_utils._original_get_device = getattr(df_utils, 'get_device', None)
+                df_utils.get_device = forced_cpu_device
+                logger.debug("Patched df.utils.get_device() to force CPU mode")
+
+                # Patch config
+                class MockConfig:
+                    def __call__(self, key, default=None, section=None):
+                        if key == "DEVICE" or key == "device":
+                            return "cpu"
+                        return default if default is not None else ""
+
+                    def load(self, *args, **kwargs):
+                        pass
+
+                # --- FIX: Safely get original config using getattr ---
+                # This prevents the "AttributeError: 'Config' object has no attribute 'config'"
+                original_config = getattr(df_config, 'config', None)
+                df_config.config = MockConfig()
+                logger.debug("Patched df.config to return CPU device")
+
+                # NOW force reload of other df modules so they pick up our patches
+                modules_to_reload = [
+                    'df.enhance', 'df.deepfilternet3', 'df.modules',
+                    'df.model', 'df.checkpoint'
+                ]
+                for mod in modules_to_reload:
+                    if mod in sys.modules:
+                        del sys.modules[mod]
+
+                # Now import df.enhance - it will use our patched functions
+                import df.enhance as df_enhance_module
 
                 # Load model, state, and df parameters
-                model, state, df = init_df()
+                model, state, df = df_enhance_module.init_df()
+
+                # Force CPU for all components
+                model = model.cpu()
+
+                # Ensure all model parameters are on CPU
+                for param in model.parameters():
+                    if param.device.type != 'cpu':
+                        param.data = param.data.cpu()
 
                 # Store references
                 df_func.model = model
                 df_func.state = state
                 df_func.df = df
-                logger.info("✓ DeepFilterNet loaded")
+                df_func.enhance_module = df_enhance_module
+                df_func.original_config = original_config
+                logger.info("✓ DeepFilterNet loaded (CPU only)")
 
-            # Ensure model is on the correct device
-            df_func.model = df_func.model.to(device)
+            # Restore CUDA visibility (for rest of the program)
+            if old_cuda_visible is None:
+                os.environ.pop('CUDA_VISIBLE_DEVICES', None)
+            else:
+                os.environ['CUDA_VISIBLE_DEVICES'] = old_cuda_visible
 
             # Convert AudioSegment samples to numpy float32
             samples = np.array(audio_chunk.get_array_of_samples(), dtype=np.float32)
             samples = samples / 32768.0
 
-            # Enhance
-            with torch.no_grad():
-                # CRITICAL FIX: Keep input on CPU.
-                # DeepFilterNet requires CPU input to compute features (ERB/Spectrogram) via numpy.
-                # Also added .unsqueeze(0) to create [1, Time] shape.
-                audio_tensor = torch.from_numpy(samples).unsqueeze(0).to(device)
+            # Enhance - with CUDA hidden again
+            os.environ['CUDA_VISIBLE_DEVICES'] = ''
+            try:
+                with torch.no_grad():
+                    # Keep input on CPU
+                    audio_tensor = torch.from_numpy(samples).unsqueeze(0)
 
-                # CRITICAL FIX: Pass 'state' as the second argument
-                enhanced = enhance(
-                    df_func.model,
-                    df_func.state,
-                    audio_tensor
-                )
+                    enhanced = df_func.enhance_module.enhance(
+                        df_func.model,
+                        df_func.state,
+                        audio_tensor
+                    )
+            finally:
+                if old_cuda_visible is None:
+                    os.environ.pop('CUDA_VISIBLE_DEVICES', None)
+                else:
+                    os.environ['CUDA_VISIBLE_DEVICES'] = old_cuda_visible
 
             # Move result to CPU, convert to numpy, and flatten back to 1D array
             enhanced = enhanced.cpu().numpy().flatten()
@@ -80,7 +146,11 @@ class AudioProcessor:
 
         except Exception as e:
             logger.warning(f"DeepFilterNet enhancement failed: {e}")
-            # Print full traceback to console to help debug future issues
+            logger.error("=" * 70)
+            logger.error("DEEPFILTERNET ERROR")
+            logger.error("If you see device mismatch errors, ensure no other process")
+            logger.error("is holding onto the GPU memory.")
+            logger.error("=" * 70)
             import traceback
             traceback.print_exc()
             return audio_chunk
