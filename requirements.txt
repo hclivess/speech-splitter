@@ -2,13 +2,15 @@
 PySide6>=6.4.0
 
 # --- Audio Processing & Math ---
-numpy==1.26.4  # FIXED: Cap NumPy to a 1.x version to avoid compatibility errors
+# CRITICAL: NumPy must be < 2.0 to prevent "np.NaN" errors in WhisperX
+numpy==1.26.4
 pydub>=0.25.1
+ffmpeg-python
 
 # --- AI & Machine Learning (Auxiliary) ---
 tensorflow>=2.10.0
 tensorflow-hub>=0.12.0
 
 # --- Speech Enhancement ---
-# If this fails due to Rust/Cargo errors, you can remove this line
+# Optional: DeepFilterNet for noise reduction
 DeepFilterNet>=0.5.6
