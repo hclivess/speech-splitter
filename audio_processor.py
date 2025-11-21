@@ -56,7 +56,7 @@ class AudioProcessor:
                 # CRITICAL FIX: Keep input on CPU.
                 # DeepFilterNet requires CPU input to compute features (ERB/Spectrogram) via numpy.
                 # Also added .unsqueeze(0) to create [1, Time] shape.
-                audio_tensor = torch.from_numpy(samples).unsqueeze(0)
+                audio_tensor = torch.from_numpy(samples).unsqueeze(0).to(device)
 
                 # CRITICAL FIX: Pass 'state' as the second argument
                 enhanced = enhance(
