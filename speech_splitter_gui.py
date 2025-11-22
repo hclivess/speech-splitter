@@ -240,7 +240,11 @@ class SpeechSplitterGUI(QMainWindow):
         
         model_layout.addWidget(QLabel("Language:"), 1, 0)
         self.language_combo = QComboBox()
-        self.language_combo.addItems(['en', 'cs', 'de', 'es', 'fr', 'it', 'ja', 'ko', 'pl', 'pt', 'ru', 'zh'])
+        self.language_combo.addItems([
+            'ar', 'ca', 'cs', 'da', 'de', 'el', 'en', 'es', 'eu', 'fa', 'fi', 'fr',
+            'gl', 'he', 'hi', 'hr', 'hu', 'it', 'ja', 'ka', 'ko', 'lv', 'ml', 'nl',
+            'nn', 'no', 'pl', 'pt', 'ro', 'ru', 'sk', 'sl', 'sv', 'te', 'tl', 'tr',
+            'uk', 'ur', 'vi', 'zh'])
         self.language_combo.setCurrentText('cs')
         self.language_combo.setEditable(True)
         model_layout.addWidget(self.language_combo, 1, 1)
