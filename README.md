@@ -113,7 +113,7 @@ speaker_0002.wav,"This is the second segment."
 ### GUI Application
 
 ```bash
-python speech_splitter_gui_v2.py
+python speech_splitter_gui.py
 ```
 
 **GUI Features:**
