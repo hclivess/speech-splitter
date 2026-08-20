@@ -1,226 +1,128 @@
 """
-Audio classification using YAMNet (optional)
-Provides music/speech/silence detection for filtering
+Audio classification with YAMNet (AudioSet, 521 classes) running on onnxruntime.
+Used to reject music / noise / silence and to validate segment boundaries.
+The model (~16 MB, Apache-2.0 conversion of google/yamnet) is fetched from the Hugging Face
+hub on first use and cached like the Whisper models.
 """
-
-import os
 import csv
-import logging
 import hashlib
+import logging
+import os
+from typing import Dict, List, Optional
+
 import numpy as np
-from typing import Dict, Optional
 from pydub import AudioSegment
 
-from utils import AudioClassification, MAX_CACHE_SIZE, CACHE_CLEANUP_RATIO
+from audio_processor import AudioProcessor
+from config import YAMNET_FILES, YAMNET_REPO
+from utils import MAX_CACHE_SIZE, AudioClassification
+
+
+def is_yamnet_cached(model_dir: str = "") -> bool:
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        for fn in YAMNET_FILES:
+            res = try_to_load_from_cache(YAMNET_REPO, fn, cache_dir=model_dir or None)
+            if not (isinstance(res, str) and os.path.isfile(res)):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def download_yamnet(model_dir: str = "") -> List[str]:
+    from huggingface_hub import hf_hub_download
+    return [hf_hub_download(YAMNET_REPO, fn, cache_dir=model_dir or None) for fn in YAMNET_FILES]
 
 
 class YAMNetFilter:
-    """
-    Optimized YAMNet audio classifier with:
-    - Classification caching
-    - Pre-computed class indices
-    - Single classification per segment
-    - Optional fallback mode
-    """
-    
-    def __init__(self, device='cuda', logger=None):
-        self.model = None
-        self.class_names = None
-        self.device = device
-        self.logger = logger or logging.getLogger("SpeechSplitter.YAMNetFilter")
-        
-        # Classification cache
-        self._classification_cache = {}
-        self._cache_hits = 0
-        self._cache_misses = 0
-        
-        # Pre-computed class indices
-        self.music_indices = None
-        self.speech_indices = None
-        self.mixed_indices = None
-        self.silence_indices = None
-        
-        self.available = self._load_model()
-    
-    def _load_model(self) -> bool:
-        """Load YAMNet and pre-compute class indices"""
+    SAMPLE_RATE = 16000
+
+    def __init__(self, logger: Optional[logging.Logger] = None, model_dir: str = ""):
+        self.logger = logger or logging.getLogger("SpeechSplitter.YAMNet")
+        self.model_dir = model_dir
+        self.session = None
+        self.input_name = ""
+        self.class_names: List[str] = []
+        self._cache: Dict[str, AudioClassification] = {}
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.available = self._load()
+
+    def _load(self) -> bool:
         try:
-            import tensorflow as tf
-            import tensorflow_hub as hub
-            import shutil
-            import tempfile
-            import time
-            
-            # GPU config
-            gpus = tf.config.list_physical_devices('GPU')
-            if gpus and self.device == 'cuda':
-                try:
-                    for gpu in gpus:
-                        tf.config.experimental.set_memory_growth(gpu, True)
-                    self.logger.info("TensorFlow GPU memory growth enabled")
-                except RuntimeError as e:
-                    self.logger.warning(f"GPU config error: {e}")
-            
-            tf.get_logger().setLevel('ERROR')
-            os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-            
-            self.logger.info("Loading YAMNet model...")
-            
-            # Clear corrupted cache if exists
-            tfhub_cache = os.path.join(tempfile.gettempdir(), 'tfhub_modules')
-            if os.path.exists(tfhub_cache):
-                try:
-                    shutil.rmtree(tfhub_cache)
-                    os.makedirs(tfhub_cache, exist_ok=True)
-                except Exception as e:
-                    self.logger.warning(f"Failed to clear cache: {e}")
-            
-            # Load model with retry
-            max_retries = 2
-            for attempt in range(max_retries):
-                try:
-                    self.model = hub.load('https://tfhub.dev/google/yamnet/1')
-                    break
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        self.logger.warning(f"Attempt {attempt + 1} failed, retrying...")
-                        time.sleep(2)
-                    else:
-                        raise
-            
-            class_map_path = self.model.class_map_path().numpy()
-            self.class_names = self._load_class_names(class_map_path)
-            
-            # Pre-compute class indices once
-            self._precompute_class_indices()
-            
-            self.logger.info("✓ YAMNet model loaded successfully")
+            import onnxruntime as ort
+            model_path, class_map = download_yamnet(self.model_dir)
+            opts = ort.SessionOptions()
+            opts.log_severity_level = 3
+            self.session = ort.InferenceSession(model_path, opts, providers=["CPUExecutionProvider"])
+            self.input_name = self.session.get_inputs()[0].name
+            with open(class_map, encoding="utf-8") as f:
+                self.class_names = [row["display_name"] for row in csv.DictReader(f)]
+            self._precompute_indices()
+            self.logger.info(f"YAMNet ready ({len(self.class_names)} classes)")
             return True
-            
-        except Exception as e:
-            self.logger.warning(f"YAMNet loading failed: {e}")
-            self.logger.warning("Audio filtering disabled - using timestamp-only mode")
-            self.model = None
+        except Exception as exc:
+            self.logger.warning(f"YAMNet unavailable ({exc}) - audio filtering disabled")
             return False
-    
-    def _load_class_names(self, class_map_csv):
-        """Load YAMNet class names"""
-        class_names = []
-        with open(class_map_csv) as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                class_names.append(row['display_name'])
-        return class_names
 
-    def _precompute_class_indices(self):
-        """Calculate class indices once instead of per-classification"""
-        self.music_indices = [
-            i for i, name in enumerate(self.class_names)
-            if 'music' in name.lower() and 'speech' not in name.lower()
-        ]
-        self.speech_indices = [
-            i for i, name in enumerate(self.class_names)
-            if 'speech' in name.lower() and 'music' not in name.lower()
-        ]
-        self.mixed_indices = [
-            i for i, name in enumerate(self.class_names)
-            if 'music' in name.lower() and 'speech' in name.lower()
-        ]
-        self.silence_indices = [
-            i for i, name in enumerate(self.class_names)
-            if 'silence' in name.lower() or 'quiet' in name.lower()
-        ]
-        # NEW: Noise indices - various noise categories
-        self.noise_indices = [
-            i for i, name in enumerate(self.class_names)
-            if any(term in name.lower() for term in
-                   ['noise', 'hum', 'buzz', 'static', 'white noise', 'pink noise', 'brown noise'])
-        ]
+    def _precompute_indices(self):
+        low = [n.lower() for n in self.class_names]
+        self.music_idx = [i for i, n in enumerate(low) if "music" in n and "speech" not in n]
+        self.speech_idx = [i for i, n in enumerate(low) if "speech" in n and "music" not in n]
+        self.mixed_idx = [i for i, n in enumerate(low) if "music" in n and "speech" in n]
+        self.silence_idx = [i for i, n in enumerate(low) if "silence" in n or "quiet" in n]
+        noise_terms = ("noise", "hum", "buzz", "static", "hiss", "wind", "rain", "crackle", "rumble")
+        self.noise_idx = [i for i, n in enumerate(low) if any(t in n for t in noise_terms)]
+        # "Singing" and friends count as music for TTS purposes
+        self.music_idx += [i for i, n in enumerate(low)
+                           if any(t in n for t in ("singing", "choir", "yodeling", "chant", "rapping"))
+                           and i not in self.music_idx]
 
-        self.logger.info(f"Class indices: music={len(self.music_indices)}, "
-                         f"speech={len(self.speech_indices)}, "
-                         f"mixed={len(self.mixed_indices)}, "
-                         f"silence={len(self.silence_indices)}, "
-                         f"noise={len(self.noise_indices)}")
-    
-    def _get_cache_key(self, audio_segment: AudioSegment) -> str:
-        """Generate stable cache key from audio segment properties"""
-        samples = np.array(audio_segment.get_array_of_samples()[:1000], dtype=np.int16)
-        key_data = f"{len(audio_segment)}_{audio_segment.frame_rate}_{audio_segment.channels}_{samples.tobytes()}"
-        return hashlib.md5(key_data.encode()).hexdigest()[:16]
-    
-    def classify_audio(self, audio_segment: AudioSegment) -> AudioClassification:
-        """Classify audio with caching - returns safe defaults if model unavailable"""
-        if not self.available or self.model is None:
-            # Return safe defaults that won't filter out speech
-            return AudioClassification(music=0.0, speech=1.0, music_speech_mixed=0.0, silence=0.0, noise=0.0)
-        
-        # Check cache first
-        cache_key = self._get_cache_key(audio_segment)
-        if cache_key in self._classification_cache:
-            self._cache_hits += 1
-            return self._classification_cache[cache_key]
-        
-        self._cache_misses += 1
-        
+    @staticmethod
+    def _key(samples: np.ndarray) -> str:
+        h = hashlib.blake2b(digest_size=12)
+        h.update(samples.shape[0].to_bytes(4, "little"))
+        h.update(samples[: 4000].tobytes())
+        h.update(samples[-4000:].tobytes())
+        return h.hexdigest()
+
+    def classify_samples(self, samples: np.ndarray) -> AudioClassification:
+        """samples: float32 mono 16 kHz"""
+        if not self.available:
+            return AudioClassification.speech_only()
+        if samples.size < self.SAMPLE_RATE // 2:     # pad to >= 0.5 s so YAMNet emits a frame
+            samples = np.pad(samples, (0, self.SAMPLE_RATE // 2 - samples.size))
+        key = self._key(samples)
+        hit = self._cache.get(key)
+        if hit is not None:
+            self.cache_hits += 1
+            return hit
+        self.cache_misses += 1
         try:
-            import tensorflow as tf
-            
-            samples = np.array(audio_segment.get_array_of_samples())
-            
-            # Normalize samples
-            if audio_segment.sample_width == 2:
-                samples = samples.astype(np.float32) / 32768.0
-            elif audio_segment.sample_width == 4:
-                samples = samples.astype(np.float32) / 2147483648.0
-            
-            scores, _, _ = self.model(samples)
-            mean_scores = np.mean(scores.numpy(), axis=0)
-            
-            # Use pre-computed indices
-            music_prob = float(np.max([mean_scores[i] for i in self.music_indices]) if self.music_indices else 0.0)
-            speech_prob = float(np.max([mean_scores[i] for i in self.speech_indices]) if self.speech_indices else 0.0)
-            mixed_prob = float(np.max([mean_scores[i] for i in self.mixed_indices]) if self.mixed_indices else 0.0)
-            silence_prob = float(np.max([mean_scores[i] for i in self.silence_indices]) if self.silence_indices else 0.0)
-            noise_prob = float(np.max([mean_scores[i] for i in self.noise_indices]) if self.noise_indices else 0.0)
+            scores = self.session.run(None, {self.input_name: samples.astype(np.float32)})[0]
+            mean = scores.mean(axis=0)
 
-            result = AudioClassification(
-                music=music_prob,
-                speech=speech_prob,
-                music_speech_mixed=mixed_prob,
-                silence=silence_prob,
-                noise=noise_prob
-            )
-            
-            # Cache result
-            self._classification_cache[cache_key] = result
-            
-            # Prevent cache from growing too large
-            if len(self._classification_cache) > MAX_CACHE_SIZE:
-                remove_count = int(len(self._classification_cache) * CACHE_CLEANUP_RATIO)
-                for key in list(self._classification_cache.keys())[:remove_count]:
-                    del self._classification_cache[key]
-            
-            return result
-            
-        except Exception as e:
-            self.logger.info(f"YAMNet classification error: {e}")
-            # Return safe defaults on error
-            return AudioClassification(music=0.0, speech=1.0, music_speech_mixed=0.0, silence=0.0, noise=0.0)
-    
-    def get_cache_stats(self) -> Dict[str, float]:
-        """Get cache performance statistics"""
-        total = self._cache_hits + self._cache_misses
-        hit_rate = (self._cache_hits / total * 100) if total > 0 else 0
-        return {
-            'cache_hits': self._cache_hits,
-            'cache_misses': self._cache_misses,
-            'hit_rate': hit_rate,
-            'cache_size': len(self._classification_cache)
-        }
-    
-    def clear_cache(self):
-        """Clear classification cache"""
-        self._classification_cache.clear()
-        self._cache_hits = 0
-        self._cache_misses = 0
+            def top(idx):
+                return float(mean[idx].max()) if idx else 0.0
+            result = AudioClassification(music=top(self.music_idx), speech=top(self.speech_idx),
+                                         music_speech_mixed=top(self.mixed_idx), silence=top(self.silence_idx),
+                                         noise=top(self.noise_idx))
+        except Exception as exc:
+            self.logger.debug(f"YAMNet inference error: {exc}")
+            return AudioClassification.speech_only()
+        if len(self._cache) >= MAX_CACHE_SIZE:
+            for k in list(self._cache)[: MAX_CACHE_SIZE // 4]:
+                del self._cache[k]
+        self._cache[key] = result
+        return result
+
+    def classify_audio(self, chunk: AudioSegment) -> AudioClassification:
+        if not self.available:
+            return AudioClassification.speech_only()
+        return self.classify_samples(AudioProcessor.to_float32(chunk, self.SAMPLE_RATE))
+
+    def cache_stats(self) -> Dict[str, float]:
+        total = self.cache_hits + self.cache_misses
+        return {"hits": self.cache_hits, "misses": self.cache_misses,
+                "hit_rate": (self.cache_hits / total * 100) if total else 0.0}

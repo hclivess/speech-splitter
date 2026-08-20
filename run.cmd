@@ -1,3 +1,3 @@
-call speech_env\Scripts\activate
-python speech_splitter_gui.py
-pause
+@echo off
+cd /d "%~dp0"
+python speech_splitter_gui.py %*

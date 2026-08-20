@@ -1,16 +1,6 @@
-# --- GUI Framework ---
-PySide6>=6.4.0
-
-# --- Audio Processing & Math ---
-# CRITICAL: NumPy must be < 2.0 to prevent "np.NaN" errors in WhisperX
-numpy==1.26.4
-pydub>=0.25.1
-ffmpeg-python
-
-# --- AI & Machine Learning (Auxiliary) ---
-tensorflow>=2.10.0
-tensorflow-hub>=0.12.0
-
-# --- Speech Enhancement ---
-# Optional: DeepFilterNet for noise reduction
-DeepFilterNet>=0.5.6
+pyside6
+faster-whisper>=1.1
+onnxruntime
+huggingface_hub
+pydub
+numpy

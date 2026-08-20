@@ -1,0 +1,3 @@
+# NVIDIA GPU support for faster-whisper (CUDA 12): cuBLAS 12 + cuDNN 9 runtime libraries (~1 GB)
+nvidia-cublas-cu12
+nvidia-cudnn-cu12

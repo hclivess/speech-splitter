@@ -1,490 +1,224 @@
 """
-Export manager for segment export and metadata generation
-Handles: File export, cutoff detection, metadata creation
-
-IMPROVED VERSION:
-- Configurable cutoff detection sensitivity
-- Selective cutoff checking (start, end, both, none)
-- More aggressive end-trimming to remove fragments
-- Better fragment detection after silence
-- Enhanced cutoff detection for artifacts
+Segment export: boundary buffers, cutoff detection, silence trimming, fragment removal,
+file writing and dataset metadata (metadata.csv for Hugging Face AudioFolder, metadata.json, manifest.txt)
 """
-
+import csv
 import json
 import logging
-import numpy as np
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
 from pydub import AudioSegment
 
-from utils import SegmentData
 from audio_processor import AudioProcessor
+from utils import SegmentData
 
 
 class ExportManager:
-    """Handle segment export and metadata generation"""
-
     def __init__(self, output_dir: Path, params: Dict, logger: logging.Logger):
-        self.output_dir = output_dir
+        self.output_dir = Path(output_dir)
         self.params = params
         self.logger = logger
+        self.audio_dir = self.output_dir / "audio"
+        self.text_dir = self.output_dir / "transcripts"
+        self.audio_dir.mkdir(parents=True, exist_ok=True)
+        self.text_dir.mkdir(parents=True, exist_ok=True)
+        self.records: Dict[str, Dict] = {}       # audio file name -> info (this run)
+        self.stats = {"start_cutoffs": 0, "end_cutoffs": 0, "fragments_removed": 0, "skipped_cutoff": 0,
+                      "skipped_long": 0}
 
-        self.audio_dir = output_dir / "audio"
-        self.text_dir = output_dir / "transcripts"
-        self.audio_dir.mkdir(exist_ok=True)
-        self.text_dir.mkdir(exist_ok=True)
-
-        # Cutoff detection stats
-        self.cutoff_stats = {
-            'start_cutoffs_detected': 0,
-            'end_cutoffs_detected': 0,
-            'extensions_successful': 0,
-            'extensions_failed': 0,
-            'fragments_removed': 0
-        }
-
-    def export_segments(self, audio: AudioSegment, segments: List[SegmentData],
-                       base_name: str, sample_rate: int) -> List[Tuple[str, str, Dict]]:
-        """Export segments to files with proper boundary handling and cutoff detection"""
-
-        self.logger.info("EXPORTING SEGMENTS")
-
-        # Determine which boundaries to check
-        check_mode = self.params.get('cutoff_check_mode', 'both')
-        check_start = check_mode in ['both', 'start']
-        check_end = check_mode in ['both', 'end']
-
-        # Log cutoff detection status
-        if self.params.get('check_cutoff', False):
-            sensitivity = self.params.get('cutoff_sensitivity', 0.35)
-            self.logger.info(
-                f"Cutoff detection ENABLED: "
-                f"mode={check_mode}, "
-                f"sensitivity={sensitivity:.2f}, "
-                f"action={self.params.get('cutoff_action', 'skip')}"
-            )
-        else:
-            self.logger.info("Cutoff detection DISABLED")
-
-        output_files = []
-        skipped_cutoff = 0
-        export_counter = 1  # Track actual export numbering
+    # ------------------------------------------------------------------ export
+    def export_segments(self, audio: AudioSegment, segments: List[SegmentData], base_name: str,
+                        should_stop=None, progress=None) -> List[Dict]:
+        p = self.params
+        fmt = p["export_format"]
+        check_cutoff = bool(p.get("check_cutoff"))
+        mode = p.get("cutoff_check_mode", "both")
+        check_start, check_end = mode in ("both", "start"), mode in ("both", "end")
+        counter = self._next_index(base_name, fmt)
+        exported: List[Dict] = []
 
         for idx, seg in enumerate(segments, 1):
-            # Get validated boundaries (without cutoff check yet)
-            start_ms, end_ms = self._get_validated_boundaries(
-                audio, seg.start_ms, seg.end_ms,
-                seg.prev_word_end_ms, seg.next_word_start_ms
-            )
+            if should_stop and should_stop():
+                raise InterruptedError("stopped")
+            if progress:
+                progress(idx, len(segments))
 
-            # Extract audio chunk
-            audio_chunk = audio[start_ms:end_ms]
+            start_ms, end_ms = self._boundaries(audio, seg)
+            chunk = audio[start_ms:end_ms]
+            flags: List[str] = []
 
-            cutoff_detected = False
-            cutoff_locations = []
-
-            if self.params.get('check_cutoff', False):
-                sensitivity = self.params.get('cutoff_sensitivity', 0.35)
-
-                # Check start cutoff if enabled
-                has_start_cutoff = False
-                if check_start:
-                    cutoff_info_start = self._check_for_cutoff_detailed(
-                        audio_chunk, is_start=True, sensitivity=sensitivity
-                    )
-                    has_start_cutoff = cutoff_info_start['has_cutoff']
-
-                    if has_start_cutoff:
-                        self.cutoff_stats['start_cutoffs_detected'] += 1
-                        cutoff_locations.append('START')
-                        self.logger.warning(
-                            f"START CUTOFF #{idx}: '{seg.text[:40]}...' "
-                            f"[RMS: {cutoff_info_start['max_rms']:.3f}]"
-                        )
-
-                # Check end cutoff if enabled
-                has_end_cutoff = False
-                if check_end:
-                    cutoff_info_end = self._check_for_cutoff_detailed(
-                        audio_chunk, is_start=False, sensitivity=sensitivity
-                    )
-                    has_end_cutoff = cutoff_info_end['has_cutoff']
-
-                    if has_end_cutoff:
-                        self.cutoff_stats['end_cutoffs_detected'] += 1
-                        cutoff_locations.append('END')
-                        self.logger.warning(
-                            f"END CUTOFF #{idx}: '...{seg.text[-40:]}' "
-                            f"[RMS: {cutoff_info_end['max_rms']:.3f}]"
-                        )
-
-                # Handle cutoff action
-                cutoff_detected = has_start_cutoff or has_end_cutoff
-                if cutoff_detected:
-                    cutoff_action = self.params.get('cutoff_action', 'skip')
-
-                    if cutoff_action == 'skip':
-                        cutoff_str = '+'.join(cutoff_locations)
-                        self.logger.error(f"  ✗ SKIPPING segment with {cutoff_str} cutoff")
-                        skipped_cutoff += 1
+            if check_cutoff:
+                sens = float(p.get("cutoff_sensitivity", 0.35))
+                if check_start and self._edge_is_loud(chunk, True, sens):
+                    self.stats["start_cutoffs"] += 1
+                    flags.append("CUTSTART")
+                if check_end and self._edge_is_loud(chunk, False, sens):
+                    self.stats["end_cutoffs"] += 1
+                    flags.append("CUTEND")
+                if flags:
+                    action = p.get("cutoff_action", "skip")
+                    self.logger.debug(f"cutoff {'+'.join(flags)} in #{idx}: '{seg.text[:40]}'")
+                    if action == "skip":
+                        self.stats["skipped_cutoff"] += 1
                         continue
-                    elif cutoff_action == 'rename':
-                        cutoff_str = '+'.join(cutoff_locations)
-                        self.logger.info(f"  → Will rename with _CUTOFF_{cutoff_str} suffix")
+                    if action == "include":
+                        flags = []
 
-            # NOW do the trimming (after cutoff detection)
-            trimmed_chunk = self._trim_and_remove_fragments(audio_chunk)
-            duration = len(trimmed_chunk) / 1000.0
+            if p.get("trim_silence", True):
+                chunk = AudioProcessor.trim_silence(chunk, float(p["trim_threshold_db"]), int(p["trim_chunk_ms"]),
+                                                    int(p["trim_pad_ms"]))
+            if p.get("remove_fragments", True):
+                cut = self._remove_end_fragment(chunk)
+                if cut is not None:
+                    self.stats["fragments_removed"] += 1
+                    chunk = cut
 
-            # Build filename suffix
-            suffix = ""
-
-            # Add cutoff suffix if detected and action is rename
-            if cutoff_detected and self.params.get('cutoff_action', 'skip') == 'rename':
-                cutoff_str = '_'.join(cutoff_locations)
-                suffix += f"_CUTOFF_{cutoff_str}"
-
-            # Handle overlength segments
-            if duration > self.params['max_segment_length']:
-                self.logger.info(f"Segment {idx} overlength: {duration:.2f}s")
-                if self.params['overlength_action'] == 'skip':
+            duration = len(chunk) / 1000.0
+            if duration > p["max_segment_length"]:
+                action = p.get("overlength_action", "split")
+                if action == "skip":
+                    self.stats["skipped_long"] += 1
                     continue
-                suffix += "_LONG"
+                if action in ("rename", "split"):     # split leftovers that still exceed max get marked
+                    flags.append("LONG")
 
-            # Use export_counter for sequential numbering
-            chunk_name = f"{base_name}_{export_counter:04d}{suffix}"
-            audio_file = self.audio_dir / f"{chunk_name}.{self.params['export_format']}"
-            transcript_file = self.text_dir / f"{chunk_name}.txt"
+            target_sr = int(p.get("export_sample_rate") or 0)
+            if target_sr and chunk.frame_rate != target_sr:
+                chunk = chunk.set_frame_rate(target_sr)
 
-            # Ensure files don't exist (shouldn't happen with sequential counter)
-            if audio_file.exists() or transcript_file.exists():
-                self.logger.warning(f"File collision detected for {chunk_name}, using fallback naming")
-                audio_file = self._get_unique_filename(self.audio_dir, chunk_name, f".{self.params['export_format']}")
-                transcript_file = self._get_unique_filename(self.text_dir, chunk_name, ".txt")
+            suffix = "".join(f"_{f}" for f in flags)
+            name = f"{base_name}_{counter:04d}{suffix}"
+            audio_file = self.audio_dir / f"{name}.{fmt}"
+            text_file = self.text_dir / f"{name}.txt"
+            while audio_file.exists() or text_file.exists():
+                counter += 1
+                name = f"{base_name}_{counter:04d}{suffix}"
+                audio_file = self.audio_dir / f"{name}.{fmt}"
+                text_file = self.text_dir / f"{name}.txt"
 
-            # Export files
-            trimmed_chunk.export(
-                audio_file,
-                format=self.params['export_format'],
-                bitrate='256k' if self.params['export_format'] == 'mp3' else None
-            )
+            export_kwargs = {"format": fmt}
+            if fmt == "mp3":
+                export_kwargs["bitrate"] = "256k"
+            chunk.export(str(audio_file), **export_kwargs)
+            text_file.write_text(seg.text, encoding="utf-8")
 
-            transcript_file.write_text(seg.text, encoding='utf-8')
-
-            metadata = {
-                'duration': duration,
-                'confidence': seg.confidence,
-                'classification': seg.classification
-            }
-
-            output_files.append((str(audio_file), str(transcript_file), metadata))
-            export_counter += 1  # Increment only on successful export
-
-        # Log cutoff statistics
-        if self.params.get('check_cutoff', False):
-            self.logger.info("="*70)
-            self.logger.info("CUTOFF DETECTION STATISTICS:")
-            self.logger.info(f"  Mode: {check_mode}")
-            if check_start:
-                self.logger.info(f"  Start cutoffs detected: {self.cutoff_stats['start_cutoffs_detected']}")
-            if check_end:
-                self.logger.info(f"  End cutoffs detected: {self.cutoff_stats['end_cutoffs_detected']}")
-            self.logger.info(f"  Segments skipped due to cutoffs: {skipped_cutoff}")
-            self.logger.info("="*70)
-
-        if self.cutoff_stats['fragments_removed'] > 0:
-            self.logger.info(f"  Fragments removed from segment ends: {self.cutoff_stats['fragments_removed']}")
-
-        self.logger.info(f"Exported {len(output_files)} segments")
-        return output_files
-
-    def _trim_and_remove_fragments(self, audio_chunk: AudioSegment) -> AudioSegment:
-        """
-        IMPROVED: Aggressive trimming with fragment detection
-
-        This function:
-        1. Trims silence from both start and end
-        2. Detects and removes isolated fragments after silence
-        3. Returns clean audio
-        """
-        # Step 1: Standard silence trimming (both ends)
-        trimmed = AudioProcessor.trim_silence_vectorized(
-            audio_chunk,
-            self.params['trim_threshold_db'],
-            self.params['trim_chunk_ms'],
-            self.params['trim_pad_ms'],
-            trim_end=True  # Always trim the end
-        )
-
-        # Step 2: Fragment detection and removal at the end
-        fragment_removed = self._detect_and_remove_end_fragment(trimmed)
-
-        if fragment_removed is not None and len(fragment_removed) < len(trimmed):
-            self.cutoff_stats['fragments_removed'] += 1
-            return fragment_removed
-
-        return trimmed
-
-    def _detect_and_remove_end_fragment(self, audio_chunk: AudioSegment,
-                                       silence_threshold_db: float = -40.0,
-                                       min_silence_duration_ms: int = 200,
-                                       max_fragment_duration_ms: int = 300) -> Optional[AudioSegment]:
-        """
-        Detect and remove word fragments that appear after a silence gap at the end.
-
-        Algorithm:
-        1. Scan from the end backward
-        2. Find any speech (above threshold)
-        3. Continue backward to find silence gap
-        4. If silence gap is significant (>200ms) and fragment is small (<300ms), remove it
-
-        Returns: Trimmed audio without fragment, or None if no fragment detected
-        """
-        if len(audio_chunk) < min_silence_duration_ms + 100:
-            return None
-
-        try:
-            # Convert to numpy for analysis
-            samples = np.array(audio_chunk.get_array_of_samples())
-            frame_rate = audio_chunk.frame_rate
-
-            # Calculate RMS in small windows (10ms chunks)
-            window_ms = 10
-            window_samples = int(frame_rate * window_ms / 1000)
-
-            if window_samples == 0:
-                return None
-
-            # Calculate RMS for each window
-            num_windows = len(samples) // window_samples
-            if num_windows < 10:
-                return None
-
-            rms_values = []
-            for i in range(num_windows):
-                start = i * window_samples
-                end = start + window_samples
-                window = samples[start:end]
-                rms = np.sqrt(np.mean(window**2))
-
-                # Convert to dB
-                max_amplitude = 2**(audio_chunk.sample_width * 8 - 1)
-                with np.errstate(divide='ignore'):
-                    db = 20 * np.log10(rms / max_amplitude + 1e-10)
-                rms_values.append(db)
-
-            # Scan from end backward
-            is_speech = [db > silence_threshold_db for db in rms_values]
-
-            # Find last speech region
-            last_speech_idx = None
-            for i in range(len(is_speech) - 1, -1, -1):
-                if is_speech[i]:
-                    last_speech_idx = i
-                    break
-
-            if last_speech_idx is None or last_speech_idx < 10:
-                return None
-
-            # Find the start of this speech region (go backward from last_speech_idx)
-            fragment_start_idx = last_speech_idx
-            for i in range(last_speech_idx, -1, -1):
-                if is_speech[i]:
-                    fragment_start_idx = i
-                else:
-                    break
-
-            # Calculate fragment duration
-            fragment_duration_ms = (last_speech_idx - fragment_start_idx + 1) * window_ms
-
-            # Find silence gap before fragment
-            silence_end_idx = fragment_start_idx
-            silence_start_idx = None
-
-            for i in range(fragment_start_idx - 1, -1, -1):
-                if not is_speech[i]:
-                    silence_start_idx = i
-                else:
-                    break
-
-            if silence_start_idx is None:
-                return None
-
-            silence_duration_ms = (silence_end_idx - silence_start_idx) * window_ms
-
-            # Decision: Remove if significant silence before small fragment
-            if (silence_duration_ms >= min_silence_duration_ms and
-                fragment_duration_ms <= max_fragment_duration_ms):
-
-                # Cut at the start of the silence gap
-                cut_point_ms = silence_start_idx * window_ms
-
-                if cut_point_ms > 0 and cut_point_ms < len(audio_chunk):
-                    return audio_chunk[:cut_point_ms]
-
-            return None
-
-        except Exception as e:
-            self.logger.debug(f"Fragment detection error: {e}")
-            return None
-
-    def _check_for_cutoff_detailed(self, audio_chunk: AudioSegment, is_start: bool = True,
-                                   sensitivity: float = 0.35) -> Dict:
-        """
-        Check for audio cutoffs at segment boundaries with configurable sensitivity.
-
-        Args:
-            audio_chunk: Audio segment to check
-            is_start: True to check start, False to check end
-            sensitivity: Threshold for cutoff detection (0.0-1.0)
-                        Lower = more sensitive (detects more cutoffs)
-                        Higher = less sensitive (detects fewer cutoffs)
-
-        Returns:
-            Dict with cutoff detection results
-        """
-        if not self.params.get('check_cutoff', False):
-            return {'has_cutoff': False}
-
-        if len(audio_chunk) < 50:
-            return {'has_cutoff': False}
-
-        # Clamp sensitivity to valid range
-        sensitivity = max(0.0, min(1.0, sensitivity))
-
-        try:
-            samples = np.array(audio_chunk.get_array_of_samples(), dtype=np.float64)
-            frame_rate = audio_chunk.frame_rate
-            max_amplitude = 2 ** (audio_chunk.sample_width * 8 - 1)
-
-            # Analyze first/last 10ms
-            analysis_ms = 10
-            analysis_samples = int(frame_rate * analysis_ms / 1000)
-            analysis_samples = max(50, min(analysis_samples, len(samples) // 10))
-
-            if is_start:
-                window = samples[:analysis_samples]
-            else:
-                window = samples[-analysis_samples:]
-
-            # Calculate envelope (absolute values)
-            envelope = np.abs(window)
-
-            # Smooth the envelope
-            if len(envelope) > 10:
-                kernel_size = min(5, len(envelope) // 5)
-                if kernel_size > 1:
-                    kernel = np.ones(kernel_size) / kernel_size
-                    envelope = np.convolve(envelope, kernel, mode='same')
-
-            # Check the gradient (rate of change)
-            if len(envelope) > 5:
-                if is_start:
-                    # Look for sudden jump at the beginning
-                    first_samples = envelope[:min(20, len(envelope) // 4)]
-                    max_at_start = np.max(first_samples) / max_amplitude
-                    has_cutoff = max_at_start > sensitivity
-                else:
-                    # Look for sudden drop at the end
-                    last_samples = envelope[-min(20, len(envelope) // 4):]
-                    max_at_end = np.max(last_samples) / max_amplitude
-                    has_cutoff = max_at_end > sensitivity
-            else:
-                has_cutoff = False
-
-            return {
-                'has_cutoff': has_cutoff,
-                'max_rms': np.max(envelope) / max_amplitude,
-                'windows_over_threshold': 1 if has_cutoff else 0,
-                'total_windows': 1
-            }
-
-        except Exception as e:
-            self.logger.warning(f"Cutoff check error: {e}")
-            return {'has_cutoff': False}
-
-    def _get_validated_boundaries(
-        self,
-        audio: AudioSegment,
-        start_ms: int,
-        end_ms: int,
-        prev_word_end_ms: Optional[int],
-        next_word_start_ms: Optional[int]
-    ) -> Tuple[int, int]:
-        """
-        Validate and adjust segment boundaries (without cutoff check).
-        Returns: (start_ms, end_ms)
-        """
-        # Apply word buffers
-        validated_start = max(0, start_ms - self.params['word_start_buffer_ms'])
-        validated_end = min(len(audio), end_ms + self.params['word_end_buffer_ms'])
-
-        # Prevent overlap with previous word
-        if prev_word_end_ms is not None:
-            validated_start = max(validated_start, prev_word_end_ms)
-
-        return validated_start, validated_end
-
-    def _get_unique_filename(self, base_path: Path, stem: str, suffix: str) -> Path:
-        """Generate unique filename to avoid overwrites"""
-        counter = 0
-        path = base_path / f"{stem}{suffix}"
-        while path.exists():
+            info = {"file_name": f"audio/{audio_file.name}", "transcript": f"transcripts/{text_file.name}",
+                    "text": seg.text, "duration": round(duration, 3), "sample_rate": chunk.frame_rate,
+                    "confidence": round(seg.confidence, 4), "source": base_name, "flags": flags,
+                    "classification": seg.classification}
+            self.records[audio_file.name] = info
+            exported.append(info)
             counter += 1
-            path = base_path / f"{stem}_{counter:03d}{suffix}"
-        return path
 
+        s = self.stats
+        self.logger.info(f"Exported {len(exported)} segments from {base_name}")
+        if check_cutoff:
+            self.logger.info(f"  cutoffs: start={s['start_cutoffs']} end={s['end_cutoffs']} skipped={s['skipped_cutoff']}")
+        if s["fragments_removed"]:
+            self.logger.info(f"  trailing fragments removed: {s['fragments_removed']}")
+        if s["skipped_long"]:
+            self.logger.info(f"  overlength segments skipped: {s['skipped_long']}")
+        return exported
+
+    def _next_index(self, base_name: str, fmt: str) -> int:
+        """Continue numbering after files already in the output folder for this speaker"""
+        best = 0
+        for f in self.audio_dir.glob(f"{base_name}_[0-9][0-9][0-9][0-9]*.{fmt}"):
+            tail = f.stem[len(base_name) + 1:][:4]
+            if tail.isdigit():
+                best = max(best, int(tail))
+        return best + 1
+
+    def _boundaries(self, audio: AudioSegment, seg: SegmentData) -> Tuple[int, int]:
+        """Extend into the pauses around the segment, never into the neighbouring words"""
+        start = max(0, seg.start_ms - int(self.params["word_start_buffer_ms"]))
+        end = min(len(audio), seg.end_ms + int(self.params["word_end_buffer_ms"]))
+        if seg.prev_word_end_ms is not None:
+            start = max(start, min(seg.prev_word_end_ms, seg.start_ms))
+        if seg.next_word_start_ms is not None:
+            end = min(end, max(seg.next_word_start_ms, seg.end_ms))
+        return start, end
+
+    # --------------------------------------------------------- cutoff / trim
+    @staticmethod
+    def _edge_is_loud(chunk: AudioSegment, at_start: bool, sensitivity: float) -> bool:
+        """Speech energy right at the boundary means the word was cut"""
+        if len(chunk) < 50:
+            return False
+        samples = np.abs(np.array(chunk.get_array_of_samples(), dtype=np.float64))
+        max_amp = float(2 ** (8 * chunk.sample_width - 1))
+        n = max(50, min(int(chunk.frame_rate * 0.01), len(samples) // 10))
+        window = samples[:n] if at_start else samples[-n:]
+        if window.size > 10:
+            k = max(2, min(5, window.size // 5))
+            window = np.convolve(window, np.ones(k) / k, mode="same")
+        return float(window.max() / max_amp) > max(0.0, min(1.0, sensitivity))
+
+    def _remove_end_fragment(self, chunk: AudioSegment, threshold_db: float = -40.0,
+                             min_silence_ms: int = 200, max_fragment_ms: int = 300) -> Optional[AudioSegment]:
+        """Drop a short burst of sound that follows a clear pause at the very end (a clipped next word)"""
+        if len(chunk) < min_silence_ms + 100:
+            return None
+        win = 10
+        db = AudioProcessor.rms_db_windows(chunk, win)
+        if db.size < 10:
+            return None
+        loud = db > threshold_db
+        idx = np.where(loud)[0]
+        if idx.size == 0 or idx[-1] < 10:
+            return None
+        last = idx[-1]
+        frag_start = last
+        while frag_start > 0 and loud[frag_start - 1]:
+            frag_start -= 1
+        sil_start = frag_start
+        while sil_start > 0 and not loud[sil_start - 1]:
+            sil_start -= 1
+        if sil_start == frag_start:
+            return None
+        fragment_ms = (last - frag_start + 1) * win
+        silence_ms = (frag_start - sil_start) * win
+        if silence_ms >= min_silence_ms and fragment_ms <= max_fragment_ms and sil_start > 0:
+            return chunk[: sil_start * win]
+        return None
+
+    # ---------------------------------------------------------------- metadata
     def generate_metadata(self, language: str):
-        """Generate metadata files for the exported segments"""
-        self.logger.info("Generating metadata...")
-
-        audio_files = sorted(self.audio_dir.glob(f"*.{self.params['export_format']}"))
-        if not audio_files:
-            self.logger.warning("No audio files found")
-            return
-
-        segments = []
-        for audio_file in audio_files:
-            transcript_file = self.text_dir / f"{audio_file.stem}.txt"
-            if not transcript_file.exists():
+        """Rebuild metadata for everything in the output folder (cumulative across runs)"""
+        fmt = self.params["export_format"]
+        rows: List[Dict] = []
+        for audio_file in sorted(self.audio_dir.glob(f"*.{fmt}")):
+            text_file = self.text_dir / f"{audio_file.stem}.txt"
+            if not text_file.exists():
                 continue
+            info = self.records.get(audio_file.name)
+            if info is None:
+                try:
+                    a = AudioSegment.from_file(str(audio_file))
+                    info = {"file_name": f"audio/{audio_file.name}", "transcript": f"transcripts/{text_file.name}",
+                            "text": text_file.read_text(encoding="utf-8").strip(),
+                            "duration": round(len(a) / 1000.0, 3), "sample_rate": a.frame_rate}
+                except Exception as exc:
+                    self.logger.error(f"Cannot read {audio_file.name}: {exc}")
+                    continue
+            rows.append(info)
 
-            try:
-                audio = AudioSegment.from_file(audio_file)
-                duration = len(audio) / 1000.0
-                text = transcript_file.read_text(encoding='utf-8').strip()
-
-                segments.append({
-                    'audio': audio_file.name,
-                    'transcript': transcript_file.name,
-                    'duration': duration,
-                    'text_length': len(text),
-                    'sample_rate': audio.frame_rate
-                })
-            except Exception as e:
-                self.logger.error(f"Error processing {audio_file.name}: {e}")
-
-        # Save metadata.json
-        metadata = {
-            'total_segments': len(segments),
-            'language': language,
-            'segments': segments
-        }
-        (self.output_dir / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2))
-
-        # Save manifest.txt
-        with open(self.output_dir / "manifest.txt", 'w', encoding='utf-8') as f:
-            for seg in segments:
-                f.write(f"{seg['audio']}|{seg['transcript']}\n")
-
-        # Save HuggingFace metadata.csv
-        with open(self.output_dir / "metadata.csv", 'w', encoding='utf-8') as f:
-            f.write("file_name,transcription\n")
-            for seg in segments:
-                text = (self.text_dir / seg['transcript']).read_text(encoding='utf-8').strip().replace('"', '""')
-                f.write(f'"{seg["audio"]}","{text}"\n')
-
-        self.logger.info("Metadata files created", extra={
-            'segments': len(segments),
-            'files': ['metadata.json', 'manifest.txt', 'metadata.csv']
-        })
+        total = sum(r["duration"] for r in rows)
+        meta = {"total_segments": len(rows), "total_duration": round(total, 2), "language": language,
+                "segments": rows}
+        (self.output_dir / "metadata.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2),
+                                                       encoding="utf-8")
+        with open(self.output_dir / "manifest.txt", "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(f"{r['file_name']}|{r['transcript']}\n")
+        # Hugging Face AudioFolder: file_name relative to metadata.csv + transcription column
+        with open(self.output_dir / "metadata.csv", "w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["file_name", "transcription", "duration"])
+            for r in rows:
+                w.writerow([r["file_name"], r["text"], r["duration"]])
+        self.logger.info(f"Metadata written: {len(rows)} segments, {total / 60:.1f} min "
+                         f"(metadata.csv, metadata.json, manifest.txt)")
+        return meta

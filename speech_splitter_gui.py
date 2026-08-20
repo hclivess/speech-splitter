@@ -1,940 +1,1098 @@
+#!/usr/bin/env python3
 """
-Speech Splitter v4 - GUI
-Modern graphical interface for sentence-based TTS data generation
-"""
+speech-splitter - GUI (PySide6)
 
-import sys
-import os
-from pathlib import Path
-from typing import List
+Queue + progress + log on the left, settings tabs on the right, presets in the menu.
+Set SPEECH_SPLITTER_SELFTEST=<audio file> to run a headless smoke test (tiny.en, CPU) and exit.
+"""
 import json
+import logging
+import os
+import subprocess
+import sys
+import time
+import traceback
+from pathlib import Path
+from typing import Dict, List, Optional
 
-# Fix for torch._pytree compatibility issue
-import warnings
-warnings.filterwarnings('ignore')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-try:
-    import torch.utils._pytree as pytree
-    if not hasattr(pytree, 'register_pytree_node'):
-        pytree.register_pytree_node = lambda *args, **kwargs: None
-except (ImportError, AttributeError):
-    pass
-
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox,
-    QFileDialog, QTextEdit, QProgressBar, QGroupBox, QListWidget, QMessageBox,
-    QCheckBox, QTabWidget, QListWidgetItem, QStatusBar, QMenuBar,
-    QGridLayout, QSplitter, QScrollArea
+from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal  # noqa: E402
+from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QIcon, QTextCursor  # noqa: E402
+from PySide6.QtWidgets import (  # noqa: E402
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
+    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton,
+    QScrollArea, QSizePolicy, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QTextEdit,
+    QVBoxLayout, QWidget,
 )
-from PySide6.QtCore import Qt, QThread, Signal, QUrl
-from PySide6.QtGui import QFont, QDragEnterEvent, QDropEvent, QColor, QTextCursor
+
+from config import (APP_NAME, APP_VERSION, AUDIO_EXTENSIONS, COMPUTE_TYPES, CUTOFF_ACTIONS, CUTOFF_MODES,  # noqa: E402
+                    DEFAULT_SETTINGS, DEVICES, EXPORT_FORMATS, LANGUAGES, MODEL_SIZES, OVERLENGTH_ACTIONS,
+                    WINDOW_MIN_HEIGHT, WINDOW_MIN_WIDTH)
+from utils import app_dir, format_duration  # noqa: E402
+
+_BTN = """
+    QPushButton { font-size: 14px; font-weight: bold; padding: 8px; background-color: %s; color: %s; border-radius: 5px; }
+    QPushButton:hover { background-color: %s; }
+    QPushButton:disabled { background-color: #cccccc; color: #666; }
+"""
+_BAR = """
+    QProgressBar { border: 1px solid #c8c8c8; border-radius: 4px; background: #f0f0f0;
+                   text-align: center; height: 18px; font-weight: bold; color: #333; }
+    QProgressBar::chunk { background-color: %s; border-radius: 3px; }
+"""
+_STATUS_COLORS = {"pending": "#ffffff", "running": "#fff3cd", "done": "#d4edda", "failed": "#f8d7da",
+                  "stopped": "#e2e3e5"}
+
+PRESETS = {
+    "fast": {"name": "Fast (small model, no audio filter)",
+             "settings": {"whisper_model": "small", "beam_size": 1, "filter_music": False, "filter_noise": False,
+                          "filter_silence": False, "check_cutoff": False}},
+    "balanced": {"name": "Balanced (large-v3-turbo, music filter)",
+                 "settings": {"whisper_model": "large-v3-turbo", "beam_size": 5, "filter_music": True,
+                              "music_threshold": 0.3, "mixed_threshold": 0.2, "filter_noise": False,
+                              "filter_silence": False, "check_cutoff": False, "min_confidence": 0.5}},
+    "strict": {"name": "Strict (large-v3, all filters, cutoff check)",
+               "settings": {"whisper_model": "large-v3", "beam_size": 5, "filter_music": True,
+                            "music_threshold": 0.25, "mixed_threshold": 0.15, "filter_noise": True,
+                            "noise_threshold": 0.3, "filter_silence": True, "silence_threshold": 0.3,
+                            "check_cutoff": True, "cutoff_action": "skip", "min_confidence": 0.65,
+                            "skip_edge_segments": True, "skip_segments_count": 1}},
+}
 
 
-class ProcessingThread(QThread):
-    progress = Signal(int)
-    status = Signal(str)
-    log = Signal(str, str)  # message, level
-    finished = Signal(dict)
-    error = Signal(str)
-    
-    def __init__(self, settings: dict, files: List[str]):
+# =============================================================================== worker
+class QtLogHandler(logging.Handler):
+    def __init__(self, emit_fn):
         super().__init__()
-        self.settings = settings
+        self.emit_fn = emit_fn
+
+    def emit(self, record):
+        try:
+            self.emit_fn(record.levelname, self.format(record))
+        except Exception:
+            pass
+
+
+class Worker(QThread):
+    log = Signal(str, str)                      # level, message
+    status = Signal(str)                        # phase text
+    file_started = Signal(int)
+    file_progress = Signal(str, float, float)   # phase, done, total
+    file_done = Signal(int, str, dict)          # index, state, stats
+    finished_all = Signal(int, int, dict)       # ok, total, metadata
+
+    def __init__(self, files: List[str], settings: Dict):
+        super().__init__()
         self.files = files
-        self._is_running = True
-    
-    def stop(self):
-        self._is_running = False
-    
+        self.settings = settings
+        self._stop = False
+
+    def request_stop(self):
+        self._stop = True
+
+    def run(self):
+        from utils import setup_logging
+        from speech_splitter import SpeechSplitter
+        out = Path(self.settings["output_dir"] or "output")
+        try:
+            out.mkdir(parents=True, exist_ok=True)
+            logger = setup_logging(out, self.settings.get("log_level", "INFO"), console=False)
+            handler = QtLogHandler(lambda lvl, msg: self.log.emit(lvl, msg))
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            handler.setLevel(logging.DEBUG if self.settings.get("log_level") == "DEBUG" else logging.INFO)
+            logger.addHandler(handler)
+            self.status.emit("Loading models")
+            splitter = SpeechSplitter(self.settings, logger=logger, status=self.status.emit,
+                                      progress=lambda ph, d, t: self.file_progress.emit(ph, d, t),
+                                      should_stop=lambda: self._stop)
+            self.log.emit("INFO", f"Device: {splitter.device}")
+        except Exception as exc:  # noqa: BLE001
+            self.log.emit("ERROR", f"Initialisation failed: {exc}")
+            self.log.emit("DEBUG", traceback.format_exc())
+            self.finished_all.emit(0, len(self.files), {})
+            return
+
+        ok = 0
+        for i, f in enumerate(self.files):
+            if self._stop:
+                self.file_done.emit(i, "stopped", {})
+                continue
+            self.file_started.emit(i)
+            try:
+                stats = splitter.process_file(f, self.settings.get("speaker_id") or None)
+                ok += 1
+                self.file_done.emit(i, "done", stats)
+            except InterruptedError:
+                self.file_done.emit(i, "stopped", {})
+            except Exception as exc:  # noqa: BLE001
+                self.log.emit("ERROR", f"{Path(f).name}: {exc}")
+                self.log.emit("DEBUG", traceback.format_exc())
+                self.file_done.emit(i, "failed", {})
+        meta = {}
+        try:
+            self.status.emit("Writing metadata")
+            meta = splitter.generate_metadata()
+        except Exception as exc:  # noqa: BLE001
+            self.log.emit("ERROR", f"Metadata generation failed: {exc}")
+        self.finished_all.emit(ok, len(self.files), meta)
+
+
+class DownloadThread(QThread):
+    progress = Signal(str, int, int)
+    done = Signal(object, str)
+
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+        self.stop = False
+
     def run(self):
         try:
-            # Import the modular speech_splitter
-            sys.path.insert(0, str(Path(__file__).parent))
-            from speech_splitter import SpeechSplitter
-            
-            self.status.emit("Initializing models...")
-            self.log.emit(f"Loading Whisper model: <b>{self.settings['whisper_model']}</b>", "info")
-            
-            splitter = SpeechSplitter(**self.settings)
-            
-            self.log.emit("✓ Models loaded successfully", "success")
-            
-            total_files = len(self.files)
-            results = []
-            
-            for idx, file_path in enumerate(self.files):
-                if not self._is_running:
-                    self.log.emit("\n⚠ Processing cancelled by user", "warning")
-                    break
-                
-                self.status.emit(f"Processing file {idx + 1}/{total_files}")
-                self.log.emit(f"<hr><b>File:</b> {Path(file_path).name}", "info")
-                
-                try:
-                    speaker_id = self.settings.get('speaker_id') or Path(file_path).stem
-                    stats = splitter.process_file(file_path, speaker_id=speaker_id)
-                    
-                    results.append({
-                        'file': file_path,
-                        'status': 'success',
-                        'segments': stats['total_segments'],
-                        'duration': stats['total_duration']
-                    })
-                    
-                    self.log.emit(f"✓ Complete: {stats['total_segments']} segments, {stats['total_duration']:.1f}s", "success")
-                    
-                except Exception as e:
-                    self.log.emit(f"✗ Error: {str(e)}", "error")
-                    results.append({'file': file_path, 'status': 'failed', 'error': str(e)})
-                
-                progress = int((idx + 1) / total_files * 100)
-                self.progress.emit(progress)
-            
-            # Summary
-            success = sum(1 for r in results if r['status'] == 'success')
-            total_segs = sum(r.get('segments', 0) for r in results)
-            
-            self.log.emit("<hr><h3>Processing Summary</h3>", "info")
-            self.log.emit(f"<b>Success:</b> {success}/{total_files} files", "info")
-            self.log.emit(f"<b>Total segments:</b> {total_segs}", "info")
-            self.log.emit(f"<b>Output directory:</b> {self.settings['output_dir']}", "info")
-            
-            if self._is_running and results:
-                self.status.emit("Generating metadata files...")
-                try:
-                    splitter.generate_metadata()
-                    self.log.emit("✓ Metadata files created", "success")
-                except Exception as e:
-                    self.log.emit(f"⚠ Metadata generation warning: {e}", "warning")
-            
-            self.finished.emit({'results': results, 'success': success, 'total_segments': total_segs})
-            
-        except Exception as e:
-            self.error.emit(str(e))
+            self.done.emit(self.fn(self), "")
+        except Exception as exc:  # noqa: BLE001
+            self.done.emit(None, str(exc))
 
 
-class SpeechSplitterGUI(QMainWindow):
+# =============================================================================== widgets
+class QueueTable(QTableWidget):
+    files_dropped = Signal(list)
+
+    def __init__(self):
+        super().__init__(0, 3)
+        self.setHorizontalHeaderLabels(["File", "Status", "Clips"])
+        self.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.verticalHeader().setVisible(False)
+        self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.setAcceptDrops(True)
+        self.setStyleSheet("QTableWidget { border: 2px solid #aaa; border-radius: 5px; background: #f9f9f9; }")
+
+    def dragEnterEvent(self, e: QDragEnterEvent):
+        e.accept() if e.mimeData().hasUrls() else e.ignore()
+
+    def dragMoveEvent(self, e):
+        e.accept() if e.mimeData().hasUrls() else e.ignore()
+
+    def dropEvent(self, e: QDropEvent):
+        if e.mimeData().hasUrls():
+            e.accept()
+            self.files_dropped.emit([u.toLocalFile() for u in e.mimeData().urls()])
+
+
+# =============================================================================== main window
+class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.check_cutoff_check = None
-        self.cutoff_sensitivity_spin = None
-        self.cutoff_check_mode_combo = None
-        self.processing_thread = None
-        self.selected_files = []
-        self.init_ui()
-        self.load_settings()
-    
-    def init_ui(self):
-        self.setWindowTitle("Speech Splitter v4 - Sentence-Based TTS Generator")
-        self.setMinimumSize(1200, 800)
-        
-        # Menu bar
-        menubar = self.menuBar()
-        file_menu = menubar.addMenu("File")
-        
-        save_action = file_menu.addAction("Save Settings")
-        save_action.triggered.connect(self.save_settings)
-        save_action.setShortcut("Ctrl+S")
-        
-        load_action = file_menu.addAction("Load Settings")
-        load_action.triggered.connect(self.load_settings_dialog)
-        load_action.setShortcut("Ctrl+O")
-        
-        file_menu.addSeparator()
-        
-        exit_action = file_menu.addAction("Exit")
-        exit_action.triggered.connect(self.close)
-        exit_action.setShortcut("Ctrl+Q")
-        
-        # Central widget
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
+        self.setMinimumSize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
+        self.resize(1180, 760)
+        self.qsettings = QSettings(APP_NAME, "Settings")
+        self.presets_dir = os.path.join(app_dir(), "presets")
+        os.makedirs(self.presets_dir, exist_ok=True)
+        self.files: List[str] = []
+        self.worker: Optional[Worker] = None
+        self.controls: Dict[str, QWidget] = {}
+        self._dl_thread: Optional[DownloadThread] = None
+        self._run_start = 0.0
+        self._clips = 0
+        self._seconds = 0.0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._build_ui()
+        self._build_menu()
+        self.apply_settings(dict(DEFAULT_SETTINGS))
+        self._load_persisted()
+        self._refresh_gpu_status()
+        self._refresh_model_labels()
+        self._check_ffmpeg()
 
-        # Main content splitter
-        content_splitter = QSplitter(Qt.Horizontal)
-        
-        # Settings panel
-        settings_widget = self.create_settings_panel()
-        content_splitter.addWidget(settings_widget)
-        
-        # Files and log panel
-        right_panel = self.create_right_panel()
-        content_splitter.addWidget(right_panel)
-        
-        content_splitter.setStretchFactor(0, 1)
-        content_splitter.setStretchFactor(1, 2)
-        main_layout.addWidget(content_splitter)
-        
-        # Progress bar and control buttons
-        controls = QHBoxLayout()
-        
-        self.start_button = QPushButton("▶ Start Processing")
-        self.start_button.clicked.connect(self.start_processing)
-        self.start_button.setStyleSheet("background: #27ae60; color: white; font-size: 14px; padding: 10px;")
-        controls.addWidget(self.start_button)
-        
-        self.stop_button = QPushButton("⏹ Stop")
-        self.stop_button.clicked.connect(self.stop_processing)
-        self.stop_button.setEnabled(False)
-        self.stop_button.setStyleSheet("background: #e74c3c; color: white; font-size: 14px; padding: 10px;")
-        controls.addWidget(self.stop_button)
-        
-        main_layout.addLayout(controls)
-        
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setMinimum(0)
-        self.progress_bar.setMaximum(100)
-        self.progress_bar.setValue(0)
-        main_layout.addWidget(self.progress_bar)
-        
-        # Status bar
-        self.status_bar = QStatusBar()
-        self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready")
-        
-        # Set initial splitter sizes
-        content_splitter.setSizes([400, 800])
+    # ------------------------------------------------------------------ UI
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.addWidget(self._left_panel())
+        split.addWidget(self._right_panel())
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        split.setSizes([640, 520])
+        root.addWidget(split, 1)
+        self.statusBar().showMessage("Ready")
 
-    def create_settings_panel(self):
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        
-        container = QWidget()
-        layout = QVBoxLayout(container)
-        
-        # Tabs for settings
-        tabs = QTabWidget()
-        
-        tabs.addTab(self.create_basic_tab(), "Basic")
-        tabs.addTab(self.create_quality_tab(), "Quality")
-        tabs.addTab(self.create_advanced_tab(), "Advanced")
-        tabs.addTab(self.create_output_tab(), "Output")
-        
-        layout.addWidget(tabs)
-        
-        # Reset button
-        reset_btn = QPushButton("Reset to Defaults")
-        reset_btn.clicked.connect(self.reset_settings)
-        layout.addWidget(reset_btn)
-        
-        layout.addStretch()
-        scroll.setWidget(container)
-        return scroll
-    
-    def create_basic_tab(self):
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        
-        # Model settings
-        model_group = QGroupBox("Model Settings")
-        model_layout = QGridLayout()
-        
-        model_layout.addWidget(QLabel("Whisper Model:"), 0, 0)
-        self.model_combo = QComboBox()
-        self.model_combo.addItems(['tiny', 'base', 'small', 'medium', 'large', 'large-v2', 'large-v3', 'turbo'])
-        self.model_combo.setCurrentText('large-v2')
-        model_layout.addWidget(self.model_combo, 0, 1)
-        
-        model_layout.addWidget(QLabel("Language:"), 1, 0)
-        self.language_combo = QComboBox()
-        self.language_combo.addItems([
-            'ar', 'ca', 'cs', 'da', 'de', 'el', 'en', 'es', 'eu', 'fa', 'fi', 'fr',
-            'gl', 'he', 'hi', 'hr', 'hu', 'it', 'ja', 'ka', 'ko', 'lv', 'ml', 'nl',
-            'nn', 'no', 'pl', 'pt', 'ro', 'ru', 'sk', 'sl', 'sv', 'te', 'tl', 'tr',
-            'uk', 'ur', 'vi', 'zh'])
-        self.language_combo.setCurrentText('cs')
-        self.language_combo.setEditable(True)
-        model_layout.addWidget(self.language_combo, 1, 1)
-        
-        model_layout.addWidget(QLabel("Batch Size:"), 2, 0)
-        self.batch_size_spin = QSpinBox()
-        self.batch_size_spin.setRange(1, 32)
-        self.batch_size_spin.setValue(6)
-        self.batch_size_spin.setToolTip("Higher = faster but more VRAM. Lower if you get OOM errors.")
-        model_layout.addWidget(self.batch_size_spin, 2, 1)
-        
-        model_layout.addWidget(QLabel("Device:"), 3, 0)
-        self.device_combo = QComboBox()
-        self.device_combo.addItems(['auto', 'cuda', 'cpu'])
-        self.device_combo.setCurrentText('auto')
-        self.device_combo.setToolTip("auto = use GPU if available, cuda = force GPU, cpu = force CPU")
-        model_layout.addWidget(self.device_combo, 3, 1)
-        
-        model_group.setLayout(model_layout)
-        layout.addWidget(model_group)
-        
-        # Segmentation settings (updated for sentence-based)
-        seg_group = QGroupBox("Segmentation Settings")
-        seg_layout = QGridLayout()
-        
-        seg_layout.addWidget(QLabel("Min Segment Length (s):"), 0, 0)
-        self.min_length_spin = QDoubleSpinBox()
-        self.min_length_spin.setRange(0.1, 30.0)
-        self.min_length_spin.setValue(1.0)
-        self.min_length_spin.setSingleStep(0.5)
-        seg_layout.addWidget(self.min_length_spin, 0, 1)
-        
-        seg_layout.addWidget(QLabel("Max Segment Length (s):"), 1, 0)
-        self.max_length_spin = QDoubleSpinBox()
-        self.max_length_spin.setRange(1.0, 60.0)
-        self.max_length_spin.setValue(15.0)
-        self.max_length_spin.setSingleStep(1.0)
-        seg_layout.addWidget(self.max_length_spin, 1, 1)
-        
-        info_label = QLabel("ℹ️ Segments are split by sentence punctuation (., !, ?)")
-        info_label.setWordWrap(True)
-        info_label.setStyleSheet("color: #3498db; font-style: italic; padding: 5px;")
-        seg_layout.addWidget(info_label, 2, 0, 1, 2)
-        
-        seg_group.setLayout(seg_layout)
-        layout.addWidget(seg_group)
-        
-        layout.addStretch()
-        return widget
-    
-    def create_quality_tab(self):
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
+    def _left_panel(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
 
-        # NEW: Edge segment removal
-        edge_group = QGroupBox("Edge Segment Removal")
-        edge_layout = QGridLayout()
+        lay.addWidget(QLabel("<b>Queue</b> — drop audio / video files or folders here"))
+        self.table = QueueTable()
+        self.table.files_dropped.connect(self.add_paths)
+        lay.addWidget(self.table, 3)
+        row = QHBoxLayout()
+        for text, fn in (("Add files", self.add_files), ("Add folder", self.add_folder),
+                         ("Remove", self.remove_selected), ("Clear", self.clear_queue)):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        row.addStretch()
+        open_out = QPushButton("Open output folder")
+        open_out.clicked.connect(self.open_output)
+        row.addWidget(open_out)
+        lay.addLayout(row)
 
-        self.skip_edge_segments_check = QCheckBox("Skip First && Last Segments Per File")
-        self.skip_edge_segments_check.setChecked(False)
-        self.skip_edge_segments_check.setToolTip(
-            "Removes N segments from start and end of each file to eliminate edge artifacts"
-        )
-        edge_layout.addWidget(self.skip_edge_segments_check, 0, 0, 1, 2)
+        prog = QGroupBox("Progress")
+        pl = QVBoxLayout(prog)
+        top = QHBoxLayout()
+        self.phase_label = QLabel("Idle")
+        self.phase_label.setStyleSheet("font-weight: bold;")
+        self.counter_label = QLabel("")
+        self.counter_label.setStyleSheet("color: #666;")
+        top.addWidget(self.phase_label)
+        top.addStretch()
+        top.addWidget(self.counter_label)
+        pl.addLayout(top)
+        self.file_bar = QProgressBar()
+        self.file_bar.setStyleSheet(_BAR % "#4a90d9")
+        self.file_bar.setFormat("%p%")
+        pl.addWidget(self.file_bar)
+        self.total_bar = QProgressBar()
+        self.total_bar.setStyleSheet(_BAR % "#28a745")
+        self.total_bar.setFormat("%v / %m files")
+        pl.addWidget(self.total_bar)
+        stats = QHBoxLayout()
+        self.stat_clips = self._stat(stats, "clips")
+        self.stat_minutes = self._stat(stats, "speech")
+        self.stat_elapsed = self._stat(stats, "elapsed")
+        self.stat_device = self._stat(stats, "device")
+        pl.addLayout(stats)
+        lay.addWidget(prog)
 
-        edge_layout.addWidget(QLabel("  Segments to Skip:"), 1, 0)
-        self.skip_segments_count_spin = QSpinBox()
-        self.skip_segments_count_spin.setRange(1, 10)
-        self.skip_segments_count_spin.setValue(1)
-        self.skip_segments_count_spin.setToolTip(
-            "Number of segments to remove from start AND end (e.g., 1 removes first + last)")
-        edge_layout.addWidget(self.skip_segments_count_spin, 1, 1)
+        lay.addWidget(QLabel("<b>Log</b>"))
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setStyleSheet("QTextEdit { font-family: monospace; font-size: 12px; background: #fcfcfc; }")
+        lay.addWidget(self.log, 2)
 
-        info_label = QLabel(
-            "ℹ️ Removes N segments from start and N from end. Useful for removing intro/outro noise or cutoff artifacts"
-        )
-        info_label.setWordWrap(True)
-        info_label.setStyleSheet("color: #7f8c8d; font-style: italic; font-size: 11px; padding: 5px;")
-        edge_layout.addWidget(info_label, 2, 0, 1, 2)
+        btns = QHBoxLayout()
+        self.start_btn = QPushButton("▶  Start")
+        self.start_btn.setStyleSheet(_BTN % ("#28a745", "white", "#218838"))
+        self.start_btn.clicked.connect(self.start)
+        self.stop_btn = QPushButton("■  Stop")
+        self.stop_btn.setStyleSheet(_BTN % ("#dc3545", "white", "#c82333"))
+        self.stop_btn.clicked.connect(self.stop)
+        self.stop_btn.setEnabled(False)
+        btns.addWidget(self.start_btn, 2)
+        btns.addWidget(self.stop_btn, 1)
+        lay.addLayout(btns)
+        return w
 
-        edge_group.setLayout(edge_layout)
-        layout.addWidget(edge_group)
+    @staticmethod
+    def _stat(layout, caption) -> QLabel:
+        box = QVBoxLayout()
+        c = QLabel(caption)
+        c.setStyleSheet("color: #888; font-size: 10px;")
+        v = QLabel("--")
+        v.setStyleSheet("font-weight: bold; font-size: 13px;")
+        box.addWidget(c)
+        box.addWidget(v)
+        layout.addLayout(box)
+        return v
 
-        deepfilter_group = QGroupBox("Speech Enhancement (Optional)")
-        deepfilter_layout = QVBoxLayout()
+    def _right_panel(self) -> QWidget:
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._wrap(self._model_tab()), "Model")
+        self.tabs.addTab(self._wrap(self._segmentation_tab()), "Segmentation")
+        self.tabs.addTab(self._wrap(self._quality_tab()), "Quality")
+        self.tabs.addTab(self._wrap(self._export_tab()), "Export")
+        for w in self.controls.values():
+            if isinstance(w, QComboBox):
+                w.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+                w.setMinimumContentsLength(8)
+            if isinstance(w, (QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox)):
+                w.setMinimumWidth(0)
+                w.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        return self.tabs
 
-        self.deepfilternet_check = QCheckBox("Enable DeepFilterNet Speech Isolation")
-        self.deepfilternet_check.setChecked(False)
-        self.deepfilternet_check.setToolTip(
-            "Isolate speech and reduce background noise using DeepFilterNet. "
-            "Adds processing time but improves quality."
-        )
-        deepfilter_layout.addWidget(self.deepfilternet_check)
+    @staticmethod
+    def _wrap(widget: QWidget) -> QScrollArea:
+        sa = QScrollArea()
+        sa.setWidgetResizable(True)
+        sa.setWidget(widget)
+        sa.setFrameShape(QScrollArea.Shape.NoFrame)
+        sa.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        return sa
 
-        deepfilter_group.setLayout(deepfilter_layout)
-        layout.addWidget(deepfilter_group)
+    def _path_row(self, line: QLineEdit, browse_fn) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.addWidget(line, 1)
+        b = QPushButton("…")
+        b.setFixedWidth(32)
+        b.clicked.connect(browse_fn)
+        row.addWidget(b)
+        return row
 
-        # Confidence filter
-        conf_group = QGroupBox("Transcription Quality")
-        conf_layout = QGridLayout()
-        
-        conf_layout.addWidget(QLabel("Min Confidence:"), 0, 0)
-        self.min_confidence_spin = QDoubleSpinBox()
-        self.min_confidence_spin.setRange(0.0, 1.0)
-        self.min_confidence_spin.setValue(0.5)
-        self.min_confidence_spin.setSingleStep(0.05)
-        conf_layout.addWidget(self.min_confidence_spin, 0, 1)
-        
-        conf_group.setLayout(conf_layout)
-        layout.addWidget(conf_group)
-        
-        # Audio filtering
-        audio_group = QGroupBox("Audio Filtering (Requires YAMNet)")
-        audio_layout = QVBoxLayout()
-        
-        # Music filter
-        music_layout = QGridLayout()
-        self.filter_music_check = QCheckBox("Filter Music")
-        self.filter_music_check.setChecked(True)
-        music_layout.addWidget(self.filter_music_check, 0, 0, 1, 2)
-        
-        music_layout.addWidget(QLabel("  Music Threshold:"), 1, 0)
-        self.music_threshold_spin = QDoubleSpinBox()
-        self.music_threshold_spin.setRange(0.0, 1.0)
-        self.music_threshold_spin.setValue(0.3)
-        self.music_threshold_spin.setSingleStep(0.05)
-        music_layout.addWidget(self.music_threshold_spin, 1, 1)
-        
-        music_layout.addWidget(QLabel("  Mixed Threshold:"), 2, 0)
-        self.mixed_threshold_spin = QDoubleSpinBox()
-        self.mixed_threshold_spin.setRange(0.0, 1.0)
-        self.mixed_threshold_spin.setValue(0.2)
-        self.mixed_threshold_spin.setSingleStep(0.05)
-        music_layout.addWidget(self.mixed_threshold_spin, 2, 1)
-        
-        audio_layout.addLayout(music_layout)
+    def _browse_dir(self, line: QLineEdit, title: str):
+        d = QFileDialog.getExistingDirectory(self, title, line.text() or os.path.expanduser("~"))
+        if d:
+            line.setText(d)
+            line.editingFinished.emit()
 
-        # NEW: Noise filter
-        noise_layout = QGridLayout()
-        self.filter_noise_check = QCheckBox("Filter Noise")
-        self.filter_noise_check.setChecked(False)
-        noise_layout.addWidget(self.filter_noise_check, 0, 0, 1, 2)
+    @staticmethod
+    def _hint(text: str) -> QLabel:
+        lab = QLabel(text)
+        lab.setWordWrap(True)
+        lab.setStyleSheet("color: #666; font-size: 11px;")
+        return lab
 
-        noise_layout.addWidget(QLabel("  Noise Threshold:"), 1, 0)
-        self.noise_threshold_spin = QDoubleSpinBox()
-        self.noise_threshold_spin.setRange(0.0, 1.0)
-        self.noise_threshold_spin.setValue(0.3)
-        self.noise_threshold_spin.setSingleStep(0.05)
-        self.noise_threshold_spin.setToolTip(
-            "Higher threshold = only filter obvious noise. Lower = filter more aggressive.")
-        noise_layout.addWidget(self.noise_threshold_spin, 1, 1)
+    def _model_tab(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        g = QGroupBox("Whisper model (faster-whisper)")
+        f = QFormLayout(g)
+        c = self.controls
+        c["whisper_model"] = QComboBox()
+        c["whisper_model"].setEditable(True)
+        c["whisper_model"].addItems(MODEL_SIZES)
+        c["whisper_model"].setToolTip("Model size, or any faster-whisper repo id from Hugging Face")
+        c["whisper_model"].currentTextChanged.connect(self._refresh_model_labels)
+        f.addRow("Model:", c["whisper_model"])
+        c["language"] = QComboBox()
+        for code, name in LANGUAGES.items():
+            c["language"].addItem(f"{name} ({code})" if code != "auto" else name, code)
+        f.addRow("Language:", c["language"])
+        c["device"] = QComboBox()
+        c["device"].addItems(DEVICES)
+        f.addRow("Device:", c["device"])
+        c["compute_type"] = QComboBox()
+        c["compute_type"].addItems(COMPUTE_TYPES)
+        c["compute_type"].setToolTip("default = float16 on GPU, int8 on CPU")
+        f.addRow("Compute type:", c["compute_type"])
+        c["beam_size"] = QSpinBox()
+        c["beam_size"].setRange(1, 10)
+        f.addRow("Beam size:", c["beam_size"])
+        c["cpu_threads"] = QSpinBox()
+        c["cpu_threads"].setRange(0, 64)
+        c["cpu_threads"].setSpecialValueText("auto")
+        f.addRow("CPU threads:", c["cpu_threads"])
+        c["vad_filter"] = QCheckBox("Silero VAD pre-filter (skip silences, fewer hallucinations)")
+        f.addRow("", c["vad_filter"])
+        c["initial_prompt"] = QLineEdit()
+        c["initial_prompt"].setPlaceholderText("optional: names, jargon, punctuation style hint")
+        f.addRow("Initial prompt:", c["initial_prompt"])
+        c["model_dir"] = QLineEdit()
+        c["model_dir"].setPlaceholderText("default: Hugging Face cache")
+        c["model_dir"].editingFinished.connect(self._refresh_model_labels)
+        f.addRow("Model folder:", self._path_row(c["model_dir"], lambda: self._browse_dir(c["model_dir"], "Model folder")))
+        c["use_transcription_cache"] = QCheckBox("Cache transcription next to the source file")
+        f.addRow("", c["use_transcription_cache"])
+        dl = QHBoxLayout()
+        self.model_label = self._hint("")
+        self.model_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.model_btn = QPushButton("Download / check model")
+        self.model_btn.clicked.connect(self._download_model)
+        dl.addWidget(self.model_label, 1)
+        dl.addWidget(self.model_btn)
+        f.addRow(dl)
+        lay.addWidget(g)
 
-        audio_layout.addLayout(noise_layout)
+        g2 = QGroupBox("Audio classifier (YAMNet, used by the Quality filters)")
+        f2 = QFormLayout(g2)
+        dl2 = QHBoxLayout()
+        self.yamnet_label = self._hint("")
+        self.yamnet_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.yamnet_btn = QPushButton("Download / check YAMNet")
+        self.yamnet_btn.clicked.connect(self._download_yamnet)
+        dl2.addWidget(self.yamnet_label, 1)
+        dl2.addWidget(self.yamnet_btn)
+        f2.addRow(dl2)
+        lay.addWidget(g2)
 
-        # NEW: Silence filter (separate from noise now)
-        silence_layout = QGridLayout()
-        self.filter_silence_check = QCheckBox("Filter Silence")
-        self.filter_silence_check.setChecked(False)
-        silence_layout.addWidget(self.filter_silence_check, 0, 0, 1, 2)
+        g3 = QGroupBox("GPU acceleration (NVIDIA CUDA)")
+        f3 = QVBoxLayout(g3)
+        self.gpu_label = self._hint("")
+        self.gpu_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        f3.addWidget(self.gpu_label)
+        c["cuda_lib_dir"] = QLineEdit()
+        c["cuda_lib_dir"].setPlaceholderText("auto (pip packages, CUDA_PATH, 'cuda' folder next to the app)")
+        c["cuda_lib_dir"].editingFinished.connect(self._refresh_gpu_status)
+        r = QFormLayout()
+        r.addRow("CUDA libraries folder:", self._path_row(c["cuda_lib_dir"],
+                                                        lambda: self._browse_dir(c["cuda_lib_dir"], "CUDA libraries folder")))
+        f3.addLayout(r)
+        br = QHBoxLayout()
+        self.cuda_dl_label = self._hint("")
+        self.cuda_dl_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.cuda_btn = QPushButton("Download CUDA libraries")
+        self.cuda_btn.setToolTip("cuBLAS 12 + cuDNN 9 from PyPI (official NVIDIA wheels, ~1 GB) into a 'cuda' folder next to the app")
+        self.cuda_btn.clicked.connect(self._download_cuda)
+        recheck = QPushButton("Re-check GPU")
+        recheck.clicked.connect(self._refresh_gpu_status)
+        br.addWidget(self.cuda_dl_label, 1)
+        br.addWidget(self.cuda_btn)
+        br.addWidget(recheck)
+        f3.addLayout(br)
+        lay.addWidget(g3)
+        lay.addStretch()
+        return w
 
-        silence_layout.addWidget(QLabel("  Silence Threshold:"), 1, 0)
-        self.noise_silence_threshold_spin = QDoubleSpinBox()
-        self.noise_silence_threshold_spin.setRange(0.0, 1.0)
-        self.noise_silence_threshold_spin.setValue(0.3)
-        self.noise_silence_threshold_spin.setSingleStep(0.05)
-        silence_layout.addWidget(self.noise_silence_threshold_spin, 1, 1)
+    def _segmentation_tab(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        c = self.controls
+        g = QGroupBox("Sentence segments")
+        f = QFormLayout(g)
+        c["min_segment_length"] = QDoubleSpinBox()
+        c["min_segment_length"].setRange(0.2, 30.0)
+        c["min_segment_length"].setSuffix(" s")
+        c["min_segment_length"].setSingleStep(0.5)
+        f.addRow("Min length:", c["min_segment_length"])
+        c["max_segment_length"] = QDoubleSpinBox()
+        c["max_segment_length"].setRange(1.0, 120.0)
+        c["max_segment_length"].setSuffix(" s")
+        c["max_segment_length"].setSingleStep(1.0)
+        f.addRow("Max length:", c["max_segment_length"])
+        c["merge_short"] = QCheckBox("Merge short sentences with the next one")
+        f.addRow("", c["merge_short"])
+        c["merge_max_gap"] = QDoubleSpinBox()
+        c["merge_max_gap"].setRange(0.0, 5.0)
+        c["merge_max_gap"].setSuffix(" s")
+        c["merge_max_gap"].setSingleStep(0.1)
+        c["merge_max_gap"].setToolTip("Only merge when the pause between the sentences is at most this long")
+        f.addRow("Merge max pause:", c["merge_max_gap"])
+        c["overlength_action"] = QComboBox()
+        for k, v in OVERLENGTH_ACTIONS.items():
+            c["overlength_action"].addItem(v, k)
+        f.addRow("Longer than max:", c["overlength_action"])
+        f.addRow(self._hint("Segments are split at sentence punctuation (. ! ?) in any language; numbers like "
+                            "\"3.5\" never split. Clips end at the last word, never at the next word's start."))
+        lay.addWidget(g)
 
-        audio_layout.addLayout(silence_layout)
+        g2 = QGroupBox("Boundary buffers")
+        f2 = QFormLayout(g2)
+        c["word_start_buffer_ms"] = QSpinBox()
+        c["word_start_buffer_ms"].setRange(0, 2000)
+        c["word_start_buffer_ms"].setSuffix(" ms")
+        c["word_start_buffer_ms"].setSingleStep(50)
+        f2.addRow("Before first word:", c["word_start_buffer_ms"])
+        c["word_end_buffer_ms"] = QSpinBox()
+        c["word_end_buffer_ms"].setRange(0, 2000)
+        c["word_end_buffer_ms"].setSuffix(" ms")
+        c["word_end_buffer_ms"].setSingleStep(50)
+        f2.addRow("After last word:", c["word_end_buffer_ms"])
+        f2.addRow(self._hint("Buffers extend into the surrounding pause but are clamped to the neighbouring words, "
+                             "so they never cut into other speech."))
+        lay.addWidget(g2)
 
-        audio_group.setLayout(audio_layout)
-        layout.addWidget(audio_group)
-        
-        layout.addStretch()
-        return widget
+        g3 = QGroupBox("Cutoff detection")
+        f3 = QFormLayout(g3)
+        c["check_cutoff"] = QCheckBox("Detect clipped first / last words")
+        f3.addRow("", c["check_cutoff"])
+        c["cutoff_check_mode"] = QComboBox()
+        c["cutoff_check_mode"].addItems(CUTOFF_MODES)
+        f3.addRow("Check:", c["cutoff_check_mode"])
+        c["cutoff_sensitivity"] = QDoubleSpinBox()
+        c["cutoff_sensitivity"].setRange(0.0, 1.0)
+        c["cutoff_sensitivity"].setSingleStep(0.05)
+        c["cutoff_sensitivity"].setToolTip("Peak level at the very edge that counts as speech. Lower = more sensitive")
+        f3.addRow("Sensitivity:", c["cutoff_sensitivity"])
+        c["cutoff_action"] = QComboBox()
+        for k, v in CUTOFF_ACTIONS.items():
+            c["cutoff_action"].addItem(v, k)
+        f3.addRow("Action:", c["cutoff_action"])
+        lay.addWidget(g3)
+        lay.addStretch()
+        return w
 
-    def create_advanced_tab(self):
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
+    def _quality_tab(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        c = self.controls
+        g = QGroupBox("Transcription confidence")
+        f = QFormLayout(g)
+        c["min_confidence"] = QDoubleSpinBox()
+        c["min_confidence"].setRange(0.0, 1.0)
+        c["min_confidence"].setSingleStep(0.05)
+        c["min_confidence"].setToolTip("Average word probability reported by Whisper; clips below are rejected")
+        f.addRow("Min confidence:", c["min_confidence"])
+        lay.addWidget(g)
 
-        # Word buffers
-        buffer_group = QGroupBox("Word Boundaries")
-        buffer_layout = QGridLayout()
+        g2 = QGroupBox("Audio content filters (YAMNet)")
+        f2 = QFormLayout(g2)
+        c["filter_music"] = QCheckBox("Reject music, singing, speech over music")
+        f2.addRow("", c["filter_music"])
+        c["music_threshold"] = QDoubleSpinBox()
+        c["music_threshold"].setRange(0.0, 1.0)
+        c["music_threshold"].setSingleStep(0.05)
+        f2.addRow("Music threshold:", c["music_threshold"])
+        c["mixed_threshold"] = QDoubleSpinBox()
+        c["mixed_threshold"].setRange(0.0, 1.0)
+        c["mixed_threshold"].setSingleStep(0.05)
+        c["mixed_threshold"].setToolTip("Score for 'speech with background music' classes")
+        f2.addRow("Mixed threshold:", c["mixed_threshold"])
+        c["filter_noise"] = QCheckBox("Reject noisy clips (hum, hiss, wind…)")
+        f2.addRow("", c["filter_noise"])
+        c["noise_threshold"] = QDoubleSpinBox()
+        c["noise_threshold"].setRange(0.0, 1.0)
+        c["noise_threshold"].setSingleStep(0.05)
+        f2.addRow("Noise threshold:", c["noise_threshold"])
+        c["filter_silence"] = QCheckBox("Reject mostly silent clips")
+        f2.addRow("", c["filter_silence"])
+        c["silence_threshold"] = QDoubleSpinBox()
+        c["silence_threshold"].setRange(0.0, 1.0)
+        c["silence_threshold"].setSingleStep(0.05)
+        f2.addRow("Silence threshold:", c["silence_threshold"])
+        f2.addRow(self._hint("Lower thresholds reject more. The classifier downloads once (~16 MB) and runs on the CPU."))
+        lay.addWidget(g2)
 
-        buffer_layout.addWidget(QLabel("Start Buffer (ms):"), 0, 0)
-        self.word_start_buffer_spin = QSpinBox()
-        self.word_start_buffer_spin.setRange(0, 2000)
-        self.word_start_buffer_spin.setValue(250)
-        self.word_start_buffer_spin.setSingleStep(50)
-        buffer_layout.addWidget(self.word_start_buffer_spin, 0, 1)
+        g3 = QGroupBox("Edge segments")
+        f3 = QFormLayout(g3)
+        c["skip_edge_segments"] = QCheckBox("Drop first / last segments of each file")
+        f3.addRow("", c["skip_edge_segments"])
+        c["skip_segments_count"] = QSpinBox()
+        c["skip_segments_count"].setRange(1, 20)
+        f3.addRow("Segments per end:", c["skip_segments_count"])
+        lay.addWidget(g3)
+        lay.addStretch()
+        return w
 
-        buffer_layout.addWidget(QLabel("End Buffer (ms):"), 1, 0)
-        self.word_end_buffer_spin = QSpinBox()
-        self.word_end_buffer_spin.setRange(0, 2000)
-        self.word_end_buffer_spin.setValue(250)
-        self.word_end_buffer_spin.setSingleStep(50)
-        buffer_layout.addWidget(self.word_end_buffer_spin, 1, 1)
+    def _export_tab(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        c = self.controls
+        g = QGroupBox("Output")
+        f = QFormLayout(g)
+        c["output_dir"] = QLineEdit()
+        f.addRow("Output folder:", self._path_row(c["output_dir"], lambda: self._browse_dir(c["output_dir"], "Output folder")))
+        c["speaker_id"] = QLineEdit()
+        c["speaker_id"].setPlaceholderText("empty = source file name")
+        c["speaker_id"].setToolTip("Prefix for clip names; numbering continues across runs")
+        f.addRow("Speaker id:", c["speaker_id"])
+        c["export_format"] = QComboBox()
+        c["export_format"].addItems(EXPORT_FORMATS)
+        f.addRow("Format:", c["export_format"])
+        c["export_sample_rate"] = QComboBox()
+        for sr in (0, 16000, 22050, 24000, 44100, 48000):
+            c["export_sample_rate"].addItem("keep original" if sr == 0 else f"{sr} Hz", sr)
+        f.addRow("Sample rate:", c["export_sample_rate"])
+        f.addRow(self._hint("Writes audio/<name>_0001.wav, transcripts/<name>_0001.txt, metadata.csv "
+                            "(Hugging Face AudioFolder: file_name, transcription), metadata.json and manifest.txt."))
+        lay.addWidget(g)
 
-        buffer_group.setLayout(buffer_layout)
-        layout.addWidget(buffer_group)
+        g2 = QGroupBox("Silence trimming")
+        f2 = QFormLayout(g2)
+        c["trim_silence"] = QCheckBox("Trim leading / trailing silence")
+        f2.addRow("", c["trim_silence"])
+        c["trim_threshold_db"] = QDoubleSpinBox()
+        c["trim_threshold_db"].setRange(-80.0, -10.0)
+        c["trim_threshold_db"].setSuffix(" dB")
+        f2.addRow("Threshold:", c["trim_threshold_db"])
+        c["trim_chunk_ms"] = QSpinBox()
+        c["trim_chunk_ms"].setRange(5, 50)
+        c["trim_chunk_ms"].setSuffix(" ms")
+        f2.addRow("Analysis window:", c["trim_chunk_ms"])
+        c["trim_pad_ms"] = QSpinBox()
+        c["trim_pad_ms"].setRange(0, 500)
+        c["trim_pad_ms"].setSuffix(" ms")
+        f2.addRow("Keep padding:", c["trim_pad_ms"])
+        c["remove_fragments"] = QCheckBox("Remove a stray burst after a pause at the end")
+        f2.addRow("", c["remove_fragments"])
+        lay.addWidget(g2)
 
-        # Cutoff detection - UPDATED
-        cutoff_group = QGroupBox("Cutoff Detection")
-        cutoff_layout = QGridLayout()
+        g3 = QGroupBox("Logging")
+        f3 = QFormLayout(g3)
+        c["log_level"] = QComboBox()
+        c["log_level"].addItems(["INFO", "DEBUG"])
+        f3.addRow("Log level:", c["log_level"])
+        lay.addWidget(g3)
+        lay.addStretch()
+        return w
 
-        self.check_cutoff_check = QCheckBox("Enable Cutoff Detection")
-        self.check_cutoff_check.setChecked(False)
-        #self.cutoff_check_mode_combo.setCurrentText('both')
-        #self.cutoff_sensitivity_spin.setValue(0.35)
-        cutoff_layout.addWidget(self.check_cutoff_check, 0, 0, 1, 2)
+    def _build_menu(self):
+        mb = self.menuBar()
+        fm = mb.addMenu("&File")
+        fm.addAction("Add files…", self.add_files, "Ctrl+O")
+        fm.addAction("Add folder…", self.add_folder, "Ctrl+Shift+O")
+        fm.addAction("Open output folder", self.open_output)
+        fm.addSeparator()
+        fm.addAction("Exit", self.close, "Ctrl+Q")
 
-        # NEW: Check mode selector
-        cutoff_layout.addWidget(QLabel("  Check:"), 1, 0)
-        self.cutoff_check_mode_combo = QComboBox()
-        self.cutoff_check_mode_combo.addItems(['both', 'start', 'end', 'none'])
-        self.cutoff_check_mode_combo.setCurrentText('both')
-        self.cutoff_check_mode_combo.setToolTip("Which boundaries to check for cutoffs")
-        cutoff_layout.addWidget(self.cutoff_check_mode_combo, 1, 1)
+        self.presets_menu = mb.addMenu("&Presets")
+        self._rebuild_presets_menu()
 
-        # NEW: Sensitivity slider
-        cutoff_layout.addWidget(QLabel("  Sensitivity:"), 2, 0)
-        self.cutoff_sensitivity_spin = QDoubleSpinBox()
-        self.cutoff_sensitivity_spin.setRange(0.0, 1.0)
-        self.cutoff_sensitivity_spin.setValue(0.35)
-        self.cutoff_sensitivity_spin.setSingleStep(0.05)
-        self.cutoff_sensitivity_spin.setToolTip(
-            "Lower = more sensitive (detects more cutoffs)\nHigher = less sensitive")
-        cutoff_layout.addWidget(self.cutoff_sensitivity_spin, 2, 1)
+        hm = mb.addMenu("&Help")
+        hm.addAction("About", self._about)
 
-        cutoff_layout.addWidget(QLabel("  Action:"), 3, 0)
-        self.cutoff_action_combo = QComboBox()
-        self.cutoff_action_combo.addItems(['include', 'skip', 'rename'])
-        self.cutoff_action_combo.setCurrentText('skip')
-        self.cutoff_action_combo.setToolTip(
-            "include = export normally\nskip = don't export\nrename = add _CUTOFF suffix")
-        cutoff_layout.addWidget(self.cutoff_action_combo, 3, 1)
+    def _rebuild_presets_menu(self):
+        m = self.presets_menu
+        m.clear()
+        for key, p in PRESETS.items():
+            m.addAction(p["name"], lambda k=key: self._apply_preset(k))
+        m.addSeparator()
+        user = sorted(f[:-5] for f in os.listdir(self.presets_dir) if f.endswith(".json") and f != "defaults.json")
+        if user:
+            for name in user:
+                m.addAction(name, lambda n=name: self._load_preset_file(os.path.join(self.presets_dir, n + ".json")))
+            m.addSeparator()
+        m.addAction("Save preset…", self._save_preset)
+        m.addAction("Delete preset…", self._delete_preset)
+        m.addAction("Import preset…", self._import_preset)
+        m.addAction("Export preset…", self._export_preset)
+        m.addSeparator()
+        m.addAction("Save current settings as defaults", self._save_defaults)
+        m.addAction("Reset to factory defaults", lambda: self.apply_settings(dict(DEFAULT_SETTINGS)))
 
-        cutoff_group.setLayout(cutoff_layout)
-        layout.addWidget(cutoff_group)
+    # ------------------------------------------------------------- settings io
+    def get_settings(self) -> Dict:
+        s = {}
+        for key, w in self.controls.items():
+            if isinstance(w, QCheckBox):
+                s[key] = w.isChecked()
+            elif isinstance(w, QComboBox):
+                data = w.currentData()
+                s[key] = data if data is not None and not w.isEditable() else w.currentText().strip()
+            elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
+                s[key] = w.value()
+            elif isinstance(w, QLineEdit):
+                s[key] = w.text().strip()
+        return s
 
-        # Overlength action
-        overlength_group = QGroupBox("Overlength Segments")
-        overlength_layout = QGridLayout()
+    def apply_settings(self, s: Dict):
+        for key, w in self.controls.items():
+            if key not in s:
+                continue
+            v = s[key]
+            try:
+                if isinstance(w, QCheckBox):
+                    w.setChecked(bool(v))
+                elif isinstance(w, QComboBox):
+                    idx = w.findData(v)
+                    if idx < 0:
+                        idx = w.findText(str(v))
+                    if idx >= 0:
+                        w.setCurrentIndex(idx)
+                    elif w.isEditable():
+                        w.setCurrentText(str(v))
+                elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
+                    w.setValue(v)
+                elif isinstance(w, QLineEdit):
+                    w.setText("" if v is None else str(v))
+            except Exception:
+                pass
+        self._refresh_model_labels()
 
-        overlength_layout.addWidget(QLabel("Action:"), 0, 0)
-        self.overlength_action_combo = QComboBox()
-        self.overlength_action_combo.addItems(['rename', 'skip', 'include'])
-        self.overlength_action_combo.setCurrentText('rename')
-        overlength_layout.addWidget(self.overlength_action_combo, 0, 1)
+    def _load_persisted(self):
+        defaults = os.path.join(self.presets_dir, "defaults.json")
+        if os.path.isfile(defaults):
+            try:
+                with open(defaults, encoding="utf-8") as fh:
+                    self.apply_settings(json.load(fh))
+            except Exception:
+                pass
+        raw = self.qsettings.value("settings")
+        if raw:
+            try:
+                self.apply_settings(json.loads(raw))
+            except Exception:
+                pass
+        geo = self.qsettings.value("geometry")
+        if geo:
+            self.restoreGeometry(geo)
 
-        overlength_group.setLayout(overlength_layout)
-        layout.addWidget(overlength_group)
+    def closeEvent(self, event):
+        if self.worker and self.worker.isRunning():
+            if QMessageBox.question(self, "Quit", "Processing is running. Stop and quit?") != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self.worker.request_stop()
+            self.worker.wait(5000)
+        self.qsettings.setValue("settings", json.dumps(self.get_settings()))
+        self.qsettings.setValue("geometry", self.saveGeometry())
+        event.accept()
 
-        layout.addStretch()
-        return widget
-    
-    def create_output_tab(self):
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        
-        # Output settings
-        output_group = QGroupBox("Output Settings")
-        output_layout = QGridLayout()
-        
-        output_layout.addWidget(QLabel("Output Directory:"), 0, 0)
-        self.output_input = QLineEdit('output')
-        output_layout.addWidget(self.output_input, 0, 1)
-        browse_btn = QPushButton("Browse")
-        browse_btn.clicked.connect(self.browse_output)
-        output_layout.addWidget(browse_btn, 0, 2)
-        
-        output_layout.addWidget(QLabel("Speaker ID (optional):"), 1, 0)
-        self.speaker_input = QLineEdit()
-        self.speaker_input.setPlaceholderText("Leave empty to use filename")
-        output_layout.addWidget(self.speaker_input, 1, 1, 1, 2)
-        
-        output_layout.addWidget(QLabel("Format:"), 2, 0)
-        self.format_combo = QComboBox()
-        self.format_combo.addItems(['wav', 'mp3'])
-        output_layout.addWidget(self.format_combo, 2, 1)
-        
-        output_group.setLayout(output_layout)
-        layout.addWidget(output_group)
-        
-        # Silence trimming
-        trim_group = QGroupBox("Silence Trimming")
-        trim_layout = QGridLayout()
-        
-        self.trim_silence_check = QCheckBox("Enable Silence Trimming")
-        self.trim_silence_check.setChecked(True)
-        trim_layout.addWidget(self.trim_silence_check, 0, 0, 1, 2)
-        
-        trim_layout.addWidget(QLabel("  Threshold (dB):"), 1, 0)
-        self.trim_threshold_spin = QDoubleSpinBox()
-        self.trim_threshold_spin.setRange(-60.0, -20.0)
-        self.trim_threshold_spin.setValue(-45.0)
-        self.trim_threshold_spin.setSingleStep(1.0)
-        trim_layout.addWidget(self.trim_threshold_spin, 1, 1)
-        
-        trim_layout.addWidget(QLabel("  Chunk Size (ms):"), 2, 0)
-        self.trim_chunk_spin = QSpinBox()
-        self.trim_chunk_spin.setRange(5, 50)
-        self.trim_chunk_spin.setValue(10)
-        trim_layout.addWidget(self.trim_chunk_spin, 2, 1)
-        
-        trim_layout.addWidget(QLabel("  Padding (ms):"), 3, 0)
-        self.trim_pad_spin = QSpinBox()
-        self.trim_pad_spin.setRange(0, 500)
-        self.trim_pad_spin.setValue(50)
-        trim_layout.addWidget(self.trim_pad_spin, 3, 1)
-        
-        trim_group.setLayout(trim_layout)
-        layout.addWidget(trim_group)
-        
-        layout.addStretch()
-        return widget
-    
-    def create_right_panel(self):
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        
-        # Files section
-        files_label = QLabel("<b>Audio Files</b>")
-        layout.addWidget(files_label)
-        
-        self.file_list = QListWidget()
-        self.file_list.setAcceptDrops(True)
-        self.file_list.setDragEnabled(True)
-        self.file_list.dragEnterEvent = self.drag_enter_event
-        self.file_list.dropEvent = self.drop_event
-        layout.addWidget(self.file_list)
-        
-        # File buttons
-        file_buttons = QHBoxLayout()
-        add_file_btn = QPushButton("Add Files")
-        add_file_btn.clicked.connect(self.add_files)
-        file_buttons.addWidget(add_file_btn)
-        
-        add_folder_btn = QPushButton("Add Folder")
-        add_folder_btn.clicked.connect(self.add_folder)
-        file_buttons.addWidget(add_folder_btn)
-        
-        clear_btn = QPushButton("Clear List")
-        clear_btn.clicked.connect(self.clear_files)
-        file_buttons.addWidget(clear_btn)
-        
-        layout.addLayout(file_buttons)
-        
-        # Log section
-        log_label = QLabel("<b>Processing Log</b>")
-        layout.addWidget(log_label)
-        
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        layout.addWidget(self.log_text)
-        
-        return widget
-    
-    def browse_output(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Output Directory")
-        if folder:
-            self.output_input.setText(folder)
-    
+    # ---------------------------------------------------------------- presets
+    def _apply_preset(self, key):
+        self.apply_settings(PRESETS[key]["settings"])
+        self.statusBar().showMessage(f"Preset applied: {PRESETS[key]['name']}")
+
+    def _write_json(self, path: str, data: Dict) -> bool:
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+            return True
+        except Exception as exc:
+            QMessageBox.warning(self, "Preset", f"Could not write {path}:\n{exc}")
+            return False
+
+    def _save_preset(self):
+        name, ok = QInputDialog.getText(self, "Save preset", "Preset name:")
+        if ok and name.strip():
+            if self._write_json(os.path.join(self.presets_dir, name.strip() + ".json"), self.get_settings()):
+                self._rebuild_presets_menu()
+
+    def _delete_preset(self):
+        user = sorted(f[:-5] for f in os.listdir(self.presets_dir) if f.endswith(".json") and f != "defaults.json")
+        if not user:
+            QMessageBox.information(self, "Presets", "No saved presets.")
+            return
+        name, ok = QInputDialog.getItem(self, "Delete preset", "Preset:", user, 0, False)
+        if ok and name:
+            os.remove(os.path.join(self.presets_dir, name + ".json"))
+            self._rebuild_presets_menu()
+
+    def _load_preset_file(self, path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                self.apply_settings(json.load(fh))
+            self.statusBar().showMessage(f"Preset loaded: {os.path.basename(path)}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Preset", f"Could not read preset:\n{exc}")
+
+    def _import_preset(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import preset", "", "JSON (*.json)")
+        if path:
+            self._load_preset_file(path)
+
+    def _export_preset(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export preset", "preset.json", "JSON (*.json)")
+        if path:
+            self._write_json(path, self.get_settings())
+
+    def _save_defaults(self):
+        if self._write_json(os.path.join(self.presets_dir, "defaults.json"), self.get_settings()):
+            self.statusBar().showMessage("Current settings saved as defaults")
+
+    # ------------------------------------------------------------- downloads
+    def _refresh_gpu_status(self, *_):
+        from cuda_utils import cuda_status
+        st = cuda_status(self.controls["cuda_lib_dir"].text().strip())
+        self.gpu_label.setText(str(st["text"]))
+        self.gpu_label.setStyleSheet("color: %s; font-size: 11px;" % ("#155724" if st["ready"] else "#856404"))
+
+    def _refresh_model_labels(self, *_):
+        if not hasattr(self, "model_label"):
+            return
+        from transcription import is_model_cached, model_repo_id
+        from audio_classifier import is_yamnet_cached
+        model = self.controls["whisper_model"].currentText().strip()
+        mdir = self.controls["model_dir"].text().strip()
+        if model:
+            cached = is_model_cached(model, mdir)
+            self.model_label.setText(f"{model_repo_id(model)} — {'downloaded' if cached else 'not downloaded yet'}")
+        self.yamnet_label.setText("YAMNet — " + ("downloaded" if is_yamnet_cached(mdir) else "not downloaded yet"))
+
+    def _run_download(self, button: QPushButton, label: QLabel, fn, done_text):
+        if self._dl_thread and self._dl_thread.isRunning():
+            QMessageBox.information(self, "Download", "Another download is still running.")
+            return
+        button.setEnabled(False)
+        old = button.text()
+        button.setText("Downloading…")
+        t = DownloadThread(fn)
+        t.progress.connect(lambda m, d, tot: label.setText(f"{m} — {d / 1048576:.0f} / {tot / 1048576:.0f} MB" if tot else m))
+
+        def done(result, err):
+            button.setEnabled(True)
+            button.setText(old)
+            if err:
+                label.setText("Download failed")
+                QMessageBox.warning(self, "Download failed", err)
+            else:
+                label.setText(done_text(result))
+            self._refresh_model_labels()
+            self._refresh_gpu_status()
+        t.done.connect(done)
+        self._dl_thread = t
+        t.start()
+
+    def _download_model(self):
+        from transcription import download_model
+        model = self.controls["whisper_model"].currentText().strip()
+        mdir = self.controls["model_dir"].text().strip()
+        self.model_label.setText(f"Downloading {model}…")
+        self._run_download(self.model_btn, self.model_label, lambda th: download_model(model, mdir),
+                           lambda r: f"Model ready: {r}")
+
+    def _download_yamnet(self):
+        from audio_classifier import download_yamnet
+        mdir = self.controls["model_dir"].text().strip()
+        self.yamnet_label.setText("Downloading YAMNet…")
+        self._run_download(self.yamnet_btn, self.yamnet_label, lambda th: download_yamnet(mdir),
+                           lambda r: "YAMNet ready")
+
+    def _download_cuda(self):
+        from cuda_utils import default_cuda_dir, download_cuda_libraries
+        if sys.platform == "darwin":
+            QMessageBox.information(self, "CUDA", "CUDA is not available on macOS.")
+            return
+        dest = self.controls["cuda_lib_dir"].text().strip() or default_cuda_dir()
+        if QMessageBox.question(self, "Download CUDA libraries",
+                                f"Download cuBLAS 12 and cuDNN 9 (official NVIDIA wheels from PyPI, about 1 GB) into:\n"
+                                f"{dest}\n\nContinue?") != QMessageBox.StandardButton.Yes:
+            return
+
+        def fn(th):
+            return download_cuda_libraries(dest, progress=lambda m, d, t: th.progress.emit(m, d, t),
+                                           should_stop=lambda: th.stop)
+
+        def done_text(files):
+            if not self.controls["cuda_lib_dir"].text().strip():
+                self.controls["cuda_lib_dir"].setText(dest)
+            return f"{len(files)} libraries installed in {dest}"
+        self._run_download(self.cuda_btn, self.cuda_dl_label, fn, done_text)
+
+    def _check_ffmpeg(self):
+        from audio_processor import find_ffmpeg
+        if not find_ffmpeg():
+            self._append_log("WARNING", "ffmpeg not found: only plain WAV input will work. Install FFmpeg "
+                                        "(or put ffmpeg next to the app) for mp3 / m4a / flac / video input.")
+
+    # ------------------------------------------------------------------ queue
+    def add_paths(self, paths: List[str]):
+        added = 0
+        for p in paths:
+            path = Path(p)
+            if path.is_dir():
+                for f in sorted(path.rglob("*")):
+                    if f.suffix.lower() in AUDIO_EXTENSIONS:
+                        added += self._add_one(str(f))
+            elif path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS:
+                added += self._add_one(str(path))
+        if added:
+            self.statusBar().showMessage(f"{added} file(s) added — {len(self.files)} in queue")
+
+    def _add_one(self, path: str) -> int:
+        if path in self.files:
+            return 0
+        self.files.append(path)
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        item = QTableWidgetItem(os.path.basename(path))
+        item.setToolTip(path)
+        self.table.setItem(r, 0, item)
+        self.table.setItem(r, 1, QTableWidgetItem("pending"))
+        self.table.setItem(r, 2, QTableWidgetItem(""))
+        self._color_row(r, "pending")
+        return 1
+
+    def _color_row(self, row: int, state: str):
+        for col in range(3):
+            it = self.table.item(row, col)
+            if it:
+                it.setBackground(QColor(_STATUS_COLORS.get(state, "#ffffff")))
+
     def add_files(self):
-        files, _ = QFileDialog.getOpenFileNames(
-            self, "Select Audio Files", "",
-            "Audio Files (*.wav *.mp3 *.flac *.m4a *.ogg);;All Files (*)"
-        )
-        for file in files:
-            if file not in self.selected_files:
-                self.selected_files.append(file)
-                self.file_list.addItem(Path(file).name)
+        exts = " ".join(f"*{e}" for e in AUDIO_EXTENSIONS)
+        files, _ = QFileDialog.getOpenFileNames(self, "Add audio files", "", f"Audio / video ({exts});;All files (*)")
+        self.add_paths(files)
 
     def add_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Folder with Audio Files")
-        if folder:
-            folder_path = Path(folder)
-            for ext in ['*.wav', '*.mp3', '*.flac', '*.m4a', '*.ogg']:
-                for file in folder_path.rglob(ext):  # <-- Use rglob instead of glob
-                    file_str = str(file)
-                    if file_str not in self.selected_files:
-                        self.selected_files.append(file_str)
-                        self.file_list.addItem(file.name)
-    
-    def clear_files(self):
-        self.selected_files.clear()
-        self.file_list.clear()
-    
-    def drag_enter_event(self, event: QDragEnterEvent):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-    
-    def drop_event(self, event: QDropEvent):
-        for url in event.mimeData().urls():
-            file_path = url.toLocalFile()
-            path = Path(file_path)
-            
-            if path.is_file() and path.suffix.lower() in ['.wav', '.mp3', '.flac', '.m4a', '.ogg']:
-                if str(path) not in self.selected_files:
-                    self.selected_files.append(str(path))
-                    self.file_list.addItem(path.name)
-            elif path.is_dir():
-                for ext in ['*.wav', '*.mp3', '*.flac', '*.m4a', '*.ogg']:
-                    for file in path.rglob(ext):
-                        file_str = str(file)
-                        if file_str not in self.selected_files:
-                            self.selected_files.append(file_str)
-                            self.file_list.addItem(file.name)
-    
-    def append_log(self, message: str, level: str = "info"):
-        colors = {
-            'info': '#2c3e50',
-            'success': '#27ae60',
-            'warning': '#f39c12',
-            'error': '#e74c3c'
-        }
-        color = colors.get(level, colors['info'])
-        self.log_text.append(f'<span style="color: {color};">{message}</span>')
-        self.log_text.moveCursor(QTextCursor.End)
-    
-    def start_processing(self):
-        if not self.selected_files:
-            QMessageBox.warning(self, "No Files", "Please add audio files to process")
+        d = QFileDialog.getExistingDirectory(self, "Add folder")
+        if d:
+            self.add_paths([d])
+
+    def remove_selected(self):
+        if self.worker and self.worker.isRunning():
             return
-        
-        if not self.validate_settings():
+        rows = sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)
+        for r in rows:
+            self.table.removeRow(r)
+            del self.files[r]
+
+    def clear_queue(self):
+        if self.worker and self.worker.isRunning():
             return
-        
-        settings = self.get_settings()
-        
-        self.log_text.clear()
-        self.append_log("<h3>Starting processing...</h3>", "info")
-        
-        self.processing_thread = ProcessingThread(settings, self.selected_files)
-        self.processing_thread.progress.connect(self.progress_bar.setValue)
-        self.processing_thread.status.connect(self.status_bar.showMessage)
-        self.processing_thread.log.connect(self.append_log)
-        self.processing_thread.finished.connect(self.processing_finished)
-        self.processing_thread.error.connect(self.processing_error)
-        
-        self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        
-        self.processing_thread.start()
-    
-    def stop_processing(self):
-        if self.processing_thread:
-            self.processing_thread.stop()
-            self.append_log("Stopping processing...", "warning")
-    
-    def processing_finished(self, results: dict):
-        self.start_button.setEnabled(True)
-        self.stop_button.setEnabled(False)
-        self.status_bar.showMessage("Processing complete")
-        
-        QMessageBox.information(
-            self,
-            "Complete",
-            f"Processing finished!\n\n"
-            f"Successful: {results['success']} files\n"
-            f"Total segments: {results['total_segments']}"
-        )
-    
-    def processing_error(self, error_msg: str):
-        self.start_button.setEnabled(True)
-        self.stop_button.setEnabled(False)
-        self.status_bar.showMessage("Error occurred")
-        
-        self.append_log(f"<b>Error:</b> {error_msg}", "error")
-        QMessageBox.critical(self, "Error", f"Processing failed:\n\n{error_msg}")
-    
-    def get_settings(self):
-        device = self.device_combo.currentText()
-        return {
-            'use_deepfilternet': self.deepfilternet_check.isChecked(),
-            'whisper_model': self.model_combo.currentText(),
-            'skip_edge_segments': self.skip_edge_segments_check.isChecked(),
-            'skip_segments_count': self.skip_segments_count_spin.value(),
-            'language': self.language_combo.currentText(),
-            'batch_size': self.batch_size_spin.value(),
-            'device': None if device == 'auto' else device,
-            'output_dir': self.output_input.text(),
-            'speaker_id': self.speaker_input.text() or None,
-            'min_segment_length': self.min_length_spin.value(),
-            'max_segment_length': self.max_length_spin.value(),
-            'export_format': self.format_combo.currentText(),
-            'min_confidence': self.min_confidence_spin.value(),
-            'filter_noise': self.filter_noise_check.isChecked(),
-            'noise_threshold': self.noise_threshold_spin.value(),
-            'filter_silence': self.filter_silence_check.isChecked(),
-            'noise_silence_threshold': self.noise_silence_threshold_spin.value(),
-            'filter_music': self.filter_music_check.isChecked(),
-            'music_threshold': self.music_threshold_spin.value(),
-            'mixed_threshold': self.mixed_threshold_spin.value(),
-            'word_start_buffer_ms': self.word_start_buffer_spin.value(),
-            'word_end_buffer_ms': self.word_end_buffer_spin.value(),
-            'check_cutoff': self.check_cutoff_check.isChecked(),
-            'cutoff_check_mode': self.cutoff_check_mode_combo.currentText(),
-            'cutoff_sensitivity': self.cutoff_sensitivity_spin.value(),
-            'cutoff_action': self.cutoff_action_combo.currentText(),
-            'overlength_action': self.overlength_action_combo.currentText(),
-            'trim_threshold_db': self.trim_threshold_spin.value(),
-            'trim_chunk_ms': self.trim_chunk_spin.value(),
-            'trim_pad_ms': self.trim_pad_spin.value(),
-            'log_level': 'INFO'
-        }
-    
-    def validate_settings(self):
-        settings = self.get_settings()
-        warnings = []
-        
-        if settings['min_segment_length'] >= settings['max_segment_length']:
-            warnings.append("Min length should be less than max length")
-        
-        if settings['word_start_buffer_ms'] + settings['word_end_buffer_ms'] > 2000:
-            warnings.append("Total buffer size > 2s may cause overlapping segments")
-        
-        if settings['filter_music'] and settings['music_threshold'] < settings['mixed_threshold']:
-            warnings.append("Music threshold should be >= mixed threshold")
-        
-        if warnings:
-            msg = "Settings warnings:\n\n" + "\n".join(f"⚠ {w}" for w in warnings)
-            msg += "\n\nContinue anyway?"
-            reply = QMessageBox.question(self, "Settings Validation", msg, QMessageBox.Yes | QMessageBox.No)
-            return reply == QMessageBox.Yes
-        
-        return True
-    
-    def reset_settings(self):
-        reply = QMessageBox.question(self, "Reset Settings", "Reset all settings to defaults?", QMessageBox.Yes | QMessageBox.No)
-        if reply != QMessageBox.Yes:
-            return
-        
-        # Basic
-        self.model_combo.setCurrentText('large')
-        self.language_combo.setCurrentText('cs')
-        self.batch_size_spin.setValue(6)
-        self.device_combo.setCurrentText('auto')
-        self.min_length_spin.setValue(1.0)
-        self.max_length_spin.setValue(15.0)
+        self.files.clear()
+        self.table.setRowCount(0)
 
-        # Quality
-        self.skip_edge_segments_check.setChecked(False)
-        self.skip_segments_count_spin.setValue(1)
-        self.noise_threshold_spin.setValue(0.3)
-        self.filter_silence_check.setChecked(False)
-        self.min_confidence_spin.setValue(0.5)
-        self.filter_noise_check.setChecked(False)
-        self.noise_silence_threshold_spin.setValue(0.3)
-        self.filter_music_check.setChecked(True)
-        self.music_threshold_spin.setValue(0.3)
-        self.mixed_threshold_spin.setValue(0.2)
-        self.deepfilternet_check.setChecked(False)
-
-        # Advanced
-        self.word_start_buffer_spin.setValue(250)
-        self.word_end_buffer_spin.setValue(250)
-        self.check_cutoff_check.setChecked(False)
-        self.cutoff_action_combo.setCurrentText('skip')
-        self.overlength_action_combo.setCurrentText('rename')
-        
-        # Output
-        self.output_input.setText('output')
-        self.speaker_input.clear()
-        self.format_combo.setCurrentText('wav')
-        self.trim_silence_check.setChecked(True)
-        self.trim_threshold_spin.setValue(-45.0)
-        self.trim_chunk_spin.setValue(10)
-        self.trim_pad_spin.setValue(50)
-        
-        self.append_log("Settings reset to defaults", "info")
-    
-    def load_settings(self):
-        settings_file = Path.home() / '.speech_splitter_v4_settings.json'
-        if settings_file.exists():
-            try:
-                with open(settings_file) as f:
-                    settings = json.load(f)
-                self.apply_settings(settings)
-                self.append_log("Settings loaded", "info")
-            except Exception as e:
-                self.append_log(f"Failed to load settings: {e}", "warning")
-    
-    def load_settings_dialog(self):
-        file, _ = QFileDialog.getOpenFileName(self, "Load Settings", "", "JSON Files (*.json)")
-        if file:
-            try:
-                with open(file) as f:
-                    settings = json.load(f)
-                self.apply_settings(settings)
-                self.append_log(f"Settings loaded from {file}", "info")
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to load settings:\n{e}")
-    
-    def apply_settings(self, settings: dict):
-        self.deepfilternet_check.setChecked(settings.get('use_deepfilternet', False))
-        self.model_combo.setCurrentText(settings.get('whisper_model', 'large'))
-        self.language_combo.setCurrentText(settings.get('language', 'cs'))
-        self.batch_size_spin.setValue(settings.get('batch_size', 6))
-        device = settings.get('device', None)
-        self.device_combo.setCurrentText('auto' if device is None else device)
-        self.output_input.setText(settings.get('output_dir', 'output'))
-        self.speaker_input.setText(settings.get('speaker_id', ''))
-        self.min_length_spin.setValue(settings.get('min_segment_length', 1.0))
-        self.max_length_spin.setValue(settings.get('max_segment_length', 15.0))
-        self.format_combo.setCurrentText(settings.get('export_format', 'wav'))
-        self.min_confidence_spin.setValue(settings.get('min_confidence', 0.5))
-        self.filter_noise_check.setChecked(settings.get('filter_noise', False))
-        self.noise_silence_threshold_spin.setValue(settings.get('noise_silence_threshold', 0.3))
-        self.filter_music_check.setChecked(settings.get('filter_music', True))
-        self.music_threshold_spin.setValue(settings.get('music_threshold', 0.3))
-        self.mixed_threshold_spin.setValue(settings.get('mixed_threshold', 0.2))
-        self.word_start_buffer_spin.setValue(settings.get('word_start_buffer_ms', 250))
-        self.word_end_buffer_spin.setValue(settings.get('word_end_buffer_ms', 250))
-        self.check_cutoff_check.setChecked(settings.get('check_cutoff', False))
-        self.cutoff_check_mode_combo.setCurrentText(settings.get('cutoff_check_mode', 'both'))
-        self.cutoff_sensitivity_spin.setValue(settings.get('cutoff_sensitivity', 0.35))
-        self.cutoff_action_combo.setCurrentText(settings.get('cutoff_action', 'skip'))
-        self.overlength_action_combo.setCurrentText(settings.get('overlength_action', 'rename'))
-        self.trim_silence_check.setChecked(settings.get('trim_silence', True))
-        self.trim_threshold_spin.setValue(settings.get('trim_threshold_db', -45.0))
-        self.trim_chunk_spin.setValue(settings.get('trim_chunk_ms', 10))
-        self.trim_pad_spin.setValue(settings.get('trim_pad_ms', 50))
-
-        self.filter_noise_check.setChecked(settings.get('filter_noise', False))
-        self.noise_threshold_spin.setValue(settings.get('noise_threshold', 0.3))
-        self.filter_silence_check.setChecked(settings.get('filter_silence', False))
-        self.noise_silence_threshold_spin.setValue(settings.get('noise_silence_threshold', 0.3))
-
-        self.skip_edge_segments_check.setChecked(settings.get('skip_edge_segments', False))
-        self.skip_segments_count_spin.setValue(settings.get('skip_segments_count', 1))
-    
-    def save_settings(self):
-        settings = self.get_settings()
-        settings_file = Path.home() / '.speech_splitter_v4_settings.json'
-        
+    def open_output(self):
+        out = os.path.abspath(self.controls["output_dir"].text().strip() or "output")
+        os.makedirs(out, exist_ok=True)
         try:
-            with open(settings_file, 'w') as f:
-                json.dump(settings, f, indent=2)
-            QMessageBox.information(self, "Saved", f"Settings saved to:\n{settings_file}")
-            self.append_log("Settings saved", "success")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to save settings:\n{e}")
+            if sys.platform == "win32":
+                os.startfile(out)  # noqa
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", out])
+            else:
+                subprocess.Popen(["xdg-open", out])
+        except Exception as exc:
+            QMessageBox.information(self, "Output folder", f"{out}\n\n({exc})")
+
+    # -------------------------------------------------------------- processing
+    def _validate(self, s: Dict) -> List[str]:
+        problems = []
+        if s["min_segment_length"] >= s["max_segment_length"]:
+            problems.append("Min segment length must be smaller than max segment length.")
+        if s["filter_music"] and s["music_threshold"] < s["mixed_threshold"]:
+            problems.append("Music threshold is below the mixed threshold (mixed is usually the stricter one).")
+        model = s["whisper_model"]
+        if model.endswith(".en") and s["language"] not in ("en", "auto"):
+            problems.append(f"{model} is an English-only model but language is '{s['language']}'.")
+        if s["device"] == "cuda":
+            from transcription import cuda_available
+            if not cuda_available(s.get("cuda_lib_dir", "")):
+                problems.append("Device is set to CUDA but no usable GPU / CUDA libraries were found.")
+        return problems
+
+    def start(self):
+        if not self.files:
+            QMessageBox.information(self, "Queue", "Add some audio files first.")
+            return
+        s = self.get_settings()
+        problems = self._validate(s)
+        if problems:
+            if QMessageBox.question(self, "Check settings", "\n\n".join(problems) + "\n\nStart anyway?") \
+                    != QMessageBox.StandardButton.Yes:
+                return
+        for r in range(self.table.rowCount()):
+            self.table.item(r, 1).setText("pending")
+            self.table.item(r, 2).setText("")
+            self._color_row(r, "pending")
+        self.log.clear()
+        self._clips = 0
+        self._seconds = 0.0
+        self._run_start = time.time()
+        self.total_bar.setRange(0, len(self.files))
+        self.total_bar.setValue(0)
+        self.file_bar.setRange(0, 100)
+        self.file_bar.setValue(0)
+        self.stat_clips.setText("0")
+        self.stat_minutes.setText("0.0 min")
+        self.stat_device.setText("--")
+        self._timer.start(1000)
+        self.worker = Worker(list(self.files), s)
+        w = self.worker
+        w.log.connect(self._append_log)
+        w.status.connect(self._on_status)
+        w.file_started.connect(self._on_file_started)
+        w.file_progress.connect(self._on_file_progress)
+        w.file_done.connect(self._on_file_done)
+        w.finished_all.connect(self._on_finished)
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.tabs.setEnabled(False)
+        w.start()
+
+    def stop(self):
+        if self.worker:
+            self.worker.request_stop()
+            self.phase_label.setText("Stopping…")
+            self.stop_btn.setEnabled(False)
+
+    def _tick(self):
+        self.stat_elapsed.setText(format_duration(time.time() - self._run_start))
+
+    def _on_status(self, text: str):
+        self.phase_label.setText(text)
+        self.statusBar().showMessage(text)
+        if text.startswith("Loading"):
+            self.file_bar.setRange(0, 0)       # busy indicator while models load
+
+    def _on_file_started(self, i: int):
+        self.table.item(i, 1).setText("running")
+        self._color_row(i, "running")
+        self.table.scrollToItem(self.table.item(i, 0))
+        self.counter_label.setText(f"file {i + 1} / {len(self.files)} — {os.path.basename(self.files[i])}")
+        self.file_bar.setRange(0, 100)
+        self.file_bar.setValue(0)
+
+    def _on_file_progress(self, phase: str, done: float, total: float):
+        # transcribe = 0-70 %, filter = 70-90 %, export = 90-100 %
+        spans = {"transcribe": (0, 70), "filter": (70, 90), "export": (90, 100)}
+        lo, hi = spans.get(phase, (0, 100))
+        frac = (done / total) if total else 0.0
+        if self.file_bar.maximum() == 0:
+            self.file_bar.setRange(0, 100)
+        self.file_bar.setValue(int(lo + (hi - lo) * min(1.0, frac)))
+
+    def _on_file_done(self, i: int, state: str, stats: Dict):
+        self.table.item(i, 1).setText(state)
+        self._color_row(i, state)
+        if state == "done":
+            self.table.item(i, 2).setText(str(stats.get("segments", 0)))
+            self._clips += stats.get("segments", 0)
+            self._seconds += stats.get("duration", 0.0)
+            self.stat_clips.setText(str(self._clips))
+            self.stat_minutes.setText(f"{self._seconds / 60:.1f} min")
+            self.file_bar.setRange(0, 100)
+            self.file_bar.setValue(100)
+        self.total_bar.setValue(self.total_bar.value() + 1)
+
+    def _on_finished(self, ok: int, total: int, meta: Dict):
+        self._timer.stop()
+        self._tick()
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.tabs.setEnabled(True)
+        if self.file_bar.maximum() == 0:
+            self.file_bar.setRange(0, 100)
+        self.phase_label.setText("Finished" if ok == total else "Finished with problems")
+        self.counter_label.setText("")
+        if meta:
+            out = os.path.abspath(self.controls["output_dir"].text() or "output")
+            self._append_log("INFO", f"Dataset: {meta.get('total_segments', 0)} clips, "
+                                     f"{meta.get('total_duration', 0) / 60:.1f} min → {out}")
+        self.statusBar().showMessage(f"Done: {ok}/{total} files")
+        if self.worker:
+            self.worker.wait(10000)
+            self.worker.deleteLater()
+        self.worker = None
+
+    def _append_log(self, level: str, msg: str):
+        color = {"DEBUG": "#888", "INFO": "#2c3e50", "WARNING": "#b8860b", "ERROR": "#c0392b",
+                 "CRITICAL": "#c0392b"}.get(level, "#2c3e50")
+        if msg.startswith("Device: "):
+            self.stat_device.setText(msg[8:])
+        safe = msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        self.log.append(f'<span style="color:{color};">{safe}</span>')
+        self.log.moveCursor(QTextCursor.MoveOperation.End)
+
+    def _about(self):
+        QMessageBox.about(self, f"About {APP_NAME}",
+                          f"<b>{APP_NAME} {APP_VERSION}</b><br>Turn audio into a TTS training dataset.<br><br>"
+                          "faster-whisper (CTranslate2) for word-level transcription, YAMNet (onnxruntime) for "
+                          "music / noise rejection, FFmpeg for decoding.<br><br>"
+                          "<a href='https://github.com/hclivess/speech-splitter'>github.com/hclivess/speech-splitter</a>")
 
 
+# =============================================================================== entry
 def main():
     app = QApplication(sys.argv)
-    
-    # Set application style
     app.setStyle("Fusion")
-    
-    # Load stylesheet
-    stylesheet = """
-    QMainWindow {
-        background-color: #f5f5f5;
-    }
-    QGroupBox {
-        font-weight: bold;
-        border: 1px solid #d0d0d0;
-        border-radius: 5px;
-        margin-top: 10px;
-        padding-top: 10px;
-    }
-    QGroupBox::title {
-        subcontrol-origin: margin;
-        left: 10px;
-        padding: 0 5px;
-    }
-    QPushButton {
-        padding: 8px 15px;
-        border-radius: 5px;
-        font-weight: bold;
-    }
-    QPushButton:hover {
-        background-color: #e0e0e0;
-    }
-    QProgressBar {
-        height: 20px;
-        border-radius: 5px;
-        text-align: center;
-    }
-    QProgressBar::chunk {
-        background-color: #3498db;
-    }
-    """
-    app.setStyleSheet(stylesheet)
-    
-    window = SpeechSplitterGUI()
-    window.show()
+    icon = os.path.join(app_dir(), "icon.ico")
+    if os.path.exists(icon):
+        app.setWindowIcon(QIcon(icon))
+    win = MainWindow()
+    win.show()
+    selftest = os.environ.get("SPEECH_SPLITTER_SELFTEST")
+    if selftest:
+        _selftest(win, selftest)
     sys.exit(app.exec())
 
 
-if __name__ == '__main__':
+def _selftest(win: MainWindow, path: str):
+    """Headless smoke test for CI: tiny.en on the CPU, music filter on (exercises YAMNet), exit 0 on success"""
+    out = os.path.join(os.path.dirname(os.path.abspath(path)), "selftest_out")
+    win.apply_settings({"whisper_model": "tiny.en", "language": "en", "device": "cpu", "beam_size": 1,
+                        "filter_music": True, "output_dir": out, "use_transcription_cache": False})
+    win.add_paths([path])
+
+    def finished(ok, total, meta):
+        print(f"selftest: finished {ok}/{total}, {meta.get('total_segments', 0)} clips", flush=True)
+        code = 0 if ok == total and meta.get("total_segments", 0) > 0 else 1
+        QTimer.singleShot(0, lambda: (win.worker and win.worker.wait(10000), QApplication.exit(code)))
+
+    def go():
+        win.start()
+        win.worker.log.connect(lambda lvl, m: print(f"selftest[{lvl}]: {m}", flush=True))
+        win.worker.status.connect(lambda m: print(f"selftest: {m}", flush=True))
+        win.worker.finished_all.connect(finished)
+    QTimer.singleShot(300, go)
+
+
+if __name__ == "__main__":
     main()

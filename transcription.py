@@ -1,131 +1,171 @@
 """
-Transcription management using WhisperX
-Handles: Model loading, transcription, alignment, caching
+Transcription with word timestamps using faster-whisper (CTranslate2).
+Results are cached next to the source file as <name>.transcription.json and reused when
+the same model + language is requested again.
 """
-
-import os
 import json
 import logging
+import os
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Callable, Dict, List, Optional
+
+from audio_processor import AudioProcessor
+from cuda_utils import setup_cuda
+
+CACHE_VERSION = 3
+
+
+def cuda_available(cuda_lib_dir: str = "") -> bool:
+    try:
+        setup_cuda(cuda_lib_dir)
+        import ctranslate2
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        return False
+
+
+def resolve_device(device: str, cuda_lib_dir: str = "") -> str:
+    if device == "auto":
+        return "cuda" if cuda_available(cuda_lib_dir) else "cpu"
+    if device == "cuda":
+        setup_cuda(cuda_lib_dir)
+    return device
+
+
+def model_repo_id(model: str) -> str:
+    try:
+        from faster_whisper.utils import _MODELS
+        return _MODELS.get(model, model)
+    except Exception:
+        return model
+
+
+def is_model_cached(model: str, model_dir: str = "") -> bool:
+    if os.path.isdir(model) and os.path.isfile(os.path.join(model, "model.bin")):
+        return True
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        res = try_to_load_from_cache(model_repo_id(model), "model.bin", cache_dir=model_dir or None)
+        return isinstance(res, str) and os.path.isfile(res)
+    except Exception:
+        return False
+
+
+def download_model(model: str, model_dir: str = "") -> str:
+    from faster_whisper import download_model as _dl
+    return _dl(model, cache_dir=model_dir or None)
 
 
 class TranscriptionManager:
-    """Manage WhisperX transcription with caching"""
-    
-    def __init__(self, model_name: str, language: str, device: str, logger: logging.Logger, batch_size: int = 6):
-        self.model_name = model_name
-        self.language = language
-        self.device = device
+    def __init__(self, params: Dict, logger: logging.Logger,
+                 status: Optional[Callable[[str], None]] = None):
+        self.params = params
         self.logger = logger
-        self.batch_size = batch_size
-        
-        # Load WhisperX
+        self.status = status or (lambda m: None)
+        self.model_name = params["whisper_model"]
+        lang = params.get("language", "auto")
+        self.language = None if lang in ("", "auto") else lang
+        self.device = resolve_device(params.get("device", "auto"), params.get("cuda_lib_dir", ""))
+        compute = params.get("compute_type", "default")
+        if compute == "default":
+            compute = "float16" if self.device == "cuda" else "int8"
+        self.compute_type = compute
+        self.model = None
+
+    def load(self):
+        if self.model is not None:
+            return
+        from faster_whisper import WhisperModel
+        self.status(f"Loading model {self.model_name} ({self.device}, {self.compute_type})")
+        self.logger.info(f"Loading faster-whisper model {self.model_name} on {self.device} [{self.compute_type}]")
+        kwargs = {"device": self.device, "compute_type": self.compute_type,
+                  "download_root": self.params.get("model_dir") or None}
+        if self.device == "cpu" and int(self.params.get("cpu_threads") or 0) > 0:
+            kwargs["cpu_threads"] = int(self.params["cpu_threads"])
         try:
-            import whisperx
-            self.whisperx = whisperx
-        except ImportError:
-            raise RuntimeError("WhisperX not found. Install: pip install git+https://github.com/m-bain/whisperx.git")
-        
-        # Load model
-        self.logger.info(f"Loading WhisperX model: {model_name}")
-        self.model = whisperx.load_model(
-            model_name,
-            device=device,
-            compute_type='float16' if device == 'cuda' else 'int8',
-            language=language
-        )
-        self.logger.info("✓ WhisperX model loaded")
-    
-    def transcribe(self, audio_path: str, original_path: str) -> Dict:
-        """Transcribe audio with caching - saves as <filename>.transcription.json alongside source"""
-        # Cache alongside source file with clear name
-        source_cache = Path(original_path).with_suffix('.transcription.json')
-        
-        # Check for cache
-        if source_cache.exists():
-            self.logger.info(f"Loading cached transcription: {source_cache.name}")
-            try:
-                with open(source_cache, encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception as e:
-                self.logger.warning(f"Cache read failed: {e}, re-transcribing")
-        
-        self.logger.info("Transcribing audio...")
-        
-        # Transcribe
-        audio = self.whisperx.load_audio(audio_path)
-        result = self.model.transcribe(audio, batch_size=self.batch_size)
-        
-        self.logger.info(f"✓ Transcription complete: {len(result.get('segments', []))} segments")
-        
-        # Align (with fallback)
-        try:
-            self.logger.info("Loading alignment model...")
-            model_a, metadata = self.whisperx.load_align_model(
-                language_code=self.language, 
-                device=self.device
-            )
-            result = self.whisperx.align(
-                result["segments"], 
-                model_a, 
-                metadata, 
-                audio, 
-                self.device, 
-                return_char_alignments=False
-            )
-            self.logger.info("✓ Alignment completed")
-        except Exception as e:
-            self.logger.warning(f"Alignment failed (continuing without it): {e}")
-            self.logger.warning("Speech splitter will work but timestamps may be less accurate")
-        
-        # Extract words
-        all_words = []
-        for segment in result.get('segments', []):
-            if 'words' in segment:
-                for word in segment['words']:
-                    all_words.append({
-                        'word': word.get('word', ''),
-                        'start': word.get('start', 0),
-                        'end': word.get('end', 0),
-                        'probability': word.get('score', 1.0)
-                    })
+            self.model = WhisperModel(self.model_name, **kwargs)
+        except Exception as exc:
+            if self.device == "cuda":
+                self.logger.warning(f"CUDA model load failed ({exc}); falling back to CPU")
+                self.device, self.compute_type = "cpu", "int8"
+                kwargs.update(device="cpu", compute_type="int8")
+                self.model = WhisperModel(self.model_name, **kwargs)
             else:
-                # Fallback: use segment timestamps
-                segment_words = segment.get('text', '').split()
-                if segment_words:
-                    seg_start = segment.get('start', 0)
-                    seg_end = segment.get('end', 0)
-                    seg_duration = seg_end - seg_start
-                    word_duration = seg_duration / len(segment_words) if len(segment_words) > 0 else 0
-                    
-                    for i, word_text in enumerate(segment_words):
-                        all_words.append({
-                            'word': word_text,
-                            'start': seg_start + i * word_duration,
-                            'end': seg_start + (i + 1) * word_duration,
-                            'probability': 1.0
-                        })
-        
-        self.logger.info(f"WhisperX complete: {len(all_words)} words")
-        
-        # Prepare transcription data
-        transcription_data = {
-            'text': ' '.join([w['word'] for w in all_words]),
-            'words': all_words,
-            'segments': result.get('segments', []),
-            'language': self.language,
-            'model': f"{self.model_name}-whisperx",
-            'aligned': 'words' in result.get('segments', [{}])[0] if result.get('segments') else False
+                raise
+        self.logger.info("Model loaded")
+
+    def _cache_path(self, source: Path) -> Path:
+        return source.with_suffix(".transcription.json")
+
+    def _cache_valid(self, data: Dict) -> bool:
+        return (data.get("cache_version") == CACHE_VERSION and data.get("model") == self.model_name
+                and (self.language is None or data.get("language") == self.language) and bool(data.get("words")))
+
+    def transcribe(self, audio, source_path: Path, progress: Optional[Callable[[float, float], None]] = None,
+                   should_stop: Optional[Callable[[], bool]] = None) -> Dict:
+        """audio: pydub AudioSegment (mono). Returns {'text', 'words', 'segments', 'language', ...}"""
+        cache = self._cache_path(source_path)
+        if self.params.get("use_transcription_cache", True) and cache.exists():
+            try:
+                data = json.loads(cache.read_text(encoding="utf-8"))
+                if self._cache_valid(data):
+                    self.logger.info(f"Using cached transcription {cache.name}")
+                    return data
+                self.logger.info("Cached transcription is from a different model/language - re-transcribing")
+            except Exception as exc:
+                self.logger.warning(f"Cache unreadable ({exc}) - re-transcribing")
+
+        self.load()
+        samples = AudioProcessor.to_float32(audio, 16000)
+        total = len(samples) / 16000.0
+        self.status("Transcribing")
+        segments_iter, info = self.model.transcribe(
+            samples,
+            language=self.language,
+            beam_size=int(self.params.get("beam_size", 5)),
+            word_timestamps=True,
+            vad_filter=bool(self.params.get("vad_filter", True)),
+            vad_parameters={"min_silence_duration_ms": 500},
+            initial_prompt=self.params.get("initial_prompt") or None,
+            condition_on_previous_text=True,
+        )
+        detected = info.language
+        if self.language is None:
+            self.logger.info(f"Detected language: {detected} (p={info.language_probability:.2f})")
+
+        words: List[Dict] = []
+        segs: List[Dict] = []
+        for seg in segments_iter:
+            if should_stop and should_stop():
+                raise InterruptedError("stopped")
+            segs.append({"start": seg.start, "end": seg.end, "text": seg.text.strip(),
+                         "no_speech_prob": seg.no_speech_prob, "avg_logprob": seg.avg_logprob})
+            if seg.words:
+                for w in seg.words:
+                    words.append({"word": w.word.strip(), "start": float(w.start), "end": float(w.end),
+                                  "probability": float(w.probability)})
+            else:
+                toks = seg.text.split()
+                if toks:
+                    step = (seg.end - seg.start) / len(toks)
+                    for i, t in enumerate(toks):
+                        words.append({"word": t, "start": seg.start + i * step, "end": seg.start + (i + 1) * step,
+                                      "probability": 1.0})
+            if progress:
+                progress(min(seg.end, total), total)
+
+        data = {
+            "cache_version": CACHE_VERSION,
+            "model": self.model_name,
+            "language": detected,
+            "text": " ".join(w["word"] for w in words),
+            "words": words,
+            "segments": segs,
         }
-        
-        # Save cache alongside source file
-        try:
-            source_cache = Path(original_path).with_suffix('.transcription.json')
-            self.logger.info(f"Saving transcription: {source_cache.name}")
-            with open(source_cache, 'w', encoding='utf-8') as f:
-                json.dump(transcription_data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            self.logger.warning(f"Cache save failed: {e}")
-        
-        return transcription_data
+        self.logger.info(f"Transcription complete: {len(segs)} segments, {len(words)} words")
+        if self.params.get("use_transcription_cache", True):
+            try:
+                cache.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+            except Exception as exc:
+                self.logger.warning(f"Could not save transcription cache: {exc}")
+        return data
