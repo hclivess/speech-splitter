@@ -4,6 +4,7 @@ Shared helpers for the speech-splitter pipeline: data classes, logging, app path
 import logging
 import os
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
@@ -92,7 +93,8 @@ def setup_logging(output_dir: Path, log_level: str = "INFO", console: bool = Tru
         except Exception:
             pass
 
-    fh = logging.FileHandler(log_file, encoding="utf-8")
+    # written as .part while the run is live (finish_logging renames it) - a .log is always a complete log
+    fh = logging.FileHandler(log_file.with_suffix(".log.part"), encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
     logger.addHandler(fh)
@@ -105,6 +107,49 @@ def setup_logging(output_dir: Path, log_level: str = "INFO", console: bool = Tru
 
     logger.info(f"Logging to {log_file}")
     return logger
+
+
+def temp_path(path) -> Path:
+    """Temporary sibling name for an output: write here, then os.replace() onto `path` when complete"""
+    path = Path(path)
+    return path.with_name(f".{path.name}.{os.getpid()}.tmp")
+
+
+@contextmanager
+def atomic_output(path):
+    """with atomic_output(dst) as tmp: <write tmp> -> tmp is renamed onto dst only if the block succeeds,
+    removed otherwise (so a Stop or a crash never leaves a partial file under the final name)"""
+    path = Path(path)
+    tmp = temp_path(path)
+    try:
+        yield tmp
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def atomic_write_text(path, text: str, encoding: str = "utf-8", newline=None) -> None:
+    with atomic_output(path) as tmp:
+        with open(tmp, "w", encoding=encoding, newline=newline) as f:
+            f.write(text)
+
+
+def finish_logging(logger: logging.Logger) -> None:
+    """Close the file handler and rename <log>.part -> <log>: a finished log has the final name"""
+    for h in list(logger.handlers):
+        if isinstance(h, logging.FileHandler):
+            logger.removeHandler(h)
+            h.close()
+            part = Path(h.baseFilename)
+            if part.suffix == ".part" and part.exists():
+                try:
+                    os.replace(part, part.with_suffix(""))
+                except OSError:
+                    pass
 
 
 def format_duration(seconds: float) -> str:

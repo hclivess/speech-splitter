@@ -11,7 +11,25 @@ from typing import Optional, Tuple
 import numpy as np
 from pydub import AudioSegment
 
+import childproc
 from utils import MIN_TRIM_DURATION_MS, app_dir
+
+
+def track_pydub_processes() -> None:
+    """pydub spawns ffmpeg/ffprobe itself through subprocess.Popen. Redirect those two call sites (and only those)
+    to childproc.popen so the decoders are tracked, hidden on Windows and die with the app. Idempotent."""
+    import pydub.audio_segment
+    import pydub.utils
+
+    class _TrackedSubprocess:
+        """Looks like the subprocess module to pydub.audio_segment, but Popen is childproc.popen"""
+        Popen = staticmethod(childproc.popen)
+
+        def __getattr__(self, name):
+            return getattr(childproc.subprocess, name)
+
+    pydub.utils.Popen = childproc.popen
+    pydub.audio_segment.subprocess = _TrackedSubprocess()
 
 
 def find_ffmpeg() -> Optional[str]:
@@ -28,6 +46,7 @@ def find_ffmpeg() -> Optional[str]:
 
 def configure_ffmpeg(logger: Optional[logging.Logger] = None) -> bool:
     """Point pydub at the ffmpeg we found (it only searches PATH by default)"""
+    track_pydub_processes()
     path = find_ffmpeg()
     if path:
         AudioSegment.converter = path

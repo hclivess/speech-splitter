@@ -86,6 +86,13 @@ All GUI options exist as flags (`--help`). Folders are searched recursively.
 The GitHub workflow builds all three platforms on every tag and attaches them to the release; the Linux build runs a
 headless self-test (`SPEECH_SPLITTER_SELFTEST=<audio file>`).
 
+## Changes in 3.0.1
+
+- Helper processes (ffmpeg / ffprobe decoders started by pydub, nvidia-smi) are tracked and killed when the app quits, is stopped, or crashes — Windows Job object, Linux parent-death signal
+- No partial output files: clips, transcripts, metadata.csv / metadata.json / manifest.txt, the transcription cache and presets are written to a temporary name and renamed into place when complete; the run log is `.log.part` until the run finishes
+- Adding files or folders never queues the same path twice (status bar reports "n already in queue")
+- Folder scans, the queue, output listings and presets use natural order (`take2 < take10`)
+
 ## Changes in 3.0
 
 - faster-whisper replaces WhisperX (no torch / pyannote; word timestamps built in; CUDA libraries downloadable in-app)

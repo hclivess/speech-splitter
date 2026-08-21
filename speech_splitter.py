@@ -19,7 +19,8 @@ warnings.filterwarnings("ignore")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import AUDIO_EXTENSIONS, DEFAULT_SETTINGS, LANGUAGES  # noqa: E402
-from utils import setup_logging  # noqa: E402
+from naturalsort import path_key  # noqa: E402
+from utils import finish_logging, setup_logging  # noqa: E402
 
 
 class SpeechSplitter:
@@ -105,7 +106,7 @@ def collect_inputs(paths: List[str]) -> List[Path]:
     for p in paths:
         path = Path(p)
         if path.is_dir():
-            files += sorted(f for f in path.rglob("*") if f.suffix.lower() in AUDIO_EXTENSIONS)
+            files += sorted((f for f in path.rglob("*") if f.suffix.lower() in AUDIO_EXTENSIONS), key=path_key)
         elif path.is_file():
             files.append(path)
     return files
@@ -197,6 +198,7 @@ def main(argv=None) -> int:
             failed += 1
             splitter.logger.error(f"{f.name}: {exc}")
     meta = splitter.generate_metadata()
+    finish_logging(splitter.logger)
     print(f"Done: {meta['total_segments']} clips, {meta['total_duration'] / 60:.1f} min -> {splitter.output_dir}")
     return 1 if failed else 0
 

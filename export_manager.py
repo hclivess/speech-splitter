@@ -12,7 +12,8 @@ import numpy as np
 from pydub import AudioSegment
 
 from audio_processor import AudioProcessor
-from utils import SegmentData
+from naturalsort import path_key
+from utils import SegmentData, atomic_output, atomic_write_text
 
 
 class ExportManager:
@@ -101,8 +102,9 @@ class ExportManager:
             export_kwargs = {"format": fmt}
             if fmt == "mp3":
                 export_kwargs["bitrate"] = "256k"
-            chunk.export(str(audio_file), **export_kwargs)
-            text_file.write_text(seg.text, encoding="utf-8")
+            with atomic_output(audio_file) as tmp:
+                chunk.export(str(tmp), **export_kwargs)
+            atomic_write_text(text_file, seg.text)
 
             info = {"file_name": f"audio/{audio_file.name}", "transcript": f"transcripts/{text_file.name}",
                     "text": seg.text, "duration": round(duration, 3), "sample_rate": chunk.frame_rate,
@@ -189,7 +191,7 @@ class ExportManager:
         """Rebuild metadata for everything in the output folder (cumulative across runs)"""
         fmt = self.params["export_format"]
         rows: List[Dict] = []
-        for audio_file in sorted(self.audio_dir.glob(f"*.{fmt}")):
+        for audio_file in sorted(self.audio_dir.glob(f"*.{fmt}"), key=path_key):
             text_file = self.text_dir / f"{audio_file.stem}.txt"
             if not text_file.exists():
                 continue
@@ -208,17 +210,16 @@ class ExportManager:
         total = sum(r["duration"] for r in rows)
         meta = {"total_segments": len(rows), "total_duration": round(total, 2), "language": language,
                 "segments": rows}
-        (self.output_dir / "metadata.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2),
-                                                       encoding="utf-8")
-        with open(self.output_dir / "manifest.txt", "w", encoding="utf-8") as f:
-            for r in rows:
-                f.write(f"{r['file_name']}|{r['transcript']}\n")
+        atomic_write_text(self.output_dir / "metadata.json", json.dumps(meta, ensure_ascii=False, indent=2))
+        atomic_write_text(self.output_dir / "manifest.txt",
+                          "".join(f"{r['file_name']}|{r['transcript']}\n" for r in rows))
         # Hugging Face AudioFolder: file_name relative to metadata.csv + transcription column
-        with open(self.output_dir / "metadata.csv", "w", encoding="utf-8", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["file_name", "transcription", "duration"])
-            for r in rows:
-                w.writerow([r["file_name"], r["text"], r["duration"]])
+        with atomic_output(self.output_dir / "metadata.csv") as tmp:
+            with open(tmp, "w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["file_name", "transcription", "duration"])
+                for r in rows:
+                    w.writerow([r["file_name"], r["text"], r["duration"]])
         self.logger.info(f"Metadata written: {len(rows)} segments, {total / 60:.1f} min "
                          f"(metadata.csv, metadata.json, manifest.txt)")
         return meta

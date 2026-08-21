@@ -26,10 +26,12 @@ from PySide6.QtWidgets import (  # noqa: E402
     QVBoxLayout, QWidget,
 )
 
+import childproc  # noqa: E402
+from naturalsort import path_key  # noqa: E402
 from config import (APP_NAME, APP_VERSION, AUDIO_EXTENSIONS, COMPUTE_TYPES, CUTOFF_ACTIONS, CUTOFF_MODES,  # noqa: E402
                     DEFAULT_SETTINGS, DEVICES, EXPORT_FORMATS, LANGUAGES, MODEL_SIZES, OVERLENGTH_ACTIONS,
                     WINDOW_MIN_HEIGHT, WINDOW_MIN_WIDTH)
-from utils import app_dir, format_duration  # noqa: E402
+from utils import app_dir, atomic_write_text, finish_logging, format_duration  # noqa: E402
 
 _BTN = """
     QPushButton { font-size: 14px; font-weight: bold; padding: 8px; background-color: %s; color: %s; border-radius: 5px; }
@@ -135,6 +137,7 @@ class Worker(QThread):
             meta = splitter.generate_metadata()
         except Exception as exc:  # noqa: BLE001
             self.log.emit("ERROR", f"Metadata generation failed: {exc}")
+        finish_logging(logger)
         self.finished_all.emit(ok, len(self.files), meta)
 
 
@@ -194,6 +197,7 @@ class MainWindow(QMainWindow):
         self.presets_dir = os.path.join(app_dir(), "presets")
         os.makedirs(self.presets_dir, exist_ok=True)
         self.files: List[str] = []
+        self._dupes_seen = 0
         self.worker: Optional[Worker] = None
         self.controls: Dict[str, QWidget] = {}
         self._dl_thread: Optional[DownloadThread] = None
@@ -633,7 +637,8 @@ class MainWindow(QMainWindow):
         for key, p in PRESETS.items():
             m.addAction(p["name"], lambda k=key: self._apply_preset(k))
         m.addSeparator()
-        user = sorted(f[:-5] for f in os.listdir(self.presets_dir) if f.endswith(".json") and f != "defaults.json")
+        user = sorted((f[:-5] for f in os.listdir(self.presets_dir) if f.endswith(".json") and f != "defaults.json"),
+                      key=path_key)
         if user:
             for name in user:
                 m.addAction(name, lambda n=name: self._load_preset_file(os.path.join(self.presets_dir, n + ".json")))
@@ -721,8 +726,7 @@ class MainWindow(QMainWindow):
 
     def _write_json(self, path: str, data: Dict) -> bool:
         try:
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump(data, fh, indent=2)
+            atomic_write_text(path, json.dumps(data, indent=2))
             return True
         except Exception as exc:
             QMessageBox.warning(self, "Preset", f"Could not write {path}:\n{exc}")
@@ -735,7 +739,8 @@ class MainWindow(QMainWindow):
                 self._rebuild_presets_menu()
 
     def _delete_preset(self):
-        user = sorted(f[:-5] for f in os.listdir(self.presets_dir) if f.endswith(".json") and f != "defaults.json")
+        user = sorted((f[:-5] for f in os.listdir(self.presets_dir) if f.endswith(".json") and f != "defaults.json"),
+                      key=path_key)
         if not user:
             QMessageBox.information(self, "Presets", "No saved presets.")
             return
@@ -846,7 +851,8 @@ class MainWindow(QMainWindow):
         self._run_download(self.cuda_btn, self.cuda_dl_label, fn, done_text)
 
     def _check_ffmpeg(self):
-        from audio_processor import find_ffmpeg
+        from audio_processor import find_ffmpeg, track_pydub_processes
+        track_pydub_processes()
         if not find_ffmpeg():
             self._append_log("WARNING", "ffmpeg not found: only plain WAV input will work. Install FFmpeg "
                                         "(or put ffmpeg next to the app) for mp3 / m4a / flac / video input.")
@@ -854,19 +860,33 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ queue
     def add_paths(self, paths: List[str]):
         added = 0
+        self._dupes_seen = 0
         for p in paths:
             path = Path(p)
             if path.is_dir():
-                for f in sorted(path.rglob("*")):
-                    if f.suffix.lower() in AUDIO_EXTENSIONS:
-                        added += self._add_one(str(f))
+                found = [f for f in path.rglob("*") if f.is_file() and f.suffix.lower() in AUDIO_EXTENSIONS]
+                for f in sorted(found, key=path_key):
+                    added += self._add_one(str(f))
             elif path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS:
                 added += self._add_one(str(path))
+        dupes = self._dupes_seen
+        self._dupes_seen = 0
+        parts = []
         if added:
-            self.statusBar().showMessage(f"{added} file(s) added — {len(self.files)} in queue")
+            parts.append(f"{added} file(s) added")
+        if dupes:
+            parts.append(f"{dupes} already in queue")
+        if parts:
+            self.statusBar().showMessage(", ".join(parts) + f" — {len(self.files)} in queue")
+
+    @staticmethod
+    def _key(path: str) -> str:
+        return os.path.normcase(os.path.abspath(path))
 
     def _add_one(self, path: str) -> int:
-        if path in self.files:
+        key = self._key(path)
+        if any(self._key(f) == key for f in self.files):
+            self._dupes_seen += 1
             return 0
         self.files.append(path)
         r = self.table.rowCount()
@@ -916,6 +936,7 @@ class MainWindow(QMainWindow):
             if sys.platform == "win32":
                 os.startfile(out)  # noqa
             elif sys.platform == "darwin":
+                # deliberately not via childproc: the file manager is the user's, it must outlive us
                 subprocess.Popen(["open", out])
             else:
                 subprocess.Popen(["xdg-open", out])
@@ -1062,6 +1083,7 @@ class MainWindow(QMainWindow):
 # =============================================================================== entry
 def main():
     app = QApplication(sys.argv)
+    childproc.install_qt_hook(app)          # every ffmpeg/ffprobe/nvidia-smi we start dies with the app
     app.setStyle("Fusion")
     icon = os.path.join(app_dir(), "icon.ico")
     if os.path.exists(icon):

@@ -11,6 +11,7 @@ from typing import Callable, Dict, List, Optional
 
 from audio_processor import AudioProcessor
 from cuda_utils import setup_cuda
+from utils import atomic_write_text
 
 CACHE_VERSION = 3
 
@@ -165,7 +166,7 @@ class TranscriptionManager:
         self.logger.info(f"Transcription complete: {len(segs)} segments, {len(words)} words")
         if self.params.get("use_transcription_cache", True):
             try:
-                cache.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+                atomic_write_text(cache, json.dumps(data, ensure_ascii=False, indent=1))
             except Exception as exc:
                 self.logger.warning(f"Could not save transcription cache: {exc}")
         return data

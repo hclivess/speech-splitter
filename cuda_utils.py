@@ -10,7 +10,8 @@ first model is created, so the app works on a GPU without touching PATH / LD_LIB
 import ctypes
 import glob
 import os
-import subprocess
+
+import childproc
 import sys
 from typing import Dict, List, Optional
 
@@ -145,7 +146,7 @@ def setup_cuda(extra_dir: str = "") -> Dict[str, Optional[str]]:
 def nvidia_smi_info() -> Optional[Dict[str, str]]:
     """GPU name / driver / memory from nvidia-smi, or None if no NVIDIA driver"""
     try:
-        out = subprocess.run(["nvidia-smi", "--query-gpu=name,driver_version,memory.total",
+        out = childproc.run(["nvidia-smi", "--query-gpu=name,driver_version,memory.total",
                               "--format=csv,noheader,nounits"],
                              capture_output=True, text=True, timeout=10, creationflags=_CREATE_NO_WINDOW)
         line = (out.stdout or "").strip().splitlines()

@@ -3,7 +3,7 @@ speech-splitter - configuration and constants
 """
 
 APP_NAME = "speech-splitter"
-APP_VERSION = "3.0"
+APP_VERSION = "3.0.1"
 WINDOW_MIN_WIDTH = 900
 WINDOW_MIN_HEIGHT = 600
 
